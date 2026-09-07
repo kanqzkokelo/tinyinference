@@ -1,165 +1,50 @@
-# tinytorch
+# tinyinference
 
-From-scratch neural-network inference in pure C + CUDA: tensor lib, autograd,
-AVX2 GEMMs, a CUDA GEMM ladder at cuBLAS parity, and a multi-arch LLM engine
-with logits verified equal vs llama.cpp (decode 0.55–0.82x of llama.cpp CUDA,
-5-run median, same GPU — see table).
+Multi-architecture LLM inference engine in C + CUDA, built from scratch.
+Loads GGUF weights, runs quantized transformer decode on NVIDIA GPUs.
+Split out of the `nnfromscratch` monorepo; tensor/autograd/ML code lives
+in `tinytorch`.
 
-## LLM engine
+What works: GGUF loader, arch registry (qwen2/llama/qwen3/gemma/gemma4/
+tinyllama/granite/smollm2/mistral/internlm2/xverse/exaone/ernie4_5),
+BPE tokenizer, chat templates, top-k/top-p/min-p samplers, paged KV-cache
+with Q8 backfill, MoE router, N-gram speculative decode, threaded CPU
+GEMV backend (Q4_0/Q8_0/Q4_K/Q5_K/Q6_K), CUDA GEMV/GEMM/flash kernels.
 
-Environment (custom CUDA toolkit path used on dev boxes):
+## Build
 
-```bash
-export PATH=$HOME/mmcuda/bin:$PATH
-export LD_LIBRARY_PATH=$HOME/mmcuda/lib:$LD_LIBRARY_PATH
+```
+make lib                 # CPU objects -> build/libtinytorch.so
+make run_llm_gpu         # needs nvcc + RTX-class GPU
+./scripts/ci_local.sh    # 30s CPU sanity, no GPU needed
 ```
 
-```bash
-./chat                                    # interactive chat (qwen2.5 default)
-TT_MODEL=data/testmodels/smollm2-135m-instruct-Q8_0.gguf ./chat
+## Quickstart
+
+```
+./build/run_llm_gpu data/models/qwen2.5-0.5b-instruct-q4_0.gguf "Hello"
 ```
 
-Prefill (RTX 3050 laptop, Qwen2.5-0.5B): **~7.8k tok/s** via FP16-shadow +
-tensor-core GEMM (`TT_CUBLAS_FP16`); see `docs/plans/2026-09-03-prefill-roofline.md`.
-Full family matrix: `docs/SUPPORTED_FAMILIES.md`.
+## Gates
 
-| Property | Value |
-|---|---|
-| Decode speed | ~272 tok/s @ ctx32 (0.82x llama.cpp) / ~180 tok/s @ ctx128 (0.55x), RTX 3050 sm_86, CUDA graphs, 5-run median |
-| vs llama.cpp | 0.55–0.82x decode; prefill 5.5x our own baseline (see below) |
-| Parity gate | `./scripts/verify.sh m61` — teacher-forced logits vs oracle, 7/7 |
-| Sampling | repeat penalty + Gumbel-max temperature sampling inside CUDA graphs |
-
-## Verified model grid
-
-Teacher-forced logits parity vs llama.cpp oracle (`tests/gate_m7_grid.py`).
-7-prompt gate; thresholds argmax-d ≤0.35, median \|Δlogit\| ≤0.6 (relaxed from
-0.15 for ≤1B models where llama.cpp's MMQ integer kernels diverge from exact
-dequant-fp32 accumulation).
-
-| Architecture | Models | Quant formats | Status |
-|---|---|---|---|
-| qwen2 | Qwen2.5-0.5B | q4_0 (+q8_0 head) | PASS 7/7 strict |
-| qwen3 | Qwen3-0.6B | q8_0 | PASS 7/7 |
-| llama | TinyLlama-1.1B | f16 | PASS bit-perfect (median Δ = 0.0009) |
-| llama | SmolLM2-135M | f16, q4_0, q5_0, q5_1, q8_0, q4_K, q4_K_S, q5_K | PASS |
-| llama | SmolLM2-135M | q4_1, q5_K_S, q6_K | PARTIAL 5–6/7 (top-1 flips on near-tied logits) |
-| llama | Llama-3.2-1B | q8_0 | PASS 7/7 unmodified (src/arch_registry.c:91) |
-| phi2 | phi-2 | — | OUT: needs LayerNorm kernels + epsilon-key alias; analysis in src/arch_registry.c:101 |
-| gemma2 | Gemma2-2B | q6_K | PARTIAL 6/7 (was 7/7; re-verified during M8 session) |
-| gemma4 | Gemma-4-E2B | q4_0 | PASS 6/7 m84 gate (median ≤0.6) |
-
-Quant kernels: q4_0, q4_1, q5_0, q5_1, q8_0, q4_K(+S), q5_K(+S), q6_K — all
-golden-verified against gguf-py dequantization on real model bytes.
-
-## M9–M11 throughput round (landed, gated separately)
-
-Gates: `./scripts/verify.sh ple` (PLE golden 3/3, ~1e-5),
-`./scripts/verify.sh tok` (tokenizer conformance vs llama-tokenize oracle —
-**honestly failing**; documented gaps: simplified pre-tokenization regex,
-greedy SP matching instead of unigram Viterbi — see header of
-`tests/gate_tokenizer.py`), `./scripts/verify.sh m84` (gemma4 parity 6/7 PASS).
-
-Unit tests / prototypes (each attributed to its file):
-
-- `tests/test_rope_ff.cu` — RoPE+FFN exact vs ggml ref; rules RoPE out of the
-  gemma4 parity hunt.
-- `tests/test_flash_multi.cu` — flash GQA multi-slot kernel, 7/7 exact
-  (incl. SWA window + mixed-head-dim gemma4 shapes).
-- `tests/proto_ple_fused.cu` — fused PLE chain V2: 2 launches, graph-capturable,
-  22.3µs/layer vs 44.6 host-assist → 22% token-budget saving (commit e7e9609).
-- `tests/proto_batched_gemv.cu` — batched-GEMV prototype.
-- `bench/bench_load_strategies.cu` — root cause of slow load = alloc churn
-  (3012× cudaMalloc = 1.2s); single arena + pinned staging ≈ 4.4 GB/s warm,
-  5 GB model ~6.3s → ~1.1s (**5.7× startup**, commit b5b3fb1).
-
-New modules (all with their own tests):
-
-- `src/samplers.c` — rep/freq/presence penalty, temp, top-k/top-p/min-p;
-  12/12 tests (`tests/test_samplers.py`).
-- `src/chat_template.c` — ChatML/gemma/llama3 formatter, HF-verified goldens,
-  37 tests (`tests/test_chat_template.py`) + per-family stop strings.
-- `src/specdec.c` — ngram drafter (C99) + acceptance simulator: 1.88× best-case
-  flat-model envelope, bounded worst-case (`tests/test_specdec_sim.py`).
-- `src/cpu_backend.c` — threaded q4_0/q8_0 GEMV, golden vs numpy (3e-7 rel)
-  (`tests/test_cpu_backend.py`).
-- `src/kvcache.c`, `src/moe_router.c` — with `tests/test_kvcache.c`,
-  `tests/test_moe_router.c`.
-
-Research docs (`docs/plans/`): `2026-08-27-m11-vulkan-design.md`,
-`2026-08-27-hybrid-offload-findings.md` (E4B-on-4GB verdict 5–9 t/s),
-`2026-08-27-moe-notes.md`, `2026-08-27-quant-roadmap.md` (IQ3_XXS verdict),
-`2026-08-26-m9-m11-roadmap.md`.
-
-### gemma4 status (M8, closed)
-
-Heterogeneous mixture architecture (per-layer heads/kv/ffn/head_dim,
-KV-cache sharing layers 15–34, partial RoPE, PLE/MatFormer blocks) loads and
-runs end-to-end. Parity verified at the 7-prompt m84 gate:
-
-- `./scripts/verify.sh m84` → **6/7 PASS** (gate bar ≥6, median ≤0.6).
-  Smoking-gun prompt `2,2202` flipped to oracle-exact: token 107, median 0.088.
-  Row 6 (`2,6890,12055,304`) is the only residual — top-1 wrong (14786 vs
-  ref 236743, argmax-d 0.242) but median 0.096 still well in-bar; left as a
-  known residual since the gate bar is met. See commit `ad29ac0`.
-- Ruled out so far: RoPE (exact per `tests/test_rope_ff.cu`); PLE stages reach
-  golden parity on L0; previously fixed: full-layer staging OOB (d_q/d_att
-  2048→4096), K-projection half-width on hd-512 layers, BF16 loader size,
-  BOS-prepend tokenizer convention (commits 2052181, 48ecc40, 8263d39), and
-  the M8 final fix — scatter using per-layer head dim `HDl` instead of meta
-  `HD` so pos-1 K/V slots stop overlapping on full-attn layers (ad29ac0).
-- Golden reference: `tests/ref_gemma4_numpy.py` (NumPy forward from plan math)
-- Chat smoke: gemma-4-E2B-it produces non-EOS, template-correct replies
-  ("Hello" for "hi", "2" for "what is 2+2?"); template auto-detected from
-  arch `gemma4` → `TT_CHAT_GEMMA4` → `fmt_gemma` (start_of_turn/end_of_turn).
-
-## Classic ML benchmarks
-
-| Suite | Result |
-|---|---|
-| Tensor ops vs NumPy | all match |
-| Autograd gradcheck | < 1e-4 rel. error |
-| MNIST MLP (2-layer) | ≥97% test accuracy |
-| CPU matmul (AVX2+FMA asm) | 75 GFLOPS 1T / 239 GFLOPS MP (0.76× OpenBLAS-1T — documented wall) |
-| CUDA sgemm tiled | ≈ cuBLAS parity, 39× naive @1024³ |
-| WMMA fp16 | up to 72% cuBLAS |
-| CIFAR-10 CNN | gate wired (`verify.sh m4`), formal run pending |
-
-## Build & verify
-
-```bash
-make lib pybind cuda cublas          # libraries
-make run_llm_gpu chat_llm_gpu        # LLM binaries (nvcc required)
-./scripts/verify.sh m61              # LLM parity gate
-./scripts/verify.sh m84              # gemma4 parity gate (6/7 PASS)
-./scripts/verify.sh ple              # PLE golden gate (3/3)
-./scripts/verify.sh tok              # tokenizer conformance (failing; gaps documented)
-./scripts/verify.sh all              # full sweep incl. classic ML gates
+```
+./scripts/ci_local.sh        # samplers, specdec-sim, chat-template, kvcache, cpu_backend
+./scripts/verify.sh m61      # greedy-logit parity vs llama.cpp + multiturn chat
+./scripts/verify.sh m84      # gemma4 parity
+./scripts/verify.sh ple      # PLE-fused golden
+./scripts/verify.sh tok      # tokenizer oracle parity (needs oracle build)
+./scripts/verify.sh backfill # Q8 KV-cache backfill (needs nvcc)
 ```
 
-## CI
+## Numbers
 
-- Where: `.github/workflows/ci.yml` runs on every push to `main` and every PR.
-  Concurrency cancels older runs on the same ref so force-pushes don't pile up.
-- Day jobs (`lint-compile` matrix, `build-gcc`, `unit-c`): CPU-only, ~30s, matches
-  `./scripts/ci_local.sh` 1:1.
-- NOT covered by CI: GPU parity gates (`make cuda`, `verify.sh m61/m84`), tokenizer
-  oracle (`gate_tokenizer.py` — needs oracle binaries). Those run **manually on
-  a GPU box** and as a separate nightly (`nightly.yml`, 04:00 UTC).
-- `benchmark-snapshot` is informational only — it uploads a JSON trend file,
-  never gates.
-- Local mirror: `./scripts/ci_local.sh` (≈30s, GPU-free).
+Decode throughput tracks 0.55-0.82x llama.cpp CUDA on RTX 3050 4GB for
+qwen2.5-0.5b-q4_0; see `docs/BENCHMARKS.md`. Supported families and
+quant tiers: `docs/SUPPORTED_FAMILIES.md`.
 
 ## Layout
 
-```
-src/            C sources (tensor, autograd, gemm, loader_gguf, tokenizer, arch_registry)
-kernels/        CUDA (.cu): GEMM ladder, typed GEMVs, transformer engine
-include/        headers
-kernels/qwen2_cuda.cu   trait-driven decode engine (cudaGraph replay)
-tests/          gates + golden references (NumPy forward, dequant goldens)
-bench/          benchmark harnesses + results.md ladder tables
-oracle/         local-only llama.cpp checkout (parity ground truth, git-ignored)
-tools/          dump_logits, oracle_logits, profile_step
-docs/plans/     implementation plans (M6.3 perf, M7 quants/archs)
-```
+`src/` engine (loader, arch_registry, tokenizer, samplers, kvcache,
+cpu_backend, moe_router, specdec, ngram_lookup, dequant_ref),
+`kernels/` CUDA, `tools/` microbenches, `bench/bench_llm.py`
+scoreboard, golden logits in `data/golden/`, servers in `examples/`.
