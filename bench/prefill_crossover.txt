@@ -1,0 +1,31 @@
+# Prefill crossover: Q4 vs Q4-WMMA vs cuBLAS/FP16
+# model: data/models/qwen2.5-0.5b-instruct-q4_0.gguf (dim=896 hidden=4864 L=24 H=14 KV=2)
+# gpu: NVIDIA GeForce RTX 3050 Laptop GPU (4GB)
+# date: 2026-09-08, branch m6-correctness
+# method: tools/bench_prefill --tokens 1,8,16,32,64,128,256,512,1024 --repeats 3 (best-of-3)
+# env per column: default (Q4 CUDA-core) | TT_USE_WMMA_PRE=1 | TT_CUBLAS_FP16=1
+# note: engine routes n<32 through per-token eager advance(), so N=1/8/16 rows
+#   measure the eager path under any env (noise), not GEMM dispatch.
+#   N=1024 default/WMMA runs as 512+512 chunks; FP16 runs one 1024 chunk (CHUNK 2048).
+#
+# N, default_tok_s, wmma_tok_s, fp16_tok_s
+1,380.4,469.5,380.2
+8,443.9,453.8,365.7
+16,430.7,433.5,424.6
+32,1322.5,1329.6,3734.2
+64,1652.7,2803.7,5782.9
+128,1748.1,3275.2,7303.2
+256,1781.4,3136.7,5624.8
+512,1626.4,2768.0,4367.1
+1024,1391.7,2100.3,2881.2
+#
+# crossover findings:
+# - cuBLAS/FP16 beats Q4 at every N where batched GEMM engages (32..1024,
+#   2.7x-4.2x). no N exists where Q4 wins once prefill_batched_gemm runs.
+# - Q4-WMMA beats Q4 CUDA-core from N=64 (+70% at 64, +87% at 128),
+#   confirming the existing n>=64 WMMA threshold. at N=32 WMMA==default
+#   by construction (threshold not engaged).
+# decision: no threshold constant added/changed. there is no fiat
+# PREFILL_CUBLAS_MIN_N in tree (cublas tried whenever shadows armed, i.e.
+# explicit TT_CUBLAS_FP16 opt-in); gating it behind N would only slow the
+# N>=32 path. WMMA n>=64 kept: measured win starts exactly there.

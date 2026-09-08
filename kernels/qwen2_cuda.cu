@@ -4098,6 +4098,14 @@ static int tt_profiling(void) {
     return tt_prof_on;
 }
 
+/* Task 6: dispatch logging. TT_DISPATCH=1 (or TT_PROFILE) prints one
+ * stderr line per prefill/verify-fallback. No behavior change. */
+static int tt_dispatch_log_on(void) {
+    static int cached = -1;
+    if (cached < 0) cached = (getenv("TT_PROFILE") || getenv("TT_DISPATCH")) ? 1 : 0;
+    return cached;
+}
+
 static void tt_prof_begin(TTProfStage st, cudaStream_t stream) {
     TTProf *p = &tt_prof[st];
     if (!p->b) { cudaEventCreate(&p->b); cudaEventCreate(&p->e); }
@@ -5345,6 +5353,9 @@ int prefill_batched_gemm(Qwen2Engine *e, const int *toks, int n, float *h_x_out)
     { static int wmma_pre = -1;
       if (wmma_pre < 0) wmma_pre = getenv("TT_USE_WMMA_PRE") ? 1 : 0;
       if (wmma_pre && n >= 64) prefill_gemm_fn = tt_gemm_wmma_q4_0_prefill; }
+    if (tt_dispatch_log_on())
+        fprintf(stderr, "[prefill] dispatch=%s N=%d\n",
+                (e->cublas_fp16_ok || e->cublas_ok) ? "cublas-fp16" : "q4-wmma", n);
 
     const int dim = c->dim;
     const int hidden_dim = c->hidden_dim;
@@ -5723,6 +5734,9 @@ int prefill_batched_gemm_dx(Qwen2Engine *e, const int *toks, int n, float *d_x_o
 
     int (*prefill_gemm_fn)(const void *, const float *, float *, int, int, int, cudaStream_t) =
         tt_gemm_q4_0_prefill;
+    if (tt_dispatch_log_on())
+        fprintf(stderr, "[prefill] dispatch=%s N=%d\n",
+                (e->cublas_fp16_ok || e->cublas_ok) ? "cublas-fp16" : "q4-wmma", n);
 
     const int dim = c->dim;
     const int hidden_dim = c->hidden_dim;
@@ -6089,6 +6103,8 @@ int qwen2_engine_prefill(Qwen2Engine *e, const int *toks, int n) {
             return 0;
         }
     }
+    if (tt_dispatch_log_on() && (n < 32 || e->has_pl_embd || e->cfg.tr.softcap_value != 0.0f))
+        fprintf(stderr, "[prefill] dispatch=eager N=%d\n", n);
     for (int i = 0; i < n; i++) {
         int rc = advance(e, toks[i]);
         if (rc) return rc;
@@ -6218,6 +6234,8 @@ int qwen2_engine_verify_speculative(Qwen2Engine *e,
             /* Prefill refused (mixed dtype / PLE / softcap). Fall back to the
              * original per-row eager path below. Restore d_pos so the eager
              * path sees the pre-call position. */
+            if (tt_dispatch_log_on())
+                fprintf(stderr, "[verify] prefill_dx refused (rc=%d), eager fallback\n", rc);
             e->pos -= n_candidate;
             cudaMemcpy(e->d_pos, &e->pos, sizeof(int), cudaMemcpyHostToDevice);
         } else {
