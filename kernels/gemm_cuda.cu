@@ -191,6 +191,7 @@ __global__ void k_sgemm_wmma(const half *__restrict__ Ah,
     const int warpN = (threadIdx.x / warpSize) / 2;
     const int row = (blockIdx.y * 2 + warpM) * WM;
     const int col = (blockIdx.x * 2 + warpN) * WM;
+    if (row >= M || col >= N) return;
 
     wmma::fragment<wmma::matrix_a, WM, WM, WM, half, wmma::row_major> fa;
     wmma::fragment<wmma::matrix_b, WM, WM, WM, half, wmma::row_major> fb;
@@ -200,8 +201,20 @@ __global__ void k_sgemm_wmma(const half *__restrict__ Ah,
         wmma::load_matrix_sync(fb, Bh + (long)t * N + col, N);
         wmma::mma_sync(acc, fa, fb, acc);
     }
-    wmma::store_matrix_sync(C + (long)row * N + col, acc, N,
-                            wmma::mem_row_major);
+    /* Ceil grid may overhang M/N by <32. row/col are warp-uniform, so this
+     * branch never diverges within a warp. Aligned tiles keep the direct
+     * store; edge tiles stage through local memory then write guarded. */
+    if (row + 16 <= M && col + 16 <= N) {
+        wmma::store_matrix_sync(C + (long)row * N + col, acc, N,
+                                wmma::mem_row_major);
+    } else {
+        float tmp[16][16];
+        wmma::store_matrix_sync(&tmp[0][0], acc, 16, wmma::mem_row_major);
+        for (int i = 0; i < 16; i++)
+            for (int j = 0; j < 16; j++)
+                if (row + i < M && col + j < N)
+                    C[(long)(row + i) * N + col + j] = tmp[i][j];
+    }
 }
 
 /* ---------------- host wrappers ---------------- */
@@ -230,7 +243,7 @@ static int run_wmma(const float *dAf, const float *dBf, float *dC,
     f2h<<<(int)((nf + conv - 1) / conv), conv>>>(dAf, dAh, nf);
     f2h<<<(int)((nb + conv - 1) / conv), conv>>>(dBf, dBh, nb);
     CHK(cudaGetLastError());
-    dim3 b(128, 1), g(N / (2 * WM), M / (2 * WM));
+    dim3 b(128, 1), g((N + 2 * WM - 1) / (2 * WM), (M + 2 * WM - 1) / (2 * WM));
     k_sgemm_wmma<<<g, b>>>((half *)dAh, (half *)dBh, dC, M, N, K);
     const int err = (int)cudaGetLastError();
     cudaFree(dAh);
