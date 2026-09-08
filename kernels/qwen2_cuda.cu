@@ -112,16 +112,31 @@ static inline int kv_thresh_value(void) {
 /* Type-blind weight handle: device pointer + GGML type code for dispatch. */
 typedef struct { void *ptr; int dtype; } TTensor;
 
-/* Upload any tensor type-blind: raw size_bytes memcpy, dtype recorded. */
-static int upload_w(GGUFModel *m, const char *name, TTensor *out) {
+/* Single weight arena: one cudaMalloc for all weight bytes, 16B-aligned
+ * per-tensor offsets, H2D copies into offsets. Overrun = internal error
+ * (arena pre-sized, so sizes must match between passes). */
+typedef struct { char *base; size_t cap; size_t off; } WArena;
+static inline size_t w_align16(size_t n) { return (n + 15) & ~(size_t)15; }
+static size_t w_arena_claim(WArena *a, size_t n) {
+    size_t off = w_align16(a->off);
+    if (n == 0 || off + n > a->cap) return (size_t)-1;
+    a->off = off + n;
+    return off;
+}
+static size_t w_bytes_for(GGUFModel *m, const char *name) {
+    GGUFTensor *t = gguf_get_tensor(m, name);
+    return (t && t->data) ? t->size_bytes : 0;
+}
+/* Upload any tensor type-blind: raw size_bytes memcpy into arena, dtype recorded. */
+static int upload_w(GGUFModel *m, const char *name, TTensor *out, WArena *a) {
     GGUFTensor *t = gguf_get_tensor(m, name);
     out->ptr = NULL; out->dtype = -1;
     if (!t || !t->data) { fprintf(stderr, "[qwen2-engine] weight upload missing: %s\n", name); return -1; }
-    void *d = NULL;
-    if (cudaMalloc(&d, t->size_bytes) != cudaSuccess) { fprintf(stderr, "[qwen2-engine] cudaMalloc fail %s\n", name); return -1; }
+    size_t off = w_arena_claim(a, t->size_bytes);
+    if (off == (size_t)-1) { fprintf(stderr, "[qwen2-engine] arena overrun %s\n", name); return -1; }
+    void *d = a->base + off;
     if (cudaMemcpy(d, t->data, t->size_bytes, cudaMemcpyHostToDevice) != cudaSuccess) {
         fprintf(stderr, "[qwen2-engine] cudaMemcpy fail %s\n", name);
-        cudaFree(d);
         return -1;
     }
     out->ptr = d;
@@ -3139,6 +3154,8 @@ struct Qwen2Engine {
     TTensor d_embd;          /* tied or untied lm head below */
     TTensor d_out_w;
     float *d_out_norm;
+    void *w_arena;           /* single weight arena; all weight ptrs point inside */
+    size_t w_arena_size;
     /* activations */
     float *d_x, *d_xn, *d_q, *d_att, *d_h, *d_logits;
     /* split-SwiGLU staging for non-q4_0 gate/up dtypes (fused q4_0 path
@@ -3276,7 +3293,7 @@ static inline int split_S_fp32(int ctx, int smax) {
     return S;
 }
 
-static float *upload_f32(GGUFModel *m, const char *name) {
+static float *upload_f32(GGUFModel *m, const char *name, WArena *a) {
     GGUFTensor *t = gguf_get_tensor(m, name);
     if (!t || !t->data) {
         /* optional-tensor silence: callers treat NULL as "feature absent"
@@ -3285,11 +3302,11 @@ static float *upload_f32(GGUFModel *m, const char *name) {
             fprintf(stderr, "[qwen2-engine] f32 upload missing: %s\n", name);
         return NULL;
     }
-    float *d = NULL;
-    if (cudaMalloc(&d, t->size_bytes) != cudaSuccess) { fprintf(stderr, "[qwen2-engine] cudaMalloc fail %s\n", name); return NULL; }
+    size_t off = w_arena_claim(a, t->size_bytes);
+    if (off == (size_t)-1) { fprintf(stderr, "[qwen2-engine] arena overrun %s\n", name); return NULL; }
+    float *d = (float *)(a->base + off);
     if (cudaMemcpy(d, t->data, t->size_bytes, cudaMemcpyHostToDevice) != cudaSuccess) {
         fprintf(stderr, "[qwen2-engine] cudaMemcpy fail %s\n", name);
-        cudaFree(d);
         return NULL;
     }
     return d;
@@ -3355,6 +3372,7 @@ static void cublas_fp16_build(Qwen2Engine *e, GGUFModel *m);
 
 Qwen2Engine *qwen2_engine_create(const TTConfig *cfg, GGUFModel *m) {
 #define ABORT_CREATE(msg) do { fail(msg); qwen2_engine_free(e); return NULL; } while (0)
+#define CK_CREATE(call, msg) do { if ((call) != cudaSuccess) ABORT_CREATE(msg); } while (0)
 
     if (!cfg || !m || cfg->dim == 0) { fail("bad config"); return NULL; }
     if (cfg->dim % cfg->n_heads || cfg->n_heads % cfg->n_kv_heads ||
@@ -3396,12 +3414,75 @@ Qwen2Engine *qwen2_engine_create(const TTConfig *cfg, GGUFModel *m) {
     if (!tembd) { fail("token_embd.weight missing"); return NULL; }
     e->cfg.vocab = (int)tembd->shape[tembd->ndim - 1];
 
+    int n_gpu_layers = cfg->n_layers;
+    const char *gpu_layers_env = getenv("TT_GPU_LAYERS");
+    if (!gpu_layers_env) gpu_layers_env = getenv("TT_N_GPU_LAYERS");
+    if (gpu_layers_env) {
+        int v = atoi(gpu_layers_env);
+        if (v >= 0 && v <= cfg->n_layers) n_gpu_layers = v;
+    }
+    /* FIRST pass: total weight bytes, 16B-aligned each. Mirrors the upload
+     * pass below (same is_gpu/optional conditions) so the bump never overruns. */
+    size_t w_total = 0;
+#define W_ADD_BYTES(n) do { w_total += w_align16(n); } while (0)
+#define W_ADD_TENSOR(nm) do { size_t _b = w_bytes_for(m, nm); if (_b) W_ADD_BYTES(_b); } while (0)
+    W_ADD_TENSOR("token_embd.weight");
+    W_ADD_TENSOR("output.weight");
+    W_ADD_TENSOR("output_norm.weight");
+    for (int _l = 0; _l < cfg->n_layers; _l++) {
+        char _nm[160];
+        const int _gpu = (_l < n_gpu_layers);
+        const char *_wq[7] = { "attn_q.weight", "attn_k.weight", "attn_v.weight",
+            "attn_output.weight", "ffn_gate.weight", "ffn_up.weight", "ffn_down.weight" };
+        if (_gpu) {
+            for (int _k = 0; _k < 7; _k++) {
+                snprintf(_nm, sizeof(_nm), "blk.%d.%s", _l, _wq[_k]);
+                W_ADD_TENSOR(_nm);
+            }
+            snprintf(_nm, sizeof(_nm), "blk.%d.attn_norm.weight", _l); W_ADD_TENSOR(_nm);
+            snprintf(_nm, sizeof(_nm), "blk.%d.ffn_norm.weight", _l); W_ADD_TENSOR(_nm);
+            snprintf(_nm, sizeof(_nm), "blk.%d.attn_q.bias", _l); W_ADD_TENSOR(_nm);
+            snprintf(_nm, sizeof(_nm), "blk.%d.attn_k.bias", _l); W_ADD_TENSOR(_nm);
+        }
+        /* Uploaded UNconditionally below (no is_gpu guard), so sized here
+         * regardless of _gpu: over-sizing for CPU layers wastes a little
+         * arena but an under-sized arena would abort hybrid configs. */
+        snprintf(_nm, sizeof(_nm), "blk.%d.post_attention_norm.weight", _l); W_ADD_TENSOR(_nm);
+        snprintf(_nm, sizeof(_nm), "blk.%d.post_norm.weight", _l); W_ADD_TENSOR(_nm);
+        snprintf(_nm, sizeof(_nm), "blk.%d.post_ffw_norm.weight", _l); W_ADD_TENSOR(_nm);
+        snprintf(_nm, sizeof(_nm), "blk.%d.attn_v.bias", _l); W_ADD_TENSOR(_nm);
+        if (e->cfg.tr.qk_norm_rms) {
+            snprintf(_nm, sizeof(_nm), "blk.%d.attn_q_norm.weight", _l); W_ADD_TENSOR(_nm);
+            snprintf(_nm, sizeof(_nm), "blk.%d.attn_k_norm.weight", _l); W_ADD_TENSOR(_nm);
+        }
+        snprintf(_nm, sizeof(_nm), "blk.%d.inp_gate.weight", _l);
+        if (gguf_get_tensor(m, _nm)) W_ADD_TENSOR(_nm);
+        snprintf(_nm, sizeof(_nm), "blk.%d.proj.weight", _l);
+        if (gguf_get_tensor(m, _nm)) W_ADD_TENSOR(_nm);
+    }
+    {
+        GGUFTensor *_tp = gguf_get_tensor(m, "per_layer_token_embd.weight");
+        GGUFTensor *_tm = gguf_get_tensor(m, "per_layer_model_proj.weight");
+        if (_tp && _tp->data && _tm && _tm->data && e->cfg.tr.per_layer_embd &&
+            m->per_layer_embd_dim > 0)
+            W_ADD_BYTES(_tm->size_bytes);
+    }
+#undef W_ADD_TENSOR
+#undef W_ADD_BYTES
+    /* ONE cudaMalloc for all weight bytes. */
+    void *w_arena_base = NULL;
+    if (w_total > 0 && cudaMalloc(&w_arena_base, w_total) != cudaSuccess)
+        ABORT_CREATE("weight arena cudaMalloc fail");
+    e->w_arena = w_arena_base;
+    e->w_arena_size = w_total;
+    WArena wa = { (char *)w_arena_base, w_total, 0 };
+
     e->d_embd.ptr = NULL;
-    upload_w(m, "token_embd.weight", &e->d_embd);
+    upload_w(m, "token_embd.weight", &e->d_embd, &wa);
 
     {
         GGUFTensor *tw = gguf_get_tensor(m, "output.weight");
-        if (tw && tw->data && upload_w(m, "output.weight", &e->d_out_w) == 0) {
+        if (tw && tw->data && upload_w(m, "output.weight", &e->d_out_w, &wa) == 0) {
             /* keep whichever dtype output.weight actually carries */
         } else {
             e->d_out_w.ptr = NULL; e->d_out_w.dtype = -1;
@@ -3414,15 +3495,8 @@ Qwen2Engine *qwen2_engine_create(const TTConfig *cfg, GGUFModel *m) {
     fprintf(stderr, "[qwen2-engine] lm head dtype: %d (%s)\n", e->d_out_w.dtype,
             e->d_out_w.dtype == GGUF_TYPE_Q8_0 ? "q8_0" :
             e->d_out_w.dtype == GGUF_TYPE_Q4_0 ? "q4_0" : "typed dispatch");
-    e->d_out_norm = upload_f32(m, "output_norm.weight");
+    e->d_out_norm = upload_f32(m, "output_norm.weight", &wa);
 
-    int n_gpu_layers = cfg->n_layers;
-    const char *gpu_layers_env = getenv("TT_GPU_LAYERS");
-    if (!gpu_layers_env) gpu_layers_env = getenv("TT_N_GPU_LAYERS");
-    if (gpu_layers_env) {
-        int v = atoi(gpu_layers_env);
-        if (v >= 0 && v <= cfg->n_layers) n_gpu_layers = v;
-    }
     e->n_gpu_layers = n_gpu_layers;
     if (n_gpu_layers < cfg->n_layers) {
         fprintf(stderr, "[qwen2-engine] HYBRID CPU-GPU Offloading: %d GPU layers, %d CPU layers\n",
@@ -3432,49 +3506,49 @@ Qwen2Engine *qwen2_engine_create(const TTConfig *cfg, GGUFModel *m) {
         LayerW *w = &e->L[l];
         const int is_gpu = (l < e->n_gpu_layers);
         snprintf(name, sizeof(name), "blk.%d.attn_q.weight", l);
-        if (is_gpu) upload_w(m, name, &w->q);
+        if (is_gpu) upload_w(m, name, &w->q, &wa);
         else { GGUFTensor *t = gguf_get_tensor(m, name); w->q.ptr = t ? t->data : NULL; w->q.dtype = t ? (int)t->type : -1; }
         snprintf(name, sizeof(name), "blk.%d.attn_k.weight", l);
-        if (is_gpu) upload_w(m, name, &w->k);
+        if (is_gpu) upload_w(m, name, &w->k, &wa);
         else { GGUFTensor *t = gguf_get_tensor(m, name); w->k.ptr = t ? t->data : NULL; w->k.dtype = t ? (int)t->type : -1; }
         snprintf(name, sizeof(name), "blk.%d.attn_v.weight", l);
-        if (is_gpu) upload_w(m, name, &w->v);
+        if (is_gpu) upload_w(m, name, &w->v, &wa);
         else { GGUFTensor *t = gguf_get_tensor(m, name); w->v.ptr = t ? t->data : NULL; w->v.dtype = t ? (int)t->type : -1; }
         snprintf(name, sizeof(name), "blk.%d.attn_output.weight", l);
-        if (is_gpu) upload_w(m, name, &w->o);
+        if (is_gpu) upload_w(m, name, &w->o, &wa);
         else { GGUFTensor *t = gguf_get_tensor(m, name); w->o.ptr = t ? t->data : NULL; w->o.dtype = t ? (int)t->type : -1; }
         snprintf(name, sizeof(name), "blk.%d.ffn_gate.weight", l);
-        if (is_gpu) upload_w(m, name, &w->gate);
+        if (is_gpu) upload_w(m, name, &w->gate, &wa);
         else { GGUFTensor *t = gguf_get_tensor(m, name); w->gate.ptr = t ? t->data : NULL; w->gate.dtype = t ? (int)t->type : -1; }
         snprintf(name, sizeof(name), "blk.%d.ffn_up.weight", l);
-        if (is_gpu) upload_w(m, name, &w->up);
+        if (is_gpu) upload_w(m, name, &w->up, &wa);
         else { GGUFTensor *t = gguf_get_tensor(m, name); w->up.ptr = t ? t->data : NULL; w->up.dtype = t ? (int)t->type : -1; }
         snprintf(name, sizeof(name), "blk.%d.ffn_down.weight", l);
-        if (is_gpu) upload_w(m, name, &w->down);
+        if (is_gpu) upload_w(m, name, &w->down, &wa);
         else { GGUFTensor *t = gguf_get_tensor(m, name); w->down.ptr = t ? t->data : NULL; w->down.dtype = t ? (int)t->type : -1; }
         snprintf(name, sizeof(name), "blk.%d.attn_norm.weight", l);
-        if (is_gpu) w->attn_norm = upload_f32(m, name);
+        if (is_gpu) w->attn_norm = upload_f32(m, name, &wa);
         else { GGUFTensor *t = gguf_get_tensor(m, name); w->attn_norm = t ? (float*)t->data : NULL; }
         snprintf(name, sizeof(name), "blk.%d.ffn_norm.weight", l);
-        if (is_gpu) w->ffn_norm  = upload_f32(m, name);
+        if (is_gpu) w->ffn_norm  = upload_f32(m, name, &wa);
         else { GGUFTensor *t = gguf_get_tensor(m, name); w->ffn_norm = t ? (float*)t->data : NULL; }
         snprintf(name, sizeof(name), "blk.%d.attn_q.bias", l);
-        if (is_gpu) w->q_bias    = upload_f32(m, name);
+        if (is_gpu) w->q_bias    = upload_f32(m, name, &wa);
         else { GGUFTensor *t = gguf_get_tensor(m, name); w->q_bias = t ? (float*)t->data : NULL; }
         snprintf(name, sizeof(name), "blk.%d.attn_k.bias", l);
-        if (is_gpu) w->k_bias    = upload_f32(m, name);
+        if (is_gpu) w->k_bias    = upload_f32(m, name, &wa);
         else { GGUFTensor *t = gguf_get_tensor(m, name); w->k_bias = t ? (float*)t->data : NULL; }
-        snprintf(name, sizeof(name), "blk.%d.post_attention_norm.weight", l); w->post_attn_norm = upload_f32(m, name); /* gemma2 sandwich */
+        snprintf(name, sizeof(name), "blk.%d.post_attention_norm.weight", l); w->post_attn_norm = upload_f32(m, name, &wa); /* gemma2 sandwich */
         {   /* gemma4 MatFormer block tensors (optional) */
             GGUFTensor *tg = gguf_get_tensor(m, name);
             (void)tg;
         }
         snprintf(name, sizeof(name), "blk.%d.inp_gate.weight", l);
-        if (gguf_get_tensor(m, name)) upload_w(m, name, &w->inp_gate);
+        if (gguf_get_tensor(m, name)) upload_w(m, name, &w->inp_gate, &wa);
         snprintf(name, sizeof(name), "blk.%d.proj.weight", l);
-        if (gguf_get_tensor(m, name)) upload_w(m, name, &w->pl_proj);
+        if (gguf_get_tensor(m, name)) upload_w(m, name, &w->pl_proj, &wa);
         snprintf(name, sizeof(name), "blk.%d.post_norm.weight", l);
-        w->pl_post_norm = upload_f32(m, name);   /* gemma4: normalizes pl_proj out */
+        w->pl_post_norm = upload_f32(m, name, &wa);   /* gemma4: normalizes pl_proj out */
         snprintf(name, sizeof(name), "blk.%d.layer_output_scale.weight", l);
         {
             GGUFTensor *tsc = gguf_get_tensor(m, name);
@@ -3482,11 +3556,11 @@ Qwen2Engine *qwen2_engine_create(const TTConfig *cfg, GGUFModel *m) {
             if (tsc && tsc->data && tsc->size_bytes >= 4)
                 memcpy(&w->out_scale_val, tsc->data, 4);
         }
-        snprintf(name, sizeof(name), "blk.%d.post_ffw_norm.weight", l);       w->post_ffn_norm  = upload_f32(m, name); /* gemma2 sandwich */
-        snprintf(name, sizeof(name), "blk.%d.attn_v.bias", l);         w->v_bias    = upload_f32(m, name); /* optional */
+        snprintf(name, sizeof(name), "blk.%d.post_ffw_norm.weight", l);       w->post_ffn_norm  = upload_f32(m, name, &wa); /* gemma2 sandwich */
+        snprintf(name, sizeof(name), "blk.%d.attn_v.bias", l);         w->v_bias    = upload_f32(m, name, &wa); /* optional */
         if (e->cfg.tr.qk_norm_rms) {   /* qwen3 trait: gammas required */
-            snprintf(name, sizeof(name), "blk.%d.attn_q_norm.weight", l); w->q_norm = upload_f32(m, name);
-            snprintf(name, sizeof(name), "blk.%d.attn_k_norm.weight", l); w->k_norm = upload_f32(m, name);
+            snprintf(name, sizeof(name), "blk.%d.attn_q_norm.weight", l); w->q_norm = upload_f32(m, name, &wa);
+            snprintf(name, sizeof(name), "blk.%d.attn_k_norm.weight", l); w->k_norm = upload_f32(m, name, &wa);
             if (!w->q_norm || !w->k_norm) { /* gemma4: no per-layer QK norm gammas; clear trait, skip step */
                 if (l == 0) fprintf(stderr, "[qwen2-engine] qk_norm_rms trait set but attn_q/k_norm missing; disabling (gemma4)\n");
                 w->q_norm = w->k_norm = NULL; e->cfg.tr.qk_norm_rms = 0;
@@ -3571,17 +3645,20 @@ Qwen2Engine *qwen2_engine_create(const TTConfig *cfg, GGUFModel *m) {
             e->has_pl_embd = 1;
             e->pl_dim = m->per_layer_embd_dim;
             memset(&e->pl_model_proj, 0, sizeof(TTensor));
-            void *dpj = NULL;
-            if (cudaMalloc(&dpj, tm->size_bytes) == cudaSuccess) {
+            size_t pj_off = w_arena_claim(&wa, tm->size_bytes);
+            if (pj_off == (size_t)-1) {
+                ABORT_CREATE("arena overrun per_layer_model_proj.weight");
+            }
+            {
+                void *dpj = wa.base + pj_off;
                 if (cudaMemcpy(dpj, tm->data, tm->size_bytes, cudaMemcpyHostToDevice) != cudaSuccess) {
-                    cudaFree(dpj);
                     ABORT_CREATE("cudaMemcpy fail per_layer_model_proj.weight");
                 }
                 e->pl_model_proj.ptr = dpj;
                 e->pl_model_proj.dtype = (int)tm->type;
                                 fprintf(stderr, "[qwen2-engine] pl_model_proj type=%d size=%ld ne=[%ld,%ld]\n",
                         (int)tm->type, tm->size_bytes, tm->shape[0], tm->shape[1]);
-            } else { e->has_pl_embd = 0; }
+            }
         }
         if (e->has_pl_embd) {
             const long row = (long)e->cfg.n_layers * e->pl_dim;   /* 8960 */
@@ -3598,13 +3675,16 @@ Qwen2Engine *qwen2_engine_create(const TTConfig *cfg, GGUFModel *m) {
             {
                 float *ones = (float *)malloc(ones_n * sizeof(float));
                 for (int i = 0; i < ones_n; i++) ones[i] = 1.0f;
-                cudaMemcpy(e->d_ones, ones, ones_n * sizeof(float),
-                           cudaMemcpyHostToDevice);
+                if (cudaMemcpy(e->d_ones, ones, ones_n * sizeof(float),
+                               cudaMemcpyHostToDevice) != cudaSuccess) {
+                    free(ones);
+                    ABORT_CREATE("cudaMemcpy fail d_ones");
+                }
                 free(ones);
             }
             e->ple_pe = (float *)malloc(row * sizeof(float));
             cudaMalloc(&e->d_rope_freqs, 256 * sizeof(float));
-            cudaMemset(e->d_rope_freqs, 0, 256 * sizeof(float));
+            CK_CREATE(cudaMemset(e->d_rope_freqs, 0, 256 * sizeof(float)), "cudaMemset fail d_rope_freqs");
             fprintf(stderr, "[qwen2-engine] MatFormer per-layer embeddings ON "
                             "(pl_dim=%d)\n", e->pl_dim);
 
@@ -3613,8 +3693,8 @@ Qwen2Engine *qwen2_engine_create(const TTConfig *cfg, GGUFModel *m) {
             {
                 GGUFTensor *trf = gguf_get_tensor(m, "rope_freqs.weight");
                 if (trf && trf->data && trf->size_bytes >= 256 * 4)
-                    cudaMemcpy(e->d_rope_freqs, trf->data, 256 * sizeof(float),
-                               cudaMemcpyHostToDevice);
+                    CK_CREATE(cudaMemcpy(e->d_rope_freqs, trf->data, 256 * sizeof(float),
+                               cudaMemcpyHostToDevice), "cudaMemcpy fail rope_freqs");
             }
 
             /* pl_heads/kv/ffn already derived above from tensor shapes */
@@ -3643,23 +3723,23 @@ Qwen2Engine *qwen2_engine_create(const TTConfig *cfg, GGUFModel *m) {
     const long cache_per = (long)max_kv * cfg->max_ctx * cfg->head_dim;
     cudaMalloc(&e->d_kc, cache_per * cfg->n_layers * sizeof(float));
     cudaMalloc(&e->d_vc, cache_per * cfg->n_layers * sizeof(float));
-    cudaMemset(e->d_kc, 0, cache_per * cfg->n_layers * sizeof(float));
-    cudaMemset(e->d_vc, 0, cache_per * cfg->n_layers * sizeof(float));
-    cudaMemset(e->d_xn, 0, D * sizeof(float));
-    cudaMemset(e->d_q, 0, max_qout * sizeof(float));
-    cudaMemset(e->d_att, 0, max_qout * sizeof(float));
-    cudaMemset(e->d_h, 0, F * sizeof(float));
-    cudaMemset(e->d_g, 0, F * sizeof(float));
-    cudaMemset(e->d_u, 0, F * sizeof(float));
-    cudaMemset(e->d_logits, 0, (long)e->cfg.vocab * sizeof(float));
-    cudaMemset(e->d_x, 0, D * sizeof(float));
+    CK_CREATE(cudaMemset(e->d_kc, 0, cache_per * cfg->n_layers * sizeof(float)), "cudaMemset fail d_kc");
+    CK_CREATE(cudaMemset(e->d_vc, 0, cache_per * cfg->n_layers * sizeof(float)), "cudaMemset fail d_vc");
+    CK_CREATE(cudaMemset(e->d_xn, 0, D * sizeof(float)), "cudaMemset fail d_xn");
+    CK_CREATE(cudaMemset(e->d_q, 0, max_qout * sizeof(float)), "cudaMemset fail d_q");
+    CK_CREATE(cudaMemset(e->d_att, 0, max_qout * sizeof(float)), "cudaMemset fail d_att");
+    CK_CREATE(cudaMemset(e->d_h, 0, F * sizeof(float)), "cudaMemset fail d_h");
+    CK_CREATE(cudaMemset(e->d_g, 0, F * sizeof(float)), "cudaMemset fail d_g");
+    CK_CREATE(cudaMemset(e->d_u, 0, F * sizeof(float)), "cudaMemset fail d_u");
+    CK_CREATE(cudaMemset(e->d_logits, 0, (long)e->cfg.vocab * sizeof(float)), "cudaMemset fail d_logits");
+    CK_CREATE(cudaMemset(e->d_x, 0, D * sizeof(float)), "cudaMemset fail d_x");
     const long kvdim_alloc = (long)max_kv * cfg->head_dim;   /* per-layer max */
     cudaMalloc(&e->d_k_stage, kvdim_alloc * sizeof(float));
     cudaMalloc(&e->d_v_stage, kvdim_alloc * sizeof(float));
-    cudaMemset(e->d_k_stage, 0, kvdim_alloc * sizeof(float));
-    cudaMemset(e->d_v_stage, 0, kvdim_alloc * sizeof(float));
+    CK_CREATE(cudaMemset(e->d_k_stage, 0, kvdim_alloc * sizeof(float)), "cudaMemset fail d_k_stage");
+    CK_CREATE(cudaMemset(e->d_v_stage, 0, kvdim_alloc * sizeof(float)), "cudaMemset fail d_v_stage");
     cudaMalloc(&e->d_pos, sizeof(int));
-    cudaMemsetAsync(e->d_pos, 0, sizeof(int), e->stream);   /* pos starts at 0 on device */
+    CK_CREATE(cudaMemsetAsync(e->d_pos, 0, sizeof(int), e->stream), "cudaMemset fail d_pos");   /* pos starts at 0 on device */
     const int nb = 256;
     cudaMalloc(&e->d_bvals, nb * sizeof(float));
     cudaMalloc(&e->d_bidxs, nb * sizeof(int));
@@ -3668,12 +3748,12 @@ Qwen2Engine *qwen2_engine_create(const TTConfig *cfg, GGUFModel *m) {
     e->repeat_penalty = 1.0f;
     cudaMalloc(&e->d_recent, 64 * sizeof(int));
     cudaMalloc(&e->d_n_recent, sizeof(int));
-    cudaMemset(e->d_recent, 0, 64 * sizeof(int));
-    cudaMemsetAsync(e->d_n_recent, 0, sizeof(int), e->stream);
+    CK_CREATE(cudaMemset(e->d_recent, 0, 64 * sizeof(int)), "cudaMemset fail d_recent");
+    CK_CREATE(cudaMemsetAsync(e->d_n_recent, 0, sizeof(int), e->stream), "cudaMemset fail d_n_recent");
     {
         int zero = 0;
         cudaMalloc(&e->d_sampling_on, sizeof(int));
-        cudaMemcpy(e->d_sampling_on, &zero, sizeof(int), cudaMemcpyHostToDevice);
+        CK_CREATE(cudaMemcpy(e->d_sampling_on, &zero, sizeof(int), cudaMemcpyHostToDevice), "cudaMemcpy fail d_sampling_on");
     }
     cudaMalloc(&e->d_out, sizeof(int));
     /* graph replay state */
@@ -3803,9 +3883,10 @@ Qwen2Engine *qwen2_engine_create(const TTConfig *cfg, GGUFModel *m) {
 
 void qwen2_engine_free(Qwen2Engine *e) {
     if (!e) return;
-    /* weight buffers were allocated individually; free via cudaFree of tracked
-     * pointers is omitted where ownership aliases mmap (host side frees via gguf_free).
-     * Device allocations freed here: */
+    /* weights live in the single w_arena (free once); individual weight ptrs
+     * point into it and must NOT be freed. Host tensors alias mmap
+     * (host side frees via gguf_free). Device allocations freed here: */
+    if (e->w_arena) { cudaFree(e->w_arena); e->w_arena = NULL; e->w_arena_size = 0; }
     cudaFree(e->d_x); cudaFree(e->d_xn); cudaFree(e->d_q); cudaFree(e->d_att); cudaFree(e->d_h);
     if (e->d_g) cudaFree(e->d_g);
     if (e->d_u) cudaFree(e->d_u);
@@ -3863,8 +3944,8 @@ void qwen2_engine_free(Qwen2Engine *e) {
     if (e->d_pf_pos_batch) cudaFree(e->d_pf_pos_batch);
     if (e->d_split_pl)   cudaFree(e->d_split_pl);
     if (e->d_x_batch)    cudaFree(e->d_x_batch);
-    /* NOTE: per-weight cudaFree calls are intentionally not tracked here; they are
-     * leaked until process exit by design (engine lifetime == process lifetime).
+    /* NOTE: individual weight ptrs point into w_arena (freed once above);
+     * freeing them here would double-free.
     if (e->h_x_buf) free(e->h_x_buf);
     if (e->h_xn_buf) free(e->h_xn_buf);
     if (e->h_q_buf) free(e->h_q_buf);
