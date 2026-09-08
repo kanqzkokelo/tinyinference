@@ -1,0 +1,4 @@
+model,quant,ctx,pp_tps,tg_tps,qkv_ms,attn_ms,o_ms,ffn_ms,lmhead_ms,other_ms
+qwen2.5-0.5b-instruct,q4_0,110,1478.6,106.7,0.568,1.505,0.249,1.502,0.792,0.66
+qwen2.5-0.5b-instruct,q4_0,510,1633.5,84.3,0.621,6.461,0.297,1.704,0.793,0.745
+qwen2.5-0.5b-instruct,q4_0,2110,1001.5,77.5,0.682,7.99,0.361,2.01,0.793,0.874

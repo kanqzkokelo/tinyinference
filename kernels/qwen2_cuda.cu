@@ -3973,14 +3973,16 @@ static int g_capturing = 0;
  * ms is accumulated and stored for a median table printed via
  * qwen2_debug_profile_report(). */
 typedef enum {
-    TT_P_EMBED = 0, TT_P_QKV, TT_P_OMLP, TT_P_FLASH,
-    TT_P_RMSNORM, TT_P_SCATTER, TT_P_LOGITS, TT_P_ARGMAX,
+    TT_P_EMBED = 0, TT_P_QKV, TT_P_OPROJ, TT_P_FFGATEUP, TT_P_FFDOWN,
+    TT_P_ATTN, TT_P_RMSNORM, TT_P_ROPE, TT_P_SCATTER, TT_P_LOGITS,
+    TT_P_ARGMAX, TT_P_OTHER,
     TT_P_NSTAGES
 } TTProfStage;
 
 static const char *tt_prof_names[TT_P_NSTAGES] = {
-    "embed", "qkv-gemv", "o+mlp-gemv", "flash",
-    "rmsnorm", "kv-scatter", "logits-gemv", "argmax"
+    "embed", "qkv-gemv", "o-proj", "ffn-gateup", "ffn-down",
+    "attn", "rmsnorm", "rope", "kv-scatter", "logits-gemv",
+    "argmax", "other"
 };
 
 typedef struct {
@@ -4292,11 +4294,13 @@ static int forward_layers(Qwen2Engine *e) {
         }
 
         CHK_STAGE("2b biases+qknorm");
+        if (tt_profiling()) tt_prof_end(TT_P_QKV, e->stream);
         /* 3. RoPE on q (all heads) and on the staged k row (in-place, pre-scatter).
          * Kernel picked by the rope-style trait: NEOX half-split vs GPT-J
          * interleaved pairs (llama family). */
         static int no_rope = -1;
         if (no_rope < 0) no_rope = getenv("TT_NO_ROPE") ? 1 : 0;
+        if (tt_profiling()) tt_prof_begin(TT_P_ROPE, e->stream);
         if (!no_rope) {
             /* gemma4: full-attn layers (16 heads) use base 1e6 + partial-rope
              * freq factors (theta/ff); swa layers use base 1e4, full rotation. */
@@ -4323,7 +4327,10 @@ static int forward_layers(Qwen2Engine *e) {
             }
         }
 
+        if (tt_profiling()) tt_prof_end(TT_P_ROPE, e->stream);
+
         /* v projection + bias (QKV group) */
+        if (tt_profiling()) tt_prof_begin(TT_P_QKV, e->stream);
         if (!kv_shared) {
         int vrc = tt_gemv_layer_dispatch(w->v.ptr, w->v.dtype, e->d_xn, e->d_v_stage, kvdim_l, c->dim, e->stream);
         if (vrc && getenv("TT_DEBUG")) fprintf(stderr, "[qwen2-engine] v gemv rc=%d\n", vrc);
@@ -4374,7 +4381,7 @@ static int forward_layers(Qwen2Engine *e) {
          * under graph capture the chosen path is fixed for the recorded
          * graph's lifetime — safe because the serial path is functionally
          * correct at every ctx and the test gates use short ctx. */
-        if (tt_profiling()) tt_prof_begin(TT_P_FLASH, e->stream);
+        if (tt_profiling()) tt_prof_begin(TT_P_ATTN, e->stream);
         {
             const int ctx_l = e->pos;            /* host mirror of *d_pos */
             const float scale_l = c->tr.attn_scale_one ? 1.0f
@@ -4456,7 +4463,7 @@ static int forward_layers(Qwen2Engine *e) {
                 }
             }
         }
-        if (tt_profiling()) tt_prof_end(TT_P_FLASH, e->stream);
+        if (tt_profiling()) tt_prof_end(TT_P_ATTN, e->stream);
 
         CHK_STAGE("4 flash");
         if (trace && l == 0) {
@@ -4465,7 +4472,7 @@ static int forward_layers(Qwen2Engine *e) {
         }
         if (trace && e->has_pl_embd && l >= 18 && l <= 21) ple_canary(e, "flash", l);
         /* 5. Wo projection + residual: x += att @ Wo^T */
-        if (tt_profiling()) tt_prof_begin(TT_P_OMLP, e->stream);
+        if (tt_profiling()) tt_prof_begin(TT_P_OPROJ, e->stream);
         int orc_ = tt_gemv_layer_dispatch(w->o.ptr, w->o.dtype, e->d_att, e->d_xn, c->dim, attn_qout, e->stream);
         if (orc_ && getenv("TT_DEBUG")) fprintf(stderr, "[qwen2-engine] o gemv rc=%d\n", orc_);
         /* gemma2 sandwich: normalize the attention output before residual */
@@ -4474,7 +4481,7 @@ static int forward_layers(Qwen2Engine *e) {
                 e->d_xn, w->post_attn_norm, e->d_xn, c->dim, c->rms_eps,
                 c->tr.norm_offset);
         k_add<<<(c->dim + 255) / 256, 256, 0, e->stream>>>(e->d_x, e->d_xn, c->dim);
-        if (tt_profiling()) tt_prof_end(TT_P_OMLP, e->stream);
+        if (tt_profiling()) tt_prof_end(TT_P_OPROJ, e->stream);
         if (trace && l == 0) {
             static float ao2[4096];
             /* o-proj output lands in d_xn pre-residual */
@@ -4493,7 +4500,7 @@ static int forward_layers(Qwen2Engine *e) {
         /* 7+8. MLP: fused q4_0 SwiGLU/GeGLU when possible (epilogue from the
          * activation trait), else two typed GEMVs + elementwise apply.
          * Then down projection + residual. */
-        if (tt_profiling()) tt_prof_begin(TT_P_OMLP, e->stream);
+        if (tt_profiling()) tt_prof_begin(TT_P_FFGATEUP, e->stream);
         const int act_gelu = (c->tr.act == ACT_GELU) ? 1 : 0;
         if (w->gate.dtype == GGUF_TYPE_Q4_0 && w->up.dtype == GGUF_TYPE_Q4_0
             && !e->has_pl_embd) {   /* gemma4: force typed path until fused-GELU is validated */
@@ -4512,6 +4519,8 @@ static int forward_layers(Qwen2Engine *e) {
                 e->d_g, e->d_u, e->d_h, FF_l, act_gelu);
             CHK_STAGE("6b swiglu-apply");
         }
+        if (tt_profiling()) tt_prof_end(TT_P_FFGATEUP, e->stream);
+        if (tt_profiling()) tt_prof_begin(TT_P_FFDOWN, e->stream);
         int drc = tt_gemv_layer_dispatch(w->down.ptr, w->down.dtype, e->d_h, e->d_xn,
                       c->dim, FF_l, e->stream);
         if (drc && getenv("TT_DEBUG")) fprintf(stderr, "[qwen2-engine] down gemv rc=%d\n", drc);
@@ -4523,7 +4532,7 @@ static int forward_layers(Qwen2Engine *e) {
                 c->tr.norm_offset);
         k_add<<<(c->dim + 255) / 256, 256, 0, e->stream>>>(e->d_x, e->d_xn, c->dim);
         CHK_STAGE("7d add");
-        if (tt_profiling()) tt_prof_end(TT_P_OMLP, e->stream);
+        if (tt_profiling()) tt_prof_end(TT_P_FFDOWN, e->stream);
         CHK_STAGE("7 mlp");
         if (trace && l == 0) {
             eng_rms(e, e->d_h, "gu", FF_l);
@@ -4550,6 +4559,7 @@ static int forward_layers(Qwen2Engine *e) {
         static int no_ple2 = -1;
         if (no_ple2 < 0) no_ple2 = getenv("TT_NO_PLE") ? 1 : 0;
         if (e->has_pl_embd && !no_ple2) {
+            if (tt_profiling()) tt_prof_begin(TT_P_OTHER, e->stream);
             const int slot = e->pos % c->max_ctx;
             (void)slot;
             /* V2 fast path: 2 device launches, no host round-trips, graph-
@@ -4703,6 +4713,7 @@ static int forward_layers(Qwen2Engine *e) {
                     fprintf(stderr, "[PLEDBG] L0 x-after: sum=%.4f nan=%d scale=%f\n", s, nan, w->out_scale_val);
                 }
             }
+            if (tt_profiling()) tt_prof_end(TT_P_OTHER, e->stream);
         }
 
         {
@@ -5384,6 +5395,7 @@ int prefill_batched_gemm(Qwen2Engine *e, const int *toks, int n, float *h_x_out)
         {
             static int no_rope = -1;
             if (no_rope < 0) no_rope = getenv("TT_NO_ROPE") ? 1 : 0;
+            if (tt_profiling()) tt_prof_begin(TT_P_ROPE, e->stream);
             if (!no_rope) {
                 dim3 g_qb((HDl / 2 + 63) / 64, H_l, n), b_rope(64, 1, 1);
                 dim3 g_kb((HDl / 2 + 63) / 64, KV_l, n);
@@ -5406,6 +5418,8 @@ int prefill_batched_gemm(Qwen2Engine *e, const int *toks, int n, float *h_x_out)
                     }
                 }
             }
+            if (tt_profiling()) tt_prof_end(TT_P_ROPE, e->stream);
+            if (tt_profiling()) tt_prof_begin(TT_P_SCATTER, e->stream);
             if (!kv_shared) {
                 /* P0-1: dual-write FP32 + Q4. Decode below thresh reads FP32;
                  * decode above thresh reads Q4, so both must be populated.
@@ -5431,11 +5445,12 @@ int prefill_batched_gemm(Qwen2Engine *e, const int *toks, int n, float *h_x_out)
                         d_K, d_V, Kl_f, Vl_f, d_pos_batch, KV_l, HDl, c->max_ctx, n, kvdim_l);
                 }
             }
+            if (tt_profiling()) tt_prof_end(TT_P_SCATTER, e->stream);
         }
 
         /* P0-1: prefill flash always on FP32 (bit-exact output at every ctx).
          * Q4 cache stays populated for decode above thresh. P0-2: ptr guard. */
-        if (tt_profiling()) tt_prof_begin(TT_P_FLASH, e->stream);
+        if (tt_profiling()) tt_prof_begin(TT_P_ATTN, e->stream);
         if (HDl > 128) {
             /* Tiled prefill flash regs/smem sized for elems<=4 (HD<=128);
              * fall back to per-token serial path for this layer only. */
@@ -5467,10 +5482,10 @@ int prefill_batched_gemm(Qwen2Engine *e, const int *toks, int n, float *h_x_out)
             launch_prefill_flash(d_Q, Kl_f, Vl_f, d_Att,
                 n, e->pos + n, e->pos, H_l, KV_l, HDl, scale_l, swa_l, e->stream);
         }
-        if (tt_profiling()) tt_prof_end(TT_P_FLASH, e->stream);
+        if (tt_profiling()) tt_prof_end(TT_P_ATTN, e->stream);
 
         /* 4. O projection */
-        if (tt_profiling()) tt_prof_begin(TT_P_OMLP, e->stream);
+        if (tt_profiling()) tt_prof_begin(TT_P_OPROJ, e->stream);
         if (w->o.dtype == TTQ_Q4_0) {
             if (cublas_prefill_try(e, l, 3, d_Att, d_Xn, dim, attn_qout, n, e->stream) != 0)
                 prefill_gemm_fn(w->o.ptr, d_Att, d_Xn, dim, attn_qout, n, e->stream);
@@ -5479,7 +5494,7 @@ int prefill_batched_gemm(Qwen2Engine *e, const int *toks, int n, float *h_x_out)
                 tt_gemv_layer_dispatch(w->o.ptr, w->o.dtype, d_Att + (long)i * attn_qout, d_Xn + (long)i * dim, dim, attn_qout, e->stream);
             }
         }
-        if (tt_profiling()) tt_prof_end(TT_P_OMLP, e->stream);
+        if (tt_profiling()) tt_prof_end(TT_P_OPROJ, e->stream);
 
         if (w->post_attn_norm) {
             k_rmsnorm_batched<<<n,256,256*sizeof(float),e->stream>>>(d_Xn, w->post_attn_norm, d_Xn, dim, c->rms_eps, c->tr.norm_offset, n);
@@ -5495,7 +5510,7 @@ int prefill_batched_gemm(Qwen2Engine *e, const int *toks, int n, float *h_x_out)
 
         /* 6. Gate & Up GEMM projections */
         const int act_gelu = (c->tr.act == ACT_GELU) ? 1 : 0;
-        if (tt_profiling()) tt_prof_begin(TT_P_OMLP, e->stream);
+        if (tt_profiling()) tt_prof_begin(TT_P_FFGATEUP, e->stream);
         if (w->gate.dtype == TTQ_Q4_0) {
             if (cublas_prefill_try(e, l, 4, d_Xn, d_G, FF_l, dim, n, e->stream) != 0)
                 prefill_gemm_fn(w->gate.ptr, d_Xn, d_G, FF_l, dim, n, e->stream);
@@ -5507,13 +5522,13 @@ int prefill_batched_gemm(Qwen2Engine *e, const int *toks, int n, float *h_x_out)
                 tt_gemv_layer_dispatch(w->up.ptr, w->up.dtype, d_Xn + (long)i * dim, d_U + (long)i * FF_l, FF_l, dim, e->stream);
             }
         }
-        if (tt_profiling()) tt_prof_end(TT_P_OMLP, e->stream);
+        if (tt_profiling()) tt_prof_end(TT_P_FFGATEUP, e->stream);
 
         /* 7. SwiGLU activation */
         k_swiglu_apply<<<(n * FF_l + 255) / 256, 256, 0, e->stream>>>(d_G, d_U, d_H, n * FF_l, act_gelu);
 
         /* 8. Down projection GEMM */
-        if (tt_profiling()) tt_prof_begin(TT_P_OMLP, e->stream);
+        if (tt_profiling()) tt_prof_begin(TT_P_FFDOWN, e->stream);
         if (w->down.dtype == TTQ_Q4_0) {
             if (cublas_prefill_try(e, l, 6, d_H, d_Xn, dim, FF_l, n, e->stream) != 0)
                 prefill_gemm_fn(w->down.ptr, d_H, d_Xn, dim, FF_l, n, e->stream);
@@ -5522,7 +5537,7 @@ int prefill_batched_gemm(Qwen2Engine *e, const int *toks, int n, float *h_x_out)
                 tt_gemv_layer_dispatch(w->down.ptr, w->down.dtype, d_H + (long)i * FF_l, d_Xn + (long)i * dim, dim, FF_l, e->stream);
             }
         }
-        if (tt_profiling()) tt_prof_end(TT_P_OMLP, e->stream);
+        if (tt_profiling()) tt_prof_end(TT_P_FFDOWN, e->stream);
 
         if (w->post_ffn_norm) {
             k_rmsnorm_batched<<<n,256,256*sizeof(float),e->stream>>>(d_Xn, w->post_ffn_norm, d_Xn, dim, c->rms_eps, c->tr.norm_offset, n);
@@ -5750,6 +5765,7 @@ int prefill_batched_gemm_dx(Qwen2Engine *e, const int *toks, int n, float *d_x_o
         {
             static int no_rope = -1;
             if (no_rope < 0) no_rope = getenv("TT_NO_ROPE") ? 1 : 0;
+            if (tt_profiling()) tt_prof_begin(TT_P_ROPE, e->stream);
             if (!no_rope) {
                 dim3 g_qb((HDl / 2 + 63) / 64, H_l, n), b_rope(64, 1, 1);
                 dim3 g_kb((HDl / 2 + 63) / 64, KV_l, n);
@@ -5772,6 +5788,8 @@ int prefill_batched_gemm_dx(Qwen2Engine *e, const int *toks, int n, float *d_x_o
                     }
                 }
             }
+            if (tt_profiling()) tt_prof_end(TT_P_ROPE, e->stream);
+            if (tt_profiling()) tt_prof_begin(TT_P_SCATTER, e->stream);
             if (!kv_shared) {
                 /* P0-1: dual-write FP32 + Q4. Decode below thresh reads FP32;
                  * decode above thresh reads Q4, so both must be populated.
@@ -5797,6 +5815,7 @@ int prefill_batched_gemm_dx(Qwen2Engine *e, const int *toks, int n, float *d_x_o
                         d_K, d_V, Kl_f, Vl_f, d_pos_batch, KV_l, HDl, c->max_ctx, n, kvdim_l);
                 }
             }
+            if (tt_profiling()) tt_prof_end(TT_P_SCATTER, e->stream);
         }
 
         /* P0-1: prefill flash always on FP32 (bit-exact output at every ctx).

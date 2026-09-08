@@ -275,6 +275,7 @@ int main(int argc, char **argv) {
     printf("\"\n[gen: %d tokens | decode %.1f tok/s | prefill %.1f tok/s | incl prefill %.1f tok/s | %s]\n",
            gen_count, gen_count / dec, n_prompt / prefill_sec, gen_count / tot, temp > 0.0f ? "sampled" : "greedy");
     printf("STATS tokens=%d prefill=%d decode_us=%.0f prefill_us=%.0f prefill_tok_s=%.1f\n", gen_count, n_prompt, dec * 1e6, prefill_sec * 1e6, n_prompt / prefill_sec);
+    if (getenv("TT_PROFILE")) qwen2_debug_profile_report(gen_count);
 
     free(logits);
     qwen2_engine_free(eng);
