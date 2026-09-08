@@ -58,7 +58,8 @@ def gpu_gemm(name, a, b):
 
 
 rng = np.random.default_rng(3)
-CASES = [(64, 64, 64), (128, 96, 160), (256, 256, 256), (288, 320, 272)]
+CASES = [(64, 64, 64), (128, 96, 160), (256, 256, 256), (288, 320, 272),
+         (16, 16, 16), (32, 32, 32), (48, 48, 48), (48, 32, 32), (32, 48, 32)]
 KERNELS = ["tt_cuda_sgemm_naive", "tt_cuda_sgemm_tiled",
            "tt_cuda_sgemm_wmma"]
 
