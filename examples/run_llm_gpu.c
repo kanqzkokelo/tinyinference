@@ -195,6 +195,11 @@ int main(int argc, char **argv) {
     }
     printf("[run] prompt: %d tokens\n", n_prompt);
     if (n_prompt <= 0) return 1;
+    if (n_prompt > MAX_CTX) {
+        fprintf(stderr, "[run] prompt too long: %d tokens > MAX_CTX %d; rerun with larger TT_MAX_CTX or shorter input\n",
+                n_prompt, MAX_CTX);
+        return 1;
+    }
 
     struct timespec t0, t1, tp0, tp1;
     AsyncPrinter *ap = async_printer_start();

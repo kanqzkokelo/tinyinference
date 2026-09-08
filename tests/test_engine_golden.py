@@ -281,7 +281,8 @@ def verify(filter_model, workdir, approximate=False, tol_median=None, tol_drift=
         rows = golden.get(c["model"], [])
         match = next((r for r in rows if r["prompt"] == c["prompt"]), None)
         if match is None:
-            print(f"  [{c['model']}/{c['prompt']}] no golden row; skipping tolerance check")
+            print(f"  [{c['model']}/{c['prompt']}] FAIL: no golden row (add vector or explicit allowlist)")
+            fails += 1
             continue
         med_drift = abs(c["diff_median"] - match["diff_median"])
         max_drift = abs(c["diff_max"] - match["diff_max"])
