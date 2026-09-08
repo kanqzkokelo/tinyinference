@@ -201,6 +201,34 @@ class TestSamplers(unittest.TestCase):
         seen = {tuple(self.cli.seq(cfg, seed, 50, logits)) for seed in (1, 2, 3)}
         self.assertEqual(len(seen), 3, "distinct seeds produced identical streams")
 
+    # -- partial top-K tie boundary -----------------------------------
+    def test_topk_tie_boundary_exact(self):
+        logits = [5.0, 4.0, 4.0, 4.0, 4.0, 1.0, 0.0, -1.0]
+        for k, want in ((3, [0, 1, 2]), (2, [0, 1])):
+            toks, probs = self.cli.cand(f"K={k},T=1.0", logits)
+            self.assertEqual(toks, want)
+            order = sorted(range(len(logits)),
+                           key=lambda i: (-logits[i], i))[:k]
+            self.assertEqual(order, want)
+            ref = softmax([logits[i] / 1.0 for i in want])
+            for got, exp in zip(probs, ref):
+                self.assertAlmostEqual(got, exp, places=5)
+            self.assertAlmostEqual(sum(probs), 1.0, places=5)
+
+    # -- seed-0 xorshift repair ----------------------------------------
+    def test_seed_zero_repaired(self):
+        logits = [2.2, 1.1, 3.3, 0.4, 1.7, 2.9]
+        cfg = "T=0.8"
+        a = self.cli.seq(cfg, 0, 50, logits)
+        b = self.cli.seq(cfg, 0, 50, logits)
+        self.assertEqual(a, b)
+        self.assertEqual(len(a), 50)
+        # 0x9E3779B97F4A7A15 == 11400714819323197973
+        golden = self.cli.seq(cfg, 11400714819323197973, 50, logits)
+        self.assertEqual(a, golden)
+        self.assertEqual(self.cli.run(cfg, 0, logits),
+                         self.cli.run(cfg, 11400714819323197973, logits))
+
     # -- speculative-decode API --------------------------------------------
     def test_candidates_sorted_renormalized(self):
         logits = [1.0, 3.0, 2.0, 0.5, 2.5]

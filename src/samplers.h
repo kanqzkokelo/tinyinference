@@ -25,7 +25,9 @@
  *
  * Determinism: identical (logits, cfg, *rng_state) always yield identical
  * tokens. RNG is xorshift64* seeded from caller-owned uint64_t state; the
- * state is advanced in place so callers can stream draws. Greedy path never
+ * state is advanced in place so callers can stream draws. A zero seed is
+ * absorbing for xorshift, so tt_sample repairs it deterministically to
+ * 0x9E3779B97F4A7A15 on entry. Greedy path never
  * touches *rng_state.
  */
 #ifndef TT_SAMPLERS_H

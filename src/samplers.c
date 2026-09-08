@@ -44,6 +44,33 @@ static int cmp_pair_desc(const void *a, const void *b) {
     return pa->idx - pb->idx;
 }
 
+/* K-th largest logit value (1-indexed k) via 3-way quickselect on the
+ * logit value only. Permutes a; duplicates collapse in one pass so an
+ * all-equal array is O(n). Callers re-establish idx-ascending tie order
+ * when collecting equals. */
+static float kth_largest_logit(tt_pair_t *a, int n, int k) {
+    int lo = 0, hi = n - 1, kk = k - 1;
+    for (;;) {
+        if (lo == hi) return a[lo].logit;
+        float pivot = a[(lo + hi) / 2].logit;
+        int lt = lo, i = lo, gt = hi;
+        while (i <= gt) {
+            if (a[i].logit > pivot) {
+                tt_pair_t t = a[lt]; a[lt] = a[i]; a[i] = t;
+                lt++; i++;
+            } else if (a[i].logit < pivot) {
+                tt_pair_t t = a[i]; a[i] = a[gt]; a[gt] = t;
+                gt--;
+            } else {
+                i++;
+            }
+        }
+        if (kk < lt) hi = lt - 1;
+        else if (kk <= gt) return pivot;
+        else lo = gt + 1;
+    }
+}
+
 static int argmax_f(const float *w, int n) {
     int best = 0;
     for (int i = 1; i < n; i++)
@@ -120,12 +147,26 @@ static int run_chain(const float *logits, int n, const tt_sampler_chain *cfg,
 
     /* order all candidates once; every later stage is a truncation */
     for (int i = 0; i < n; i++) { pr[i].logit = w[i]; pr[i].idx = i; }
-    qsort(pr, (size_t)n, sizeof(tt_pair_t), cmp_pair_desc);
 
     int m_local = n;
 
     /* 4. top-K (k = 0 off) */
-    if (cfg->top_k > 0 && cfg->top_k < m_local) m_local = cfg->top_k;
+    if (cfg->top_k > 0 && cfg->top_k < m_local) {
+        /* partial selection: v = K-th largest logit, then all above v
+         * plus idx-ascending equals to fill exactly K, sorted. Matches
+         * the full-sort prefix exactly, ties straddling K included. */
+        int k = cfg->top_k;
+        float v = kth_largest_logit(pr, n, k);
+        int c = 0;
+        for (int i = 0; i < n; i++)
+            if (w[i] > v) { pr[c].logit = w[i]; pr[c].idx = i; c++; }
+        for (int i = 0; i < n && c < k; i++)
+            if (w[i] == v) { pr[c].logit = w[i]; pr[c].idx = i; c++; }
+        qsort(pr, (size_t)k, sizeof(tt_pair_t), cmp_pair_desc);
+        m_local = k;
+    } else {
+        qsort(pr, (size_t)n, sizeof(tt_pair_t), cmp_pair_desc);
+    }
 
     /* 5. min-p: keep p_i >= min_p * p_top <=> logit >= max + ln(min_p)
      * (monotonic in logit space since temperature already applied) */
@@ -173,6 +214,7 @@ int tt_sample(const float *logits, int n, const tt_sampler_chain *cfg,
     if (run_chain(logits, n, cfg, workbuf, &ord, &probs, &m) != 0) return -1;
     if (m == 1) return ord[0];           /* greedy/top-k=1: no RNG draw */
 
+    if (rng_state && *rng_state == 0) *rng_state = 0x9E3779B97F4A7A15ULL; /* xorshift zero is absorbing; repair deterministically */
     float r = tt_rng_float(rng_state);
     float cum = 0.0f;
     for (int i = 0; i < m - 1; i++) {
