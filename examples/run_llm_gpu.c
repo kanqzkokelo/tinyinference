@@ -103,6 +103,7 @@ int main(int argc, char **argv) {
     float top_p = 0.9f;
     int top_k = 0;
     float rep_penalty = 1.1f;
+    const char *model_path_arg = NULL;
 
     int pos_arg = 0;
     for (int i = 1; i < argc; i++) {
@@ -118,6 +119,8 @@ int main(int argc, char **argv) {
             top_k = atoi(argv[++i]);
         } else if (strcmp(argv[i], "--rep-penalty") == 0 && i + 1 < argc) {
             rep_penalty = (float)atof(argv[++i]);
+        } else if ((strcmp(argv[i], "-m") == 0 || strcmp(argv[i], "--model") == 0) && i + 1 < argc) {
+            model_path_arg = argv[++i];
         } else if (argv[i][0] != '-') {
             if (pos_arg == 0) prompt = argv[i];
             else if (pos_arg == 1) target_tokens = atoi(argv[i]);
@@ -133,8 +136,9 @@ int main(int argc, char **argv) {
         srand((unsigned int)time(NULL));
     }
 
-    const char *model_path = getenv("TT_MODEL") ? getenv("TT_MODEL")
-        : "data/models/qwen2.5-0.5b-instruct-q4_0.gguf";
+    const char *model_path = model_path_arg ? model_path_arg
+        : (getenv("TT_MODEL") ? getenv("TT_MODEL")
+        : "data/models/qwen2.5-0.5b-instruct-q4_0.gguf");
     const int MAX_CTX = getenv("TT_MAX_CTX") ? atoi(getenv("TT_MAX_CTX")) : 1024;
 
     GGUFModel *model = gguf_load(model_path);
@@ -232,6 +236,8 @@ int main(int argc, char **argv) {
     int gen_count = 0;
     char turn_text[8192];
     size_t tl = 0;
+    struct timespec t_first = {0, 0};
+    int got_first_token = 0;
     for (int s = 0; s < target_tokens && qwen2_engine_pos(eng) < MAX_CTX - 1; s++) {
         int id;
         if (temp <= 0.0f) {
@@ -243,6 +249,11 @@ int main(int argc, char **argv) {
         }
 
         if (id < 0 || (tok && (id == tok->eos_id || id == 151645))) break;
+        if (!got_first_token) {
+            cudaDeviceSynchronize();
+            clock_gettime(CLOCK_MONOTONIC, &t_first);
+            got_first_token = 1;
+        }
         if (!tok) { gen_count++; continue; }   /* no decoder yet: count only */
         int out_len = 0;
         const char *txt = bpe_decode_token(tok, id, &out_len);
@@ -272,9 +283,14 @@ int main(int argc, char **argv) {
     const double dec = (t1.tv_sec - t0.tv_sec) + (t1.tv_nsec - t0.tv_nsec) * 1e-9;
     const double tot = (t1.tv_sec - tp0.tv_sec) + (t1.tv_nsec - tp0.tv_nsec) * 1e-9;
     const double prefill_sec = (t0.tv_sec - tp0.tv_sec) + (t0.tv_nsec - tp0.tv_nsec) * 1e-9;
+    const double first_tok_sec = got_first_token
+        ? ((t_first.tv_sec - tp0.tv_sec) + (t_first.tv_nsec - tp0.tv_nsec) * 1e-9)
+        : (prefill_sec);
     printf("\"\n[gen: %d tokens | decode %.1f tok/s | prefill %.1f tok/s | incl prefill %.1f tok/s | %s]\n",
            gen_count, gen_count / dec, n_prompt / prefill_sec, gen_count / tot, temp > 0.0f ? "sampled" : "greedy");
-    printf("STATS tokens=%d prefill=%d decode_us=%.0f prefill_us=%.0f prefill_tok_s=%.1f\n", gen_count, n_prompt, dec * 1e6, prefill_sec * 1e6, n_prompt / prefill_sec);
+    printf("STATS tokens=%d prefill=%d decode_us=%.0f prefill_us=%.0f prefill_tok_s=%.1f first_token_us=%.0f total_us=%.0f\n",
+           gen_count, n_prompt, dec * 1e6, prefill_sec * 1e6, n_prompt / prefill_sec,
+           first_tok_sec * 1e6, tot * 1e6);
     if (getenv("TT_PROFILE")) qwen2_debug_profile_report(gen_count);
 
     free(logits);

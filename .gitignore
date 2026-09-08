@@ -5,10 +5,12 @@ __pycache__/
 *.pyc
 .pytest_cache/
 data/
+!data/bench/
 *.gguf
 *.part
 *.incomplete
 bench/*.csv
+!bench/scoreboard_decode.csv
 oracle/
 .vscode/
 .idea/
