@@ -18,7 +18,10 @@ BUILD_DIR="${BUILD_DIR:-build}"
 BIN="${BUILD_DIR}/server_minimal"
 if [[ ! -x "${BIN}" ]]; then
     echo "[serve_minimal] ${BIN} not found. Build it first with:" >&2
-    echo "    ${NVCC:-nvcc} -O3 -gencode arch=compute_86,code=sm_86 \\" >&2
+    ARCHS="${CUDA_ARCHS:-86 89}"
+    GENCODE=""
+    for a in ${ARCHS}; do GENCODE="${GENCODE} -gencode arch=compute_${a},code=sm_${a}"; done
+    echo "    ${NVCC:-nvcc} -O3${GENCODE} \\" >&2
     echo "      -I\${HOME}/.local/lib/python3.12/site-packages/nvidia/cuda_runtime/include \\" >&2
     echo "      -Iinclude -Isrc -L\${HOME}/mmcuda/lib -o ${BIN} \\" >&2
     echo "      examples/server_minimal.c src/loader_gguf.c src/arch_registry.c \\" >&2
