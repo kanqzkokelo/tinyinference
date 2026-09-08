@@ -69,7 +69,9 @@ uint32_t tt_ngram_draft(const tt_ngram *g, uint32_t *out) {
     uint64_t needle_start = g->total - g->window;
     uint64_t cand_end_max = needle_start; /* exclusive upper bound */
 
-    for (uint64_t e = cand_end_max; e - g->window >= base; e--) {
+    /* e ranges over [base + window, cand_end_max]; written without
+     * unsigned subtraction so base==0 terminates instead of wrapping. */
+    for (uint64_t e = cand_end_max; e >= base + g->window; ) {
         uint64_t cs = e - g->window;
         uint32_t match = 1;
         for (uint32_t j = 0; j < g->window; j++) {
@@ -88,6 +90,8 @@ uint32_t tt_ngram_draft(const tt_ngram *g, uint32_t *out) {
                 out[j] = ng_at(g, e + j);
             return k;
         }
+        if (e == 0) break;
+        --e;
     }
     return 0;
 }
