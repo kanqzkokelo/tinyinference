@@ -42,36 +42,61 @@
 #include <math.h>
 #define GGUF_MAGIC 0x46554747
 
-/* ---------------- GGUF stream readers (same as loader) ---------------- */
+/* ---------------- GGUF stream readers: bounds-checked only ---------------- */
+/* NOTE: the old unchecked read_u32/read_u64/read_string/skip_kv_value
+ * helpers were removed. All reparse advances use CK_NEED / skip_checked
+ * against `end`; see bpe_tokenizer_init. */
 
-static uint32_t read_u32(const uint8_t **p) {
-    uint32_t v; memcpy(&v, *p, 4); *p += 4; return v;
-}
-static uint64_t read_u64(const uint8_t **p) {
-    uint64_t v; memcpy(&v, *p, 8); *p += 8; return v;
-}
-static void read_string(const uint8_t **p, char *buf, size_t max_len) {
-    uint64_t len = read_u64(p);
-    size_t copy_len = len < max_len - 1 ? len : max_len - 1;
-    memcpy(buf, *p, copy_len);
-    buf[copy_len] = '\0';
-    *p += len;
-}
-static void skip_kv_value(const uint8_t **p, uint32_t type) {
+#define TOK_MAX_COUNT (4u*1024u*1024u)
+
+static int skip_checked(const uint8_t **pp, const uint8_t *end, uint32_t type) {
+    const uint8_t *p = *pp;
+#define SK_NEED(n) do { if (p > end || (size_t)(end - p) < (size_t)(n)) return -1; } while (0)
     switch (type) {
-        case 0: case 1: case 7: *p += 1; break;
-        case 2: case 3: *p += 2; break;
-        case 4: case 5: case 6: *p += 4; break;
-        case 10: case 11: case 12: *p += 8; break;
-        case 8: { uint64_t l = read_u64(p); *p += l; break; }
-        case 9: {
-            uint32_t it = read_u32(p);
-            uint64_t al = read_u64(p);
-            for (uint64_t i = 0; i < al; i++) skip_kv_value(p, it);
+        case 0: case 1: case 7: SK_NEED(1); p += 1; break;
+        case 2: case 3: SK_NEED(2); p += 2; break;
+        case 4: case 5: case 6: SK_NEED(4); p += 4; break;
+        case 10: case 11: case 12: SK_NEED(8); p += 8; break;
+        case 8: {
+            uint64_t l;
+            SK_NEED(8); memcpy(&l, p, 8); p += 8;
+            if (l > (uint64_t)(end - p)) return -1;
+            p += l;
             break;
         }
-        default: break;
+        case 9: {
+            uint32_t it;
+            uint64_t al;
+            SK_NEED(12); memcpy(&it, p, 4); memcpy(&al, p + 4, 8); p += 12;
+            if (it == 9 || it > 12) return -1;
+            if (al > (uint64_t)(16u*1024u*1024u)) return -1;
+            size_t esz = 0;
+            switch (it) {
+                case 0: case 1: case 7: esz = 1; break;
+                case 2: case 3: esz = 2; break;
+                case 4: case 5: case 6: esz = 4; break;
+                case 10: case 11: case 12: esz = 8; break;
+                default: break;
+            }
+            if (esz) {
+                if (al > (uint64_t)SIZE_MAX / esz) return -1;
+                if ((uint64_t)(end - p) < al * esz) return -1;
+                p += (size_t)(al * esz);
+            } else {
+                for (uint64_t i = 0; i < al; i++) {
+                    uint64_t l;
+                    SK_NEED(8); memcpy(&l, p, 8); p += 8;
+                    if (l > (uint64_t)(end - p)) return -1;
+                    p += l;
+                }
+            }
+            break;
+        }
+        default: return -1;
     }
+    *pp = p;
+    return 0;
+#undef SK_NEED
 }
 
 /* ---------------- open-addressing string hash map ---------------- */
@@ -328,13 +353,29 @@ BPETokenizer *bpe_tokenizer_init(const GGUFModel *model) {
         return NULL;
     }
 
-    const uint8_t *p = (const uint8_t *)model->mmap_addr;
-    if (read_u32(&p) != GGUF_MAGIC) { fprintf(stderr, "[BPE] bad magic\n"); return NULL; }
-    (void)read_u32(&p);
-    (void)read_u64(&p);
-    const uint64_t kv_count = read_u64(&p);
+    const uint8_t *base = (const uint8_t *)model->mmap_addr;
+    size_t msize = model->mmap_size;
+    if (!base || msize < 24) {
+        fprintf(stderr, "[BPE] truncated/corrupt tokenizer metadata\n");
+        return NULL;
+    }
+    const uint8_t *p = base;
+    const uint8_t *end = base + msize;
+    Tok *t = NULL;
+#define CK_NEED(n) do { if (p > end || (size_t)(end - p) < (size_t)(n)) goto fail; } while (0)
+    uint32_t magic = 0, version = 0;
+    uint64_t tensor_count = 0, kv_count = 0;
+    CK_NEED(4); memcpy(&magic, p, 4); p += 4;
+    if (magic != GGUF_MAGIC) { fprintf(stderr, "[BPE] bad magic\n"); return NULL; }
+    CK_NEED(4); memcpy(&version, p, 4); p += 4; (void)version;
+    CK_NEED(8); memcpy(&tensor_count, p, 8); p += 8; (void)tensor_count;
+    CK_NEED(8); memcpy(&kv_count, p, 8); p += 8;
 
-    Tok *t = (Tok *)calloc(1, sizeof(Tok));
+    t = (Tok *)calloc(1, sizeof(Tok));
+    if (!t) {
+        fprintf(stderr, "[BPE] truncated/corrupt tokenizer metadata\n");
+        return NULL;
+    }
     t->base.bos_id = -1;
     t->base.eos_id = -1;
     t->pre_type = PRE_GPT2;
@@ -345,39 +386,65 @@ BPETokenizer *bpe_tokenizer_init(const GGUFModel *model) {
     t->kv_add_bos_seen = 0;
     t->dec_cap = 4096;
     t->dec_buf = (char *)malloc(t->dec_cap);
+    if (!t->dec_buf) goto fail;
 
     char key[128];
     uint64_t n_merges = 0;
     for (uint64_t i = 0; i < kv_count; i++) {
-        read_string(&p, key, sizeof(key));
-        const uint32_t vtype = read_u32(&p);
+        uint64_t klen = 0;
+        uint32_t vtype = 0;
+        CK_NEED(8); memcpy(&klen, p, 8); p += 8;
+        if (klen > (uint64_t)(end - p)) goto fail;
+        {
+            size_t kcopy = klen < sizeof(key) - 1 ? (size_t)klen : sizeof(key) - 1;
+            memcpy(key, p, kcopy);
+            key[kcopy] = '\0';
+        }
+        p += (size_t)klen;
+        CK_NEED(4); memcpy(&vtype, p, 4); p += 4;
 
         if (strcmp(key, "tokenizer.ggml.tokens") == 0 && vtype == 9) {
-            (void)read_u32(&p);                       /* item type (STRING) */
-            const uint64_t n = read_u64(&p);
+            uint32_t itype = 0;
+            uint64_t n = 0;
+            CK_NEED(4); memcpy(&itype, p, 4); p += 4; (void)itype;
+            CK_NEED(8); memcpy(&n, p, 8); p += 8;
+            if (n == 0 || n > TOK_MAX_COUNT || n > (uint64_t)INT_MAX) goto fail;
             t->base.vocab_size = (int)n;
-            t->base.tokens = (char **)calloc(n, sizeof(char *));
-            t->base.token_lens = (int *)calloc(n, sizeof(int));
+            t->base.tokens = (char **)calloc((size_t)n, sizeof(char *));
+            t->base.token_lens = (int *)calloc((size_t)n, sizeof(int));
+            if (!t->base.tokens || !t->base.token_lens) goto fail;
             hm_init(&t->tok2id, (size_t)n);
+            if (!t->tok2id.ents) goto fail;
 
             for (uint64_t id = 0; id < n; id++) {
-                const uint64_t slen = read_u64(&p);   /* helper advances p */
+                uint64_t slen = 0;
+                CK_NEED(8); memcpy(&slen, p, 8); p += 8;
+                if (slen > (uint64_t)INT_MAX) goto fail;
+                if (slen > (uint64_t)(end - p)) goto fail;
                 char *s = (char *)malloc((size_t)slen + 1);
+                if (!s) goto fail;
                 memcpy(s, p, (size_t)slen);            /* RAW BYTES, no filtering */
                 s[slen] = '\0';
-                p += slen;
+                p += (size_t)slen;
                 t->base.tokens[id] = s;
                 t->base.token_lens[id] = (int)slen;
                 if ((int)slen > t->max_piece) t->max_piece = (int)slen;
                 hm_put(&t->tok2id, s, (int)slen, (int)id);
             }
         } else if (strcmp(key, "tokenizer.ggml.merges") == 0 && vtype == 9) {
-            (void)read_u32(&p);
-            const uint64_t n = read_u64(&p);
+            uint32_t mitype = 0;
+            uint64_t n = 0;
+            CK_NEED(4); memcpy(&mitype, p, 4); p += 4; (void)mitype;
+            CK_NEED(8); memcpy(&n, p, 8); p += 8;
+            if (n > TOK_MAX_COUNT || n > (uint64_t)INT_MAX) goto fail;
             hm_init(&t->pair_rank, (size_t)n);
+            if (!t->pair_rank.ents) goto fail;
             n_merges = n;
             for (uint64_t r = 0; r < n; r++) {
-                const uint64_t slen = read_u64(&p);   /* helper advances p */
+                uint64_t slen = 0;
+                CK_NEED(8); memcpy(&slen, p, 8); p += 8;
+                if (slen > (uint64_t)INT_MAX) goto fail;
+                if (slen > (uint64_t)(end - p)) goto fail;
                 /* entry format "left right" — rank key is the concatenated pair */
                 const char *sp = memchr(p, ' ', (size_t)slen);
                 const int ll = sp ? (int)(sp - (const char *)p) : -1;
@@ -391,16 +458,20 @@ BPETokenizer *bpe_tokenizer_init(const GGUFModel *model) {
                 p += slen;
             }
         } else if (strcmp(key, "tokenizer.ggml.model") == 0 && vtype == 8) {
-            const uint64_t slen = read_u64(&p);
+            uint64_t slen = 0;
+            CK_NEED(8); memcpy(&slen, p, 8); p += 8;
+            if (slen > (uint64_t)(end - p)) goto fail;
             char tm[32];
-            const size_t cp = slen < sizeof(tm)-1 ? slen : sizeof(tm)-1;
-            memcpy(tm, p, cp); tm[cp] = '\0'; p += slen;
+            const size_t cp = slen < sizeof(tm)-1 ? (size_t)slen : sizeof(tm)-1;
+            memcpy(tm, p, cp); tm[cp] = '\0'; p += (size_t)slen;
             t->sp_mode = (strcmp(tm, "gpt2") != 0);   /* llama/gemma4/gemma => SP */
         } else if (strcmp(key, "tokenizer.ggml.pre") == 0 && vtype == 8) {
-            const uint64_t slen = read_u64(&p);
+            uint64_t slen = 0;
+            CK_NEED(8); memcpy(&slen, p, 8); p += 8;
+            if (slen > (uint64_t)(end - p)) goto fail;
             char pre[32];
-            const size_t cp2 = slen < sizeof(pre)-1 ? slen : sizeof(pre)-1;
-            memcpy(pre, p, cp2); pre[cp2] = '\0'; p += slen;
+            const size_t cp2 = slen < sizeof(pre)-1 ? (size_t)slen : sizeof(pre)-1;
+            memcpy(pre, p, cp2); pre[cp2] = '\0'; p += (size_t)slen;
             /* mirror llama-vocab.cpp: these BPE families prepend BOS by default */
             t->pre_add_bos =
                 strcmp(pre, "llama3") == 0 || strcmp(pre, "llama-v3") == 0 ||
@@ -425,24 +496,47 @@ BPETokenizer *bpe_tokenizer_init(const GGUFModel *model) {
             else
                 t->pre_type = PRE_GPT2;
         } else if (strcmp(key, "tokenizer.ggml.scores") == 0 && vtype == 9) {
-            (void)read_u32(&p);
-            const uint64_t n = read_u64(&p);
-            t->base.scores = (float *)calloc(n, sizeof(float));
-            for (uint64_t j = 0; j < n; j++) { t->base.scores[j] = *(const float *)p; p += 4; }
+            uint32_t sitype = 0;
+            uint64_t n = 0;
+            CK_NEED(4); memcpy(&sitype, p, 4); p += 4; (void)sitype;
+            CK_NEED(8); memcpy(&n, p, 8); p += 8;
+            if (n > TOK_MAX_COUNT || n > (uint64_t)INT_MAX) goto fail;
+            if (n > (uint64_t)SIZE_MAX / sizeof(float)) goto fail;
+            CK_NEED((size_t)n * sizeof(float));
+            if (n == 0) {
+                t->base.scores = NULL;
+            } else {
+                t->base.scores = (float *)calloc((size_t)n, sizeof(float));
+                if (!t->base.scores) goto fail;
+                memcpy(t->base.scores, p, (size_t)n * sizeof(float));
+                p += (size_t)n * sizeof(float);
+            }
         } else if (strcmp(key, "tokenizer.ggml.add_bos_token") == 0 && vtype == 7) {
-            t->add_bos = *(const int8_t *)p ? 1 : 0;
+            CK_NEED(1);
+            t->add_bos = p[0] ? 1 : 0;
             t->kv_add_bos_seen = 1;
             p += 1;
         } else if (strcmp(key, "tokenizer.ggml.bos_token_id") == 0) {
-            t->base.bos_id = *(const int32_t *)p;
-            skip_kv_value(&p, vtype);
+            if (vtype == 4 || vtype == 5) {
+                int32_t v = 0;
+                CK_NEED(4); memcpy(&v, p, 4); p += 4;
+                t->base.bos_id = v;
+            } else {
+                if (skip_checked(&p, end, vtype) != 0) goto fail;
+            }
         } else if (strcmp(key, "tokenizer.ggml.eos_token_id") == 0) {
-            t->base.eos_id = *(const int32_t *)p;
-            skip_kv_value(&p, vtype);
+            if (vtype == 4 || vtype == 5) {
+                int32_t v = 0;
+                CK_NEED(4); memcpy(&v, p, 4); p += 4;
+                t->base.eos_id = v;
+            } else {
+                if (skip_checked(&p, end, vtype) != 0) goto fail;
+            }
         } else {
-            skip_kv_value(&p, vtype);
+            if (skip_checked(&p, end, vtype) != 0) goto fail;
         }
     }
+#undef CK_NEED
 
     if (!t->base.tokens || (!t->sp_mode && !t->pair_rank.ents)) {
         fprintf(stderr, "[BPE] missing tokens or merges in GGUF\n");
@@ -457,6 +551,11 @@ BPETokenizer *bpe_tokenizer_init(const GGUFModel *model) {
            t->base.vocab_size, (unsigned long long)n_merges,
            t->base.bos_id, t->base.eos_id, t->add_bos, t->n_specials);
     return &t->base;
+
+fail:
+    if (t) bpe_tokenizer_free(&t->base);
+    fprintf(stderr, "[BPE] truncated/corrupt tokenizer metadata\n");
+    return NULL;
 }
 
 const char *bpe_decode_token(const BPETokenizer *tok_, int token_id, int *out_len) {
@@ -1109,6 +1208,7 @@ void bpe_tokenizer_free(BPETokenizer *tok_) {
     }
     free(tok_->token_lens);
     free(tok_->scores);
+    free(t->dec_buf);
     free(t->specials);
     hm_free(&t->pair_rank);
     hm_free(&t->tok2id);
