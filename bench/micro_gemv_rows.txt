@@ -1,0 +1,73 @@
+# micro_gemv_rows — Task 2 measurement (decode GEMV rows/warp)
+# GPU: RTX 3050 Laptop (sm_86). Build flags = Makefile `cuda` rule + --ptxas-options=-v:
+#   $HOME/mmcuda/bin/nvcc -O3 -gencode arch=compute_86,code=sm_86 -gencode arch=compute_89,code=sm_89 \
+#     -I$CUDA_INC -Iinclude -Xcompiler -fPIC \
+#     -o build/micro_gemv_rows tools/micro_gemv_rows.cu kernels/gemv_q4_cuda.cu kernels/gemv_typed.cu \
+#     -L$HOME/mmcuda/lib -lcudart -lpthread -lm
+# --ptxas-options=-v register usage (sm_86, all 0 spill / 0 stack frame):
+#   k_gemv_q4_0 (V2 layer)      48 regs
+#   k_gemv_q4_0_v4 (V4 layer)   50 regs
+#   k_gemv_q4_0_batch4          80 regs
+#   k_logits_q4_0 (scalar)      40 regs
+#   k_logits_q4_0_v2            48 regs
+#   k_logits_q4_0_v4            50 regs
+#   k_logits_q4_0_batch4        96 regs
+#   k_logits_q8_0 (scalar)      40 regs
+#   k_logits_q8_0_v4            62 regs
+#   k_gemv_q8_0_batch4          72 regs
+# Full ptxas log lines: 294 in $HOME/ti-scratch/ptxas.log
+# Method: 20 warmup + 200 timed iters, per-iter CUDA events, median us.
+# BW: Q4_0 bytes=M*(K/32)*18, Q8_0 bytes=M*(K/32)*34; GB/s=bytes/med_s/1e9.
+# Batch4 streams weights once per launch (4 toks); per-tok us = launch/4.
+# --- run output ---
+device: NVIDIA GeForce RTX 3050 Laptop GPU
+method: 20 warmup + 200 timed iters, per-iter CUDA events, median us
+bw formula: Q4_0 bytes=M*(K/32)*18, Q8_0 bytes=M*(K/32)*34; GB/s=bytes/med_s/1e9
+--- class=Q-proj M=896 K=896 ---
+[Q-proj ] M=   896 K= 896 entry=tt_gemv_q4_0           median=    11.07 us  GB/s=  40.79
+[Q-proj ] M=   896 K= 896 entry=tt_gemv_q4_0_v4        median=     9.09 us  GB/s=  49.69
+[Q-proj ] M=   896 K= 896 entry=tt_gemv_q4_0_dispatch  median=     9.06 us  GB/s=  49.87
+[Q-proj ] M=   896 K= 896 entry=tt_gemv_q4_0_batch4    median=    19.46 us/launch (    4.86 us/tok)  GB/s=  23.21
+--- class=Q-proj M=1152 K=896 ---
+[Q-proj ] M=  1152 K= 896 entry=tt_gemv_q4_0           median=    13.31 us  GB/s=  43.62
+[Q-proj ] M=  1152 K= 896 entry=tt_gemv_q4_0_v4        median=    10.24 us  GB/s=  56.70
+[Q-proj ] M=  1152 K= 896 entry=tt_gemv_q4_0_dispatch  median=    10.24 us  GB/s=  56.70
+[Q-proj ] M=  1152 K= 896 entry=tt_gemv_q4_0_batch4    median=    34.82 us/launch (    8.70 us/tok)  GB/s=  16.68
+--- class=Q-proj M=1536 K=896 ---
+[Q-proj ] M=  1536 K= 896 entry=tt_gemv_q4_0           median=    14.34 us  GB/s=  54.00
+[Q-proj ] M=  1536 K= 896 entry=tt_gemv_q4_0_v4        median=    11.10 us  GB/s=  69.72
+[Q-proj ] M=  1536 K= 896 entry=tt_gemv_q4_0_dispatch  median=    11.14 us  GB/s=  69.52
+[Q-proj ] M=  1536 K= 896 entry=tt_gemv_q4_0_batch4    median=    34.78 us/launch (    8.70 us/tok)  GB/s=  22.26
+--- class=FFN M=4864 K=896 ---
+[FFN    ] M=  4864 K= 896 entry=tt_gemv_q4_0           median=    35.87 us  GB/s=  68.34
+[FFN    ] M=  4864 K= 896 entry=tt_gemv_q4_0_v4        median=    24.58 us  GB/s=  99.75
+[FFN    ] M=  4864 K= 896 entry=tt_gemv_q4_0_dispatch  median=    24.58 us  GB/s=  99.75
+[FFN    ] M=  4864 K= 896 entry=tt_gemv_q4_0_batch4    median=    80.90 us/launch (   20.22 us/tok)  GB/s=  30.30
+--- class=LM-head M=151936 K=896 ---
+[LM-head] M=151936 K= 896 entry=tt_gemv_q4_0           median=   751.46 us  GB/s= 101.90
+[LM-head] M=151936 K= 896 entry=tt_gemv_q4_0_v4        median=   438.27 us  GB/s= 174.72
+[LM-head] M=151936 K= 896 entry=tt_logits_q4_0         median=  4509.70 us  GB/s=  16.98
+[LM-head] M=151936 K= 896 entry=tt_logits_q4_0_v2      median=   768.00 us  GB/s=  99.71
+[LM-head] M=151936 K= 896 entry=tt_logits_q4_0_v4      median=   458.75 us  GB/s= 166.92
+[LM-head] M=151936 K= 896 entry=tt_logits_q4_0_batch4  median=   946.18 us/launch (  236.54 us/tok)  GB/s=  80.93
+[LM-head] M=151936 K= 896 entry=tt_logits_q8_0         median=  1358.91 us  GB/s= 106.44
+[LM-head] M=151936 K= 896 entry=tt_logits_q8_0_v4      median=   792.58 us  GB/s= 182.50
+done
+# --- DECISION RECORD (Task 2) ---
+# Winner per class (median us, K=896; margin = (second-best - best)/best):
+#   Q-proj M=896:  V4 9.09 vs V2 11.07            -> V4 wins +21.8%
+#   Q-proj M=1152: V4 10.24 vs V2 13.31           -> V4 wins +30.0%
+#   Q-proj M=1536: V4 11.10 vs V2 14.34           -> V4 wins +29.2%
+#   FFN M=4864:    V4 24.58 vs V2 35.87           -> V4 wins +45.9%
+#   LM-head M=151936 Q4: gemv-V4 438.27 vs logits-V4 458.75 -> gemv-V4 wins +4.7%
+#     (logits-V4 vs logits-V2: 458.75 vs 768.00, +67.4%; scalar 4509.70 off chart)
+#   LM-head Q8: V4 792.58 vs scalar 1358.91      -> V4 wins +71.5%
+#   Batch4 per-token beats single V4 everywhere (4.86 vs 9.09 Q-proj; 20.22 vs 24.58 FFN;
+#     236.54 vs 438.27 LM) but applies to verify path only, not single-token decode.
+#   dispatch == V4 on all shapes (M>=128 routes V4): dispatcher already picks winner.
+# R=8 kernel GO/NO-GO (GO only if best-vs-second margin >10% on FFN or LM-head):
+#   FFN: 45.9% -> GO (V4 far from roof at ~100 GB/s; rows/warp scaling still pays)
+#   LM-head: 4.7% (V4-vs-V4) -> NO-GO (class at ~175 GB/s near roof; R=8 unlikely to help,
+#     and batch4 reg pressure already 80-96 regs)
+# Overall: CONDITIONAL GO for R=8 in Task 3, scoped to FFN/Q-proj shapes only; skip LM-head.
+# R=1 needs no kernel: skip.
