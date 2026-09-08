@@ -7,6 +7,7 @@ binary prints (currently the prefill block; once run_llm_gpu reports after
 the decode loop the last block is the decode table and these become
 per-token decode medians with no script change).
 """
+import argparse
 import csv
 import os
 import re
@@ -20,6 +21,15 @@ os.chdir(ROOT)
 CTXS = (128, 512, 2048)
 RUNS = 3
 GEN_TOKENS = 64
+
+
+def parse_args():
+    p = argparse.ArgumentParser()
+    p.add_argument("--ctxs", default=",".join(map(str, CTXS)),
+                   help="comma-separated target ctxs, e.g. 128,512,2048,4096,8192")
+    a = p.parse_args()
+    ctxs = tuple(int(x) for x in a.ctxs.split(",") if x.strip())
+    return ctxs if ctxs else CTXS
 PROMPT = "Explain quantum computing in one sentence."
 FILLER = ("The quick brown fox jumps over the lazy dog near the river bank "
           "while soft rain falls on the quiet village below the hills. ")
@@ -85,9 +95,10 @@ def cols(st):
 
 
 model, quant = model_quant()
+CTXS = parse_args()
 rows = []
 for target in CTXS:
-    outs = [run_once(pad_prompt(target), target + 256) for _ in range(RUNS)]
+    outs = [run_once(pad_prompt(target), target + 512) for _ in range(RUNS)]
     ctx = int(statistics.median(o["prefill"] for o in outs))
     row = {
         "model": model, "quant": quant, "ctx": ctx,

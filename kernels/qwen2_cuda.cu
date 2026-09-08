@@ -3866,8 +3866,12 @@ Qwen2Engine *qwen2_engine_create(const TTConfig *cfg, GGUFModel *m) {
     e->d_kc_q4 = NULL;
     e->d_vc_q4 = NULL;
     e->use_q4_kvcache = 0;
+    const char *kv_f16_env = getenv("TT_KV_F16");
+    int kv_force_f16 = (kv_f16_env && atoi(kv_f16_env) != 0);
     const char *q4_env = getenv("TT_Q4_KV");
-    if (q4_env && atoi(q4_env) != 0) {
+    if (kv_force_f16) {
+        fprintf(stderr, "[qwen2-engine] TT_KV_F16=1: quantized KV disabled, FP32 path\n");
+    } else if (q4_env && atoi(q4_env) != 0) {
         qwen2_engine_enable_q4_kvcache(e, 1);
     } else {
         const char *q8_env = getenv("TT_Q8_KV");
