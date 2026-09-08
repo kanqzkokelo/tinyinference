@@ -82,7 +82,7 @@ tt_chat_opts tt_chat_opts_default(void);
 /* Format a conversation. snprintf return semantics: returns the TOTAL
  * length the formatted prompt would need (excluding NUL). If that is
  * >= cap, output was truncated; call again with a larger buffer.
- * Negative on error: -1 unknown family, -2 bad arguments (NULL out,
+ * Negative on error: -1 unknown family or unknown role, -2 bad arguments (NULL out,
  * cap == 0, n > 0 with NULL msgs). */
 int tt_chat_format_ex(tt_chat_family fam, const tt_msg *msgs, int n,
                       const tt_chat_opts *opts, char *out, size_t cap);

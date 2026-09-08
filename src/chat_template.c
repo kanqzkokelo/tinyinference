@@ -264,6 +264,12 @@ int tt_chat_format_ex(tt_chat_family fam, const tt_msg *msgs, int n,
                       const tt_chat_opts *opts, char *out, size_t cap) {
     if (!out || cap == 0 || (n > 0 && !msgs)) return -2;
     if (fam < TT_CHAT_QWEN2 || fam > TT_CHAT_LLAMA3) return -1;
+    for (int i = 0; i < n; i++) {
+        const char *role = msgs[i].role;
+        if (!role || (strcmp(role, "system") != 0 &&
+                       strcmp(role, "user") != 0 &&
+                       strcmp(role, "assistant") != 0)) return -1;
+    }
     tt_chat_opts dflt;
     if (!opts) { dflt = tt_chat_opts_default(); opts = &dflt; }
 

@@ -379,6 +379,31 @@ check("history accumulation matches direct format",
       buf.value.decode(),
       fmt(TT_CHAT_QWEN2, [("system", SYS), ("user", U1)])[0])
 
+# ---- unknown-role rejection --------------------------------------------------
+# Central check in tt_chat_format_ex: any role outside
+# {"system", "user", "assistant"} (incl. "" / NULL) returns -1, all families.
+for _fam, _name in [(TT_CHAT_QWEN2, "qwen2"), (TT_CHAT_QWEN3, "qwen3"),
+                     (TT_CHAT_GEMMA, "gemma"), (TT_CHAT_GEMMA4, "gemma4"),
+                     (TT_CHAT_LLAMA3, "llama3")]:
+    _, _rc = fmt(_fam, [("user", U1), ("wizard", A1)])
+    if _rc == -1:
+        print(f"ok   {_name} unknown role wizard -> -1")
+    else:
+        FAILURES.append(f"{_name} wizard role")
+        print(f"FAIL {_name} wizard role should return -1 (rc={_rc})")
+    _, _rc = fmt(_fam, [("user", U1), ("", A1)])
+    if _rc == -1:
+        print(f"ok   {_name} empty role -> -1")
+    else:
+        FAILURES.append(f"{_name} empty role")
+        print(f"FAIL {_name} empty role should return -1 (rc={_rc})")
+    _out, _rc = fmt(_fam, [("user", U1), ("assistant", A1)])
+    if _rc >= 0 and _out:
+        print(f"ok   {_name} user+assistant control renders")
+    else:
+        FAILURES.append(f"{_name} control")
+        print(f"FAIL {_name} user+assistant control should render (rc={_rc})")
+
 # ---- optional tokenizer encode-check ---------------------------------------
 # Skipped by design: bpe_encode needs a full GGUFModel (loader_gguf + weights).
 # Wire up later inside examples/chat_llm_gpu.c where the model is loaded:
