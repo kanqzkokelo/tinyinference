@@ -193,6 +193,100 @@ __global__ void k_rmsnorm(const float *__restrict__ x, const float *__restrict__
     }
 }
 
+/* Task 4 FIRST fusion: RMSNorm(x,g)->xn + Q/K/V row-GEMVs for Q4_0 weights.
+ * Each block rebuilds xn in shared with the same loop order as k_rmsnorm
+ * (blockDim 256, so bits match), writes xn out, then its warps run the
+ * k_gemv_q4_0 row-pair math verbatim against shared xn. Caller gates on
+ * Q4_0/even-M/nb-even/D<=4096; anything else takes the old path. */
+__global__ void k_rmsnorm_qkv_q4_0(const float *__restrict__ x, const float *__restrict__ g,
+                          float *__restrict__ xn,
+                          const BlockQ4_0 *__restrict__ Wq, const BlockQ4_0 *__restrict__ Wk,
+                          const BlockQ4_0 *__restrict__ Wv,
+                          float *__restrict__ yq, float *__restrict__ yk, float *__restrict__ yv,
+                          int D, int Mq, int Mkv, float eps, float woff) {
+    extern __shared__ float sm[];
+    float *sh = sm;
+    float *red = sm + D;
+    const int tid = threadIdx.x;
+    const int lane = tid & 31;
+    float ss = 0.0f;
+    for (int i = tid; i < D; i += blockDim.x) ss += x[i] * x[i];
+    ss = warp_sum(ss);
+    if ((tid & 31) == 0) red[tid >> 5] = ss;
+    __syncthreads();
+    if (tid == 0) {
+        float t = 0.0f;
+        for (int w = 0; w < (blockDim.x + 31) / 32; w++) t += red[w];
+        red[0] = rsqrtf(t / (float)D + eps);
+    }
+    __syncthreads();
+    const float inv = red[0];
+    if (woff == 0.0f) {
+        for (int i = tid; i < D; i += blockDim.x) { float v = x[i] * inv * g[i]; sh[i] = v; xn[i] = v; }
+    } else {
+        for (int i = tid; i < D; i += blockDim.x) { float v = x[i] * inv * (woff + g[i]); sh[i] = v; xn[i] = v; }
+    }
+    __syncthreads();
+    const int nq2 = Mq >> 1, nkv2 = Mkv >> 1;
+    const int npair = nq2 + nkv2 * 2;
+    const int p = blockIdx.x * (blockDim.x >> 5) + (tid >> 5);
+    if (p >= npair) return;
+    const int nb = D >> 5;
+    const BlockQ4_0 *W;
+    float *y;
+    int row0;
+    if (p < nq2) { W = Wq; y = yq; row0 = p * 2; }
+    else if (p < nq2 + nkv2) { W = Wk; y = yk; row0 = (p - nq2) * 2; }
+    else { W = Wv; y = yv; row0 = (p - nq2 - nkv2) * 2; }
+    const int row1 = row0 + 1;
+    const uint32_t *rw0 = (const uint32_t *)((const char *)W + (long)row0 * nb * 18);
+    const uint32_t *rw1 = (const uint32_t *)((const char *)W + (long)row1 * nb * 18);
+    float s0 = 0.0f, s1 = 0.0f;
+    for (int b = lane; b < nb; b += 32) {
+        const int wsc = (18 * b) >> 2;
+        const unsigned short d16a = (unsigned short)
+            (((18 * b) & 2) ? (rw0[wsc] >> 16) : (rw0[wsc] & 0xFFFFu));
+        const unsigned short d16b = (unsigned short)
+            (((18 * b) & 2) ? (rw1[wsc] >> 16) : (rw1[wsc] & 0xFFFFu));
+        const float da = __half2float(__ushort_as_half(d16a));
+        const float db = __half2float(__ushort_as_half(d16b));
+        const int a0 = (18 * b + 2) >> 2;
+        const int shf = (18 * b + 2) & 2;
+        const float4 *x4 = (const float4 *)(sh + b * 32);
+#pragma unroll
+        for (int k = 0; k < 4; k++) {
+            const uint32_t la = rw0[a0 + k];
+            const uint32_t lb = rw1[a0 + k];
+            const uint32_t va = shf ? __byte_perm(la, rw0[a0 + k + 1], 0x5432) : la;
+            const uint32_t vb = shf ? __byte_perm(lb, rw1[a0 + k + 1], 0x5432) : lb;
+            const float4 xa = x4[k];
+            const float4 xb = x4[k + 4];
+            s0 += (float)((int)(va         & 0xFu) - 8) * da * xa.x;
+            s0 += (float)((int)((va >>  4) & 0xFu) - 8) * da * xb.x;
+            s0 += (float)((int)((va >>  8) & 0xFu) - 8) * da * xa.y;
+            s0 += (float)((int)((va >> 12) & 0xFu) - 8) * da * xb.y;
+            s0 += (float)((int)((va >> 16) & 0xFu) - 8) * da * xa.z;
+            s0 += (float)((int)((va >> 20) & 0xFu) - 8) * da * xb.z;
+            s0 += (float)((int)((va >> 24) & 0xFu) - 8) * da * xa.w;
+            s0 += (float)((int)(va >> 28) - 8) * da * xb.w;
+            s1 += (float)((int)(vb         & 0xFu) - 8) * db * xa.x;
+            s1 += (float)((int)((vb >>  4) & 0xFu) - 8) * db * xb.x;
+            s1 += (float)((int)((vb >>  8) & 0xFu) - 8) * db * xa.y;
+            s1 += (float)((int)((vb >> 12) & 0xFu) - 8) * db * xb.y;
+            s1 += (float)((int)((vb >> 16) & 0xFu) - 8) * db * xa.z;
+            s1 += (float)((int)((vb >> 20) & 0xFu) - 8) * db * xb.z;
+            s1 += (float)((int)((vb >> 24) & 0xFu) - 8) * db * xa.w;
+            s1 += (float)((int)(vb >> 28) - 8) * db * xb.w;
+        }
+    }
+    s0 = warp_sum(s0);
+    s1 = warp_sum(s1);
+    if (lane == 0) {
+        y[row0] = s0;
+        y[row1] = s1;
+    }
+}
+
 /* ---------------- M9 PLE-fused V2 (gemma4 MatFormer block) ----------------
  *
  * Replaces the per-layer host-assisted PLE round-trip (D2H x2, H2D x2, plus
@@ -4249,22 +4343,44 @@ static int forward_layers(Qwen2Engine *e) {
             if (ce_ != cudaSuccess && getenv("TT_DEBUG")) \
                 fprintf(stderr, "[qwen2-engine] L%d %s: %s\n", l, tag, cudaGetErrorString(ce_)); } while(0)
 
-        /* 1. xn = rmsnorm(x) * attn_norm */
-        if (tt_profiling()) tt_prof_begin(TT_P_RMSNORM, e->stream);
-        k_rmsnorm<<<1, 256, 256 * sizeof(float), e->stream>>>(
-            e->d_x, w->attn_norm, e->d_xn, c->dim, c->rms_eps, c->tr.norm_offset);
-        if (tt_profiling()) tt_prof_end(TT_P_RMSNORM, e->stream);
-
-        CHK_STAGE("1 rmsnorm");
-        if (trace && l == 0) { eng_rms(e, e->d_xn, "xn", c->dim); }
-        /* 2. projections: q -> d_q ; k,v -> KV cache slot pos */
-        if (tt_profiling()) tt_prof_begin(TT_P_QKV, e->stream);
+        /* 1+2 fused (Task 4 FIRST): rmsnorm->xn + Q/K/V GEMVs, Q4_0 only.
+         * TT_NO_FUSE=1 forces the old two-launch path. */
         const int H_l = e->pl_heads[l] > 0 ? e->pl_heads[l] : c->n_heads;
         const int KV_l = e->pl_kv[l] > 0 ? e->pl_kv[l] : c->n_kv_heads;
         const int FF_l = e->pl_ffn[l] > 0 ? e->pl_ffn[l] : c->hidden_dim;
         const int HDl = e->pl_hd[l] > 0 ? e->pl_hd[l] : HD;
         const int attn_qout = H_l * HDl;
         const int kvdim_l = KV_l * HDl;
+        static int no_fuse = -1;
+        if (no_fuse < 0) no_fuse = getenv("TT_NO_FUSE") ? 1 : 0;
+        const int use_fuse = (!no_fuse && !kv_shared &&
+            w->q.dtype == 2 && w->k.dtype == 2 && w->v.dtype == 2 &&
+            c->dim > 0 && c->dim <= 4096 && (c->dim & 63) == 0 &&
+            attn_qout > 0 && (attn_qout & 1) == 0 &&
+            kvdim_l > 0 && (kvdim_l & 1) == 0 &&
+            H_l > 0 && H_l <= 64 && KV_l > 0 && KV_l <= 64 &&
+            HDl > 0 && HDl <= 512 &&
+            H_l * HDl == attn_qout && KV_l * HDl == kvdim_l) ? 1 : 0;
+        if (use_fuse) {
+            if (tt_profiling()) tt_prof_begin(TT_P_QKV, e->stream);
+            const int npair = (attn_qout >> 1) + (kvdim_l >> 1) * 2;
+            const dim3 fg((npair + 7) / 8, 1, 1), fb(256, 1, 1);
+            const size_t fsh = ((size_t)c->dim + 8) * sizeof(float);
+            k_rmsnorm_qkv_q4_0<<<fg, fb, fsh, e->stream>>>(
+                e->d_x, w->attn_norm, e->d_xn,
+                (const BlockQ4_0 *)w->q.ptr, (const BlockQ4_0 *)w->k.ptr,
+                (const BlockQ4_0 *)w->v.ptr, e->d_q, e->d_k_stage, e->d_v_stage,
+                c->dim, attn_qout, kvdim_l, c->rms_eps, c->tr.norm_offset);
+            CHK_STAGE("2 qkv-gemv");
+        } else {
+        if (tt_profiling()) tt_prof_begin(TT_P_RMSNORM, e->stream);
+        k_rmsnorm<<<1, 256, 256 * sizeof(float), e->stream>>>(
+            e->d_x, w->attn_norm, e->d_xn, c->dim, c->rms_eps, c->tr.norm_offset);
+        if (tt_profiling()) tt_prof_end(TT_P_RMSNORM, e->stream);
+
+        CHK_STAGE("1 rmsnorm");
+        /* 2. projections: q -> d_q ; k,v -> KV cache slot pos */
+        if (tt_profiling()) tt_prof_begin(TT_P_QKV, e->stream);
         int qrc = tt_gemv_layer_dispatch(w->q.ptr, w->q.dtype, e->d_xn, e->d_q,
                       attn_qout, c->dim, e->stream);
         if (qrc && getenv("TT_DEBUG")) fprintf(stderr, "[qwen2-engine] q gemv rc=%d\n", qrc);
@@ -4272,6 +4388,9 @@ static int forward_layers(Qwen2Engine *e) {
             int krc = tt_gemv_layer_dispatch(w->k.ptr, w->k.dtype, e->d_xn, e->d_k_stage, kvdim_l, c->dim, e->stream);
             if (krc && getenv("TT_DEBUG")) fprintf(stderr, "[qwen2-engine] k gemv rc=%d\n", krc);
         }
+        CHK_STAGE("2 qkv-gemv");
+        } /* use_fuse else */
+        if (trace && l == 0) { eng_rms(e, e->d_xn, "xn", c->dim); }
         /* QKV biases present in some GGUF conversions of Qwen2 (applied by
          * llama.cpp whenever the tensors exist). Optional by design. */
         CHK_STAGE("2 qkv-gemv");
@@ -4329,7 +4448,16 @@ static int forward_layers(Qwen2Engine *e) {
 
         if (tt_profiling()) tt_prof_end(TT_P_ROPE, e->stream);
 
-        /* v projection + bias (QKV group) */
+        /* v projection + bias (QKV group); fused path already did the GEMV */
+        if (use_fuse) {
+            if (w->v_bias)
+                k_add<<<(kvdim + 255) / 256, 256, 0, e->stream>>>(e->d_v_stage, w->v_bias, kvdim);
+            if (e->has_pl_embd) {
+                const int vt = HDl < 256 ? HDl : 256;
+                k_qk_norm_rms<<<KV_l, vt, vt * sizeof(float), e->stream>>>(
+                    e->d_v_stage, e->d_ones, KV_l, HDl, c->rms_eps);
+            }
+        } else {
         if (tt_profiling()) tt_prof_begin(TT_P_QKV, e->stream);
         if (!kv_shared) {
         int vrc = tt_gemv_layer_dispatch(w->v.ptr, w->v.dtype, e->d_xn, e->d_v_stage, kvdim_l, c->dim, e->stream);
@@ -4344,6 +4472,7 @@ static int forward_layers(Qwen2Engine *e) {
         }
         }
         if (tt_profiling()) tt_prof_end(TT_P_QKV, e->stream);
+        }
 
         /* scatter staged K/V into the cache slot chosen by *d_pos.
          * Must precede flash attention. Shared-KV layers skip: they read the
