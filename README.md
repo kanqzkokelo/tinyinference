@@ -25,6 +25,14 @@ make run_llm_gpu         # needs nvcc + RTX-class GPU
 ./build/run_llm_gpu data/models/qwen2.5-0.5b-instruct-q4_0.gguf "Hello"
 ```
 
+## Chat frontends
+
+```
+./chat          # bash launcher -> build/chat_llm_gpu (C binary, fastest)
+python3 chat.py      # terminal client (template + sampling knobs)
+python3 real_chat.py # ctypes live chat app (uses build/libtinytorch.so)
+```
+
 ## Gates
 
 ```

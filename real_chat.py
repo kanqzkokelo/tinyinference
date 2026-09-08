@@ -9,7 +9,9 @@ import sys
 import time
 import numpy as np
 
-ROOT = "/home/mitesh/Storage/repos/nnfromscratch"
+ROOT = os.path.dirname(os.path.abspath(__file__))
+while ROOT != "/" and not os.path.isdir(os.path.join(ROOT, "kernels")):
+    ROOT = os.path.dirname(ROOT)
 QWEN_PATH = os.path.join(ROOT, "data", "models", "qwen2.5-0.5b-instruct-q4_0.gguf")
 GEMMA_PATH = os.path.join(ROOT, "data", "models", "gemma-4-E4B_q4_0-it.gguf")
 MODEL_PATH = os.path.join(ROOT, "data", "models", "qwen2.5-0.5b-instruct-q4_0.gguf")
