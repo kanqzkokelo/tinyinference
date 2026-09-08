@@ -119,7 +119,11 @@ static int upload_w(GGUFModel *m, const char *name, TTensor *out) {
     if (!t || !t->data) { fprintf(stderr, "[qwen2-engine] weight upload missing: %s\n", name); return -1; }
     void *d = NULL;
     if (cudaMalloc(&d, t->size_bytes) != cudaSuccess) { fprintf(stderr, "[qwen2-engine] cudaMalloc fail %s\n", name); return -1; }
-    cudaMemcpy(d, t->data, t->size_bytes, cudaMemcpyHostToDevice);
+    if (cudaMemcpy(d, t->data, t->size_bytes, cudaMemcpyHostToDevice) != cudaSuccess) {
+        fprintf(stderr, "[qwen2-engine] cudaMemcpy fail %s\n", name);
+        cudaFree(d);
+        return -1;
+    }
     out->ptr = d;
     out->dtype = (int)t->type;
     if (getenv("TT_DEBUG")) {
@@ -3283,7 +3287,11 @@ static float *upload_f32(GGUFModel *m, const char *name) {
     }
     float *d = NULL;
     if (cudaMalloc(&d, t->size_bytes) != cudaSuccess) { fprintf(stderr, "[qwen2-engine] cudaMalloc fail %s\n", name); return NULL; }
-    cudaMemcpy(d, t->data, t->size_bytes, cudaMemcpyHostToDevice);
+    if (cudaMemcpy(d, t->data, t->size_bytes, cudaMemcpyHostToDevice) != cudaSuccess) {
+        fprintf(stderr, "[qwen2-engine] cudaMemcpy fail %s\n", name);
+        cudaFree(d);
+        return NULL;
+    }
     return d;
 }
 
@@ -3351,6 +3359,7 @@ Qwen2Engine *qwen2_engine_create(const TTConfig *cfg, GGUFModel *m) {
     if (!cfg || !m || cfg->dim == 0) { fail("bad config"); return NULL; }
     if (cfg->dim % cfg->n_heads || cfg->n_heads % cfg->n_kv_heads ||
         cfg->hidden_dim % 32 || cfg->dim % 32) { fail("dims not divisible"); return NULL; }
+    if (cfg->head_dim <= 0 || cfg->head_dim % 32 != 0) { fail("head_dim must be a positive multiple of 32"); return NULL; }
     if (cfg->n_layers > MAX_LAYERS || cfg->dim > MAX_DIM) { fail("dims exceed engine limits"); return NULL; }
 
     Qwen2Engine *e = (Qwen2Engine *)calloc(1, sizeof(Qwen2Engine));
@@ -3564,7 +3573,10 @@ Qwen2Engine *qwen2_engine_create(const TTConfig *cfg, GGUFModel *m) {
             memset(&e->pl_model_proj, 0, sizeof(TTensor));
             void *dpj = NULL;
             if (cudaMalloc(&dpj, tm->size_bytes) == cudaSuccess) {
-                cudaMemcpy(dpj, tm->data, tm->size_bytes, cudaMemcpyHostToDevice);
+                if (cudaMemcpy(dpj, tm->data, tm->size_bytes, cudaMemcpyHostToDevice) != cudaSuccess) {
+                    cudaFree(dpj);
+                    ABORT_CREATE("cudaMemcpy fail per_layer_model_proj.weight");
+                }
                 e->pl_model_proj.ptr = dpj;
                 e->pl_model_proj.dtype = (int)tm->type;
                                 fprintf(stderr, "[qwen2-engine] pl_model_proj type=%d size=%ld ne=[%ld,%ld]\n",
