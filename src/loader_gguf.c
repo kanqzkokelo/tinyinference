@@ -9,6 +9,13 @@
 
 #define GGUF_MAGIC 0x46554747 // "GGUF"
 
+static const GGUFTensor *g_dup_sort_tensors;
+static int cmp_tensor_ord(const void *a, const void *b) {
+    int ia = *(const int *)a;
+    int ib = *(const int *)b;
+    return strcmp(g_dup_sort_tensors[ia].name, g_dup_sort_tensors[ib].name);
+}
+
 /* Sanity cap: no real model has anywhere near this many tensors; anything
  * larger in a header is corrupt/hostile input aiming at a malloc bomb. */
 #define MAX_TENSORS 10000000ULL
@@ -152,6 +159,15 @@ GGUFModel *gguf_load(const char *filepath) {
     if (tensor_count == 0 || tensor_count > MAX_TENSORS) {
         fprintf(stderr, "[GGUF] Unrealistic tensor count %llu (cap %llu): %s\n",
                 (unsigned long long)tensor_count, (unsigned long long)MAX_TENSORS, filepath);
+        munmap(mmap_addr, file_size);
+        return NULL;
+    }
+    /* A tensor header needs >=33 bytes on disk (u64 name-len + >=1 name byte
+     * + u32 ndim + >=1 u64 shape + u32 type + u64 offset = 8+1+4+8+4+8),
+     * so reject counts that cannot fit, with 2x generous margin (/16). */
+    if (tensor_count > (uint64_t)(file_size / 16)) {
+        fprintf(stderr, "[GGUF] Unrealistic tensor count %llu for %zu-byte file: %s\n",
+                (unsigned long long)tensor_count, file_size, filepath);
         munmap(mmap_addr, file_size);
         return NULL;
     }
@@ -350,6 +366,30 @@ GGUFModel *gguf_load(const char *filepath) {
         goto fail;
     }
 
+    /* Duplicate tensor names: first-wins lookup would silently shadow later
+     * entries, so reject instead. O(n log n) index sort; valid files unchanged. */
+    {
+        int n = model->tensor_count;
+        int *ord = (int *)malloc((size_t)n * sizeof(int));
+        if (!ord) {
+            fprintf(stderr, "[GGUF] Out of memory (dup check)\n");
+            goto fail;
+        }
+        for (int i = 0; i < n; i++) ord[i] = i;
+        g_dup_sort_tensors = model->tensors;
+        qsort(ord, (size_t)n, sizeof(int), cmp_tensor_ord);
+        g_dup_sort_tensors = NULL;
+        for (int i = 1; i < n; i++) {
+            if (strcmp(model->tensors[ord[i - 1]].name, model->tensors[ord[i]].name) == 0) {
+                fprintf(stderr, "[GGUF] Duplicate tensor name '%s': %s\n",
+                        model->tensors[ord[i]].name, filepath);
+                free(ord);
+                goto fail;
+            }
+        }
+        free(ord);
+    }
+
     // Align p to 32 bytes for binary payload base
     uintptr_t current_pos = (uintptr_t)c.p;
     uintptr_t base_pos = (uintptr_t)mmap_addr;
@@ -373,6 +413,17 @@ GGUFModel *gguf_load(const char *filepath) {
     for (int i = 0; i < model->tensor_count; i++) {
         GGUFTensor *t = &model->tensors[i];
         if (t->offset > avail || t->size_bytes > avail - t->offset) {
+            /* Strict by default: truncated payloads fail the load. Opt into
+             * the old warn+NULL+continue behavior with TT_GGUF_ALLOW_PARTIAL
+             * set to a value not starting with '0' (unset/empty/"0" = strict). */
+            const char *allow = getenv("TT_GGUF_ALLOW_PARTIAL");
+            if (!allow || !*allow || *allow == '0') {
+                fprintf(stderr,
+                        "[GGUF] Truncated tensor '%s' data out of bounds (offset=%llu size=%zu avail=%llu): %s\n",
+                        t->name, (unsigned long long)t->offset, t->size_bytes,
+                        (unsigned long long)avail, filepath);
+                goto fail;
+            }
             fprintf(stderr,
                     "[GGUF] WARN: Tensor '%s' data out of bounds (offset=%llu size=%zu avail=%llu) — marking NULL\n",
                     t->name, (unsigned long long)t->offset, t->size_bytes,
