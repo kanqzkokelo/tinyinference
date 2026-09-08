@@ -20,7 +20,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - id: set
-        run: echo "sources=$(ls src/*.c | jq -RSC .)" >> "$GITHUB_OUTPUT"
+        run: echo "sources=$(python3 -c "import glob, json; print(json.dumps(sorted(glob.glob('src/*.c'))))")" >> "$GITHUB_OUTPUT"
 
   # Per-file syntax check. Each src file is checked in isolation so a single
   # bad include does not mask errors in the rest. Matrix uses an explicit
