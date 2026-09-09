@@ -314,3 +314,11 @@ ci:
 	./scripts/ci_local.sh
 
 .PHONY: ci
+
+# Q4_0 reference quantizer roundtrip gate (head-requant prerequisite).
+$(BUILD)/test_quant_ref: tests/test_quant_ref.c src/quant_ref.c src/dequant_ref.c src/loader_gguf.c | $(BUILD)
+	cc -O2 -Iinclude -Isrc -o $@ tests/test_quant_ref.c src/quant_ref.c src/dequant_ref.c src/loader_gguf.c -lm
+
+test_quant_ref: $(BUILD)/test_quant_ref
+
+.PHONY: test_quant_ref
