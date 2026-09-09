@@ -59,6 +59,7 @@ run build-gcc bash -c '
 run test-samplers      python3 tests/test_samplers.py
 run test-specdec-sim   python3 tests/test_specdec_sim.py
 run test-chat-template python3 tests/test_chat_template.py
+run test-profile-decode python3 tests/test_profile_decode.py
 
 # 5. kvcache unit tests (pure C, self-contained binary).
 if [ ! -x build/test_kvcache ]; then
