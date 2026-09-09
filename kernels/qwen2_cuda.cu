@@ -6439,6 +6439,7 @@ static void apply_sampling_eager(Qwen2Engine *e) {
     if (e->repeat_penalty > 1.0f)
         k_repeat_penalty<<<(e->cfg.vocab + 255) / 256, 256, 0, e->stream>>>(
             e->d_logits, e->d_recent, e->d_n_recent, e->cfg.vocab, e->repeat_penalty);
+    if (e->sampling_temp > 0.0f)
     k_gumbel_transform<<<(e->cfg.vocab + 255) / 256, 256, 0, e->stream>>>(
         e->d_logits, e->cfg.vocab, e->sampling_temp, e->d_pos, e->d_sampling_on);
 }
@@ -6580,9 +6581,13 @@ static int qwen2_engine_graph_capture(Qwen2Engine *e) {
     if (c->tr.softcap_value > 0.0f)
         k_softcap<<<(c->vocab + 255) / 256, 256, 0, e->stream>>>(
             e->d_logits, c->vocab, c->tr.softcap_value);
-    /* sampling controls: both kernels no-op when disabled (greedy byte-identical) */
+    /* sampling controls: skip launches entirely when disabled (device-side
+     * no-ops in that case; greedy byte-identical). Capture-safe:
+     * set_sampling drops the graph when the on/off set flips post-capture. */
+    if (e->repeat_penalty > 1.0f)
     k_repeat_penalty<<<(c->vocab + 255) / 256, 256, 0, e->stream>>>(
         e->d_logits, e->d_recent, e->d_n_recent, c->vocab, e->repeat_penalty);
+    if (e->sampling_temp > 0.0f)
     k_gumbel_transform<<<(c->vocab + 255) / 256, 256, 0, e->stream>>>(
         e->d_logits, c->vocab, e->sampling_temp, e->d_pos, e->d_sampling_on);
     const int nb = 64;
@@ -6851,6 +6856,18 @@ void qwen2_engine_set_sampling(Qwen2Engine *e, float temp, int topk,
                                float penalty) {
     if (!e) return;
     (void)topk; /* Gumbel-max samples full softmax; topk reserved */
+    /* Launch-set flip vs graph capture: replay bakes whether the
+     * penalty/gumbel launches exist, so a post-capture flip is silently
+     * ignored by replay. Invalidate -> eager forever (always coherent). */
+    if (e->graph_exec &&
+        (((temp > 0.0f) ? 1 : 0) != ((e->sampling_temp > 0.0f) ? 1 : 0) ||
+         ((penalty > 1.0f) ? 1 : 0) != ((e->repeat_penalty > 1.0f) ? 1 : 0))) {
+        cudaGraphExecDestroy(e->graph_exec);
+        e->graph_exec = NULL;
+        e->graph_ready = 0;
+        e->no_graph = 1;
+        e->pending_tok = -1;
+    }
     e->sampling_temp = temp;
     e->repeat_penalty = penalty;
     const int on = (temp > 0.0f) ? 1 : 0;
