@@ -644,6 +644,7 @@ __global__ void k_logits_q4_0_batch4(const BlockQ4_0 *__restrict__ W,
 __global__ void k_gemv_q4_0_v4(const BlockQ4_0 *__restrict__ W,
                                const float *__restrict__ x,
                                float *__restrict__ y,
+                               const float *res,
                                int M, int K) {
     const int row0 = (blockIdx.x * blockDim.y + threadIdx.y) * 4;
     if (row0 >= M) return;
@@ -727,10 +728,17 @@ __global__ void k_gemv_q4_0_v4(const BlockQ4_0 *__restrict__ W,
     s2 = warp_reduce_sum(s2);
     s3 = warp_reduce_sum(s3);
     if (lane == 0) {
-        y[row0] = s0;
-        if (row1 < M) y[row1] = s1;
-        if (row2 < M) y[row2] = s2;
-        if (row3 < M) y[row3] = s3;
+        if (res) {
+            y[row0] = s0 + res[row0];
+            if (row1 < M) y[row1] = s1 + res[row1];
+            if (row2 < M) y[row2] = s2 + res[row2];
+            if (row3 < M) y[row3] = s3 + res[row3];
+        } else {
+            y[row0] = s0;
+            if (row1 < M) y[row1] = s1;
+            if (row2 < M) y[row2] = s2;
+            if (row3 < M) y[row3] = s3;
+        }
     }
 }
 
@@ -2036,7 +2044,27 @@ int tt_gemv_q4_0_v4(const void *dW, const float *dx, float *dy,
                     int M, int K, cudaStream_t stream) {
     dim3 g, b; b.x = 32; b.y = 8; b.z = 1;
     g.x = (M + b.y * 4 - 1) / (b.y * 4); g.y = 1; g.z = 1;
-    k_gemv_q4_0_v4<<<g, b, 0, stream>>>((const BlockQ4_0 *)dW, dx, dy, M, K);
+    k_gemv_q4_0_v4<<<g, b, 0, stream>>>((const BlockQ4_0 *)dW, dx, dy, NULL, M, K);
+    return (int)cudaGetLastError();
+}
+
+/* V4 eligibility predicate (mirrors tt_gemv_q4_0_dispatch routing). */
+int tt_gemv_q4_0_v4_ok(int M, int K) {
+    if ((K & 31) != 0) return 0;
+    if (((K / 32) & 1) != 0) return 0;
+    if ((M & 3) != 0) return 0;
+    if (M < 128) return 0;
+    return 1;
+}
+
+/* Residual-fusion V4 launcher: dy[i] = GEMV(dW,dx)[i] + res[i].
+ * Bit-exact vs GEMV-then-k_add (same accumulation order, same fp32 add).
+ * res may alias dy (in-place residual). Caller verifies v4_ok. */
+int tt_gemv_q4_0_v4_res(const void *dW, const float *dx, const float *res,
+                        float *dy, int M, int K, cudaStream_t stream) {
+    dim3 g, b; b.x = 32; b.y = 8; b.z = 1;
+    g.x = (M + b.y * 4 - 1) / (b.y * 4); g.y = 1; g.z = 1;
+    k_gemv_q4_0_v4<<<g, b, 0, stream>>>((const BlockQ4_0 *)dW, dx, dy, res, M, K);
     return (int)cudaGetLastError();
 }
 

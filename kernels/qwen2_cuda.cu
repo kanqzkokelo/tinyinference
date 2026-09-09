@@ -79,6 +79,10 @@ int tt_logits_q4_0_batch4(const void *dW, const float *dX_4xK,
  * between V2 and V4). Returns 0 on success. */
 int tt_gemv_q4_0_dispatch(const void *dW, const float *dx, float *dy,
                           int M, int K, cudaStream_t stream);
+/* Residual-fusion V4: dy[i] = GEMV + res[i]; v4_ok predicate. */
+int tt_gemv_q4_0_v4_ok(int M, int K);
+int tt_gemv_q4_0_v4_res(const void *dW, const float *dx, const float *res,
+                        float *dy, int M, int K, cudaStream_t stream);
 }
 
 static size_t q4_bytes(long numel) { return (size_t)(numel / Q4_VALS_PER_BLOCK) * Q4_BYTES_PER_BLOCK; }
@@ -834,6 +838,28 @@ __global__ void k_softcap(float *__restrict__ logits, int n, float cap) {
 __global__ void k_add(float *__restrict__ dst, const float *__restrict__ src, int n) {
     const int i = threadIdx.x + blockIdx.x * blockDim.x;
     if (i < n) dst[i] += src[i];
+}
+
+/* Residual-fused layer GEMV attempt: dy = GEMV(W,dx) + res (in-place OK).
+ * Returns 1 if the V4-res fast path was taken (Q4_0 V4-eligible shapes),
+ * 0 otherwise (caller runs the legacy dispatch-to-scratch + k_add path).
+ * Kept fallback-free: the legacy path owns d_xn, so a blind dispatch+k_add
+ * here would corrupt res when dy aliases res (engine passes d_x thrice).
+ * TT_NO_RESADD=1 forces legacy. */
+static inline int tt_gemv_res_try(void *w_ptr, int w_dtype,
+                                  const float *dx, const float *res,
+                                  float *dy, int M, int K,
+                                  cudaStream_t s) {
+    static int no_resadd = -2;
+    if (no_resadd == -2) no_resadd = getenv("TT_NO_RESADD") ? 1 : 0;
+    if (no_resadd || w_dtype != 2 || !tt_gemv_q4_0_v4_ok(M, K)) return 0;
+    if (getenv("TT_DISPATCH")) {
+        static unsigned res_trace_n = 0;
+        if (res_trace_n++ < 64)
+            fprintf(stderr, "[dispatch] op=q4_gemv path=V4-res M=%d K=%d\n", M, K);
+    }
+    int rc = tt_gemv_q4_0_v4_res(w_ptr, dx, res, dy, M, K, s);
+    return (rc == 0);
 }
 
 /* GQA flash-attention decode: one warp per query head.
@@ -4798,14 +4824,23 @@ static int forward_layers(Qwen2Engine *e) {
         if (trace && e->has_pl_embd && l >= 18 && l <= 21) ple_canary(e, "flash", l);
         /* 5. Wo projection + residual: x += att @ Wo^T */
         if (tt_profiling()) tt_prof_begin(TT_P_OPROJ, e->stream);
-        int orc_ = tt_gemv_layer_dispatch(w->o.ptr, w->o.dtype, e->d_att, e->d_xn, c->dim, attn_qout, e->stream);
-        if (orc_ && getenv("TT_DEBUG")) fprintf(stderr, "[qwen2-engine] o gemv rc=%d\n", orc_);
-        /* gemma2 sandwich: normalize the attention output before residual */
-        if (w->post_attn_norm)
-            k_rmsnorm<<<1, 256, 256 * sizeof(float), e->stream>>>(
-                e->d_xn, w->post_attn_norm, e->d_xn, c->dim, c->rms_eps,
-                c->tr.norm_offset);
-        k_add<<<(c->dim + 255) / 256, 256, 0, e->stream>>>(e->d_x, e->d_xn, c->dim);
+        /* Residual-fused o-proj: d_x += Wo @ d_att (skips d_xn + k_add).
+         * Sandwich-norm/trace builds keep the legacy path (d_xn observed). */
+        int orc_ = 0;
+        if (!w->post_attn_norm && !trace &&
+            tt_gemv_res_try(w->o.ptr, w->o.dtype, e->d_att, e->d_x, e->d_x,
+                             c->dim, attn_qout, e->stream)) {
+            /* fused in-place: d_x += Wo @ d_att, d_xn untouched */
+        } else {
+            orc_ = tt_gemv_layer_dispatch(w->o.ptr, w->o.dtype, e->d_att, e->d_xn, c->dim, attn_qout, e->stream);
+            if (orc_ && getenv("TT_DEBUG")) fprintf(stderr, "[qwen2-engine] o gemv rc=%d\n", orc_);
+            /* gemma2 sandwich: normalize the attention output before residual */
+            if (w->post_attn_norm)
+                k_rmsnorm<<<1, 256, 256 * sizeof(float), e->stream>>>(
+                    e->d_xn, w->post_attn_norm, e->d_xn, c->dim, c->rms_eps,
+                    c->tr.norm_offset);
+            k_add<<<(c->dim + 255) / 256, 256, 0, e->stream>>>(e->d_x, e->d_xn, c->dim);
+        }
         if (tt_profiling()) tt_prof_end(TT_P_OPROJ, e->stream);
         if (trace && l == 0) {
             static float ao2[4096];
@@ -4846,17 +4881,25 @@ static int forward_layers(Qwen2Engine *e) {
         }
         if (tt_profiling()) tt_prof_end(TT_P_FFGATEUP, e->stream);
         if (tt_profiling()) tt_prof_begin(TT_P_FFDOWN, e->stream);
-        int drc = tt_gemv_layer_dispatch(w->down.ptr, w->down.dtype, e->d_h, e->d_xn,
-                      c->dim, FF_l, e->stream);
-        if (drc && getenv("TT_DEBUG")) fprintf(stderr, "[qwen2-engine] down gemv rc=%d\n", drc);
-        CHK_STAGE("7c down-gemv");
-        /* gemma2 sandwich: normalize the MLP output before residual */
-        if (w->post_ffn_norm)
-            k_rmsnorm<<<1, 256, 256 * sizeof(float), e->stream>>>(
-                e->d_xn, w->post_ffn_norm, e->d_xn, c->dim, c->rms_eps,
-                c->tr.norm_offset);
-        k_add<<<(c->dim + 255) / 256, 256, 0, e->stream>>>(e->d_x, e->d_xn, c->dim);
-        CHK_STAGE("7d add");
+        /* Residual-fused down-proj: d_x += Wdown @ d_h. */
+        int drc = 0;
+        if (!w->post_ffn_norm && !trace &&
+            tt_gemv_res_try(w->down.ptr, w->down.dtype, e->d_h, e->d_x, e->d_x,
+                             c->dim, FF_l, e->stream)) {
+            /* fused in-place: d_x += Wdown @ d_h, d_xn untouched */
+        } else {
+            drc = tt_gemv_layer_dispatch(w->down.ptr, w->down.dtype, e->d_h, e->d_xn,
+                          c->dim, FF_l, e->stream);
+            if (drc && getenv("TT_DEBUG")) fprintf(stderr, "[qwen2-engine] down gemv rc=%d\n", drc);
+            CHK_STAGE("7c down-gemv");
+            /* gemma2 sandwich: normalize the MLP output before residual */
+            if (w->post_ffn_norm)
+                k_rmsnorm<<<1, 256, 256 * sizeof(float), e->stream>>>(
+                    e->d_xn, w->post_ffn_norm, e->d_xn, c->dim, c->rms_eps,
+                    c->tr.norm_offset);
+            k_add<<<(c->dim + 255) / 256, 256, 0, e->stream>>>(e->d_x, e->d_xn, c->dim);
+            CHK_STAGE("7d add");
+        }
         if (tt_profiling()) tt_prof_end(TT_P_FFDOWN, e->stream);
         CHK_STAGE("7 mlp");
         if (trace && l == 0) {
@@ -6264,6 +6307,18 @@ static int compute_logits_into_d_logits(Qwen2Engine *e) {
     if (tt_profiling()) tt_prof_end(TT_P_LOGITS, e->stream);
     if (rc) return rc;
 
+    /* Real-hidden-state hook for head-requant gate (env-gated, zero default impact):
+     * TT_DUMP_XN=/tmp/xn.f32 appends post-norm d_xn (dim floats) per call. */
+    if (getenv("TT_DUMP_XN") && c->dim > 0 && c->dim <= 8192) {
+        const char *pp = getenv("TT_DUMP_XN");
+        static float h_xn[8192];
+        cudaMemcpyAsync(h_xn, e->d_xn, (size_t)c->dim * sizeof(float),
+                        cudaMemcpyDeviceToHost, e->stream);
+        cudaStreamSynchronize(e->stream);
+        FILE *ff = fopen(pp, "ab");
+        if (ff) { fwrite(h_xn, sizeof(float), (size_t)c->dim, ff); fclose(ff); }
+    }
+
     /* M7 trait: final-logit tanh softcap (gemma2). Identical kernel as
      * the eager path; if the trait is absent this branch is dead. */
     if (c->tr.softcap_value > 0.0f)
@@ -6462,6 +6517,16 @@ static int sample_eager(Qwen2Engine *e) {
         k_softcap<<<(c->vocab + 255) / 256, 256, 0, e->stream>>>(
             e->d_logits, c->vocab, c->tr.softcap_value);
     apply_sampling_eager(e);
+
+    if (getenv("TT_DUMP_XN") && c->dim > 0 && c->dim <= 8192) {
+        const char *pp2 = getenv("TT_DUMP_XN");
+        static float h_xn2[8192];
+        cudaStreamSynchronize(e->stream);
+        cudaMemcpy(h_xn2, e->d_xn, (size_t)c->dim * sizeof(float),
+                   cudaMemcpyDeviceToHost);
+        FILE *ff2 = fopen(pp2, "ab");
+        if (ff2) { fwrite(h_xn2, sizeof(float), (size_t)c->dim, ff2); fclose(ff2); }
+    }
 
     if (tt_profiling()) tt_prof_begin(TT_P_ARGMAX, e->stream);
     const int nb = 64;
