@@ -139,6 +139,37 @@ def get_gpu_info() -> Dict[str, str]:
     }
 
 
+def get_power_info() -> Dict[str, Any]:
+    """Snapshot GPU power limit/draw + AC state. Fail-open with warning."""
+    info: Dict[str, Any] = {
+        "power_limit_w": None,
+        "power_draw_w": None,
+        "ac_online": None,
+    }
+    try:
+        r = subprocess.run(
+            ["nvidia-smi", "-q", "-d", "POWER"],
+            capture_output=True, text=True, timeout=10,
+        )
+        if r.returncode == 0 and r.stdout:
+            m = re.search(r"Current Power Limit\s*:\s*([\d.]+)\s*W", r.stdout)
+            if m:
+                info["power_limit_w"] = float(m.group(1))
+            m2 = re.search(r"Average Power Draw\s*:\s*([\d.]+)\s*W", r.stdout)
+            if m2:
+                info["power_draw_w"] = float(m2.group(1))
+    except Exception:
+        pass
+    for p in ("/sys/class/power_supply/ACAD/online", "/sys/class/power_supply/AC/online"):
+        try:
+            with open(p) as f:
+                info["ac_online"] = int(f.read().strip())
+            break
+        except Exception:
+            continue
+    return info
+
+
 def compute_sha256(file_path: Path) -> str:
     path_str = str(file_path.resolve())
     if path_str in _SHA256_CACHE:
@@ -317,6 +348,8 @@ def run_oracle_once(
 ) -> Dict[str, Any]:
     if not os.path.isfile(oracle_bin):
         raise FileNotFoundError(f"Oracle binary not found at '{oracle_bin}'")
+    if not prompt or not prompt.strip():
+        raise ValueError("Refusing to invoke oracle llama-cli with empty prompt (known hang)")
 
     cmd = [
         oracle_bin,
@@ -388,6 +421,8 @@ def run_oracle_once(
             return {
                 "tokens": predicted_n,
                 "prefill": prompt_n,
+                "prompt_n": prompt_n,
+                "predicted_n": predicted_n,
                 "decode_us": decode_us,
                 "prefill_us": prefill_us,
                 "first_token_us": first_token_us,
@@ -415,6 +450,8 @@ def run_oracle_once(
     return {
         "tokens": gen_tokens,
         "prefill": 32,
+        "prompt_n": 32,
+        "predicted_n": gen_tokens,
         "decode_us": decode_us,
         "prefill_us": prefill_us,
         "first_token_us": prefill_us + (decode_us / gen_tokens if gen_tokens > 0 else 0.0),
@@ -437,6 +474,8 @@ def benchmark_case(
 ) -> Dict[str, Any]:
     prompt = make_prompt_for_ctx(target_ctx, custom_prompt)
     ctx_cap = max(1024, target_ctx + gen_tokens + 256)
+    row_start = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    power = get_power_info()
 
     # 1. TinyInference Warmup
     for _ in range(warmup):
@@ -487,13 +526,19 @@ def benchmark_case(
             "decode_tok_s": [],
             "prefill_tok_s": [],
         }
+        oracle_prompt_ns: List[int] = []
+        oracle_predicted_ns: List[int] = []
         for _ in range(runs):
             oout = run_oracle_once(
                 oracle_bin, model_path, prompt, gen_tokens, ctx_cap
             )
             for k in oracle_samples:
                 oracle_samples[k].append(oout[k])
+            oracle_prompt_ns.append(int(oout.get("prompt_n", 0)))
+            oracle_predicted_ns.append(int(oout.get("predicted_n", 0)))
         oracle_summary = {k: compute_stats(v) for k, v in oracle_samples.items()}
+        oracle_summary["prompt_n"] = compute_stats([float(x) for x in oracle_prompt_ns])
+        oracle_summary["predicted_n"] = compute_stats([float(x) for x in oracle_predicted_ns])
         oracle_med_dec = oracle_summary["decode_tok_s"]["median"]
         ours_med_dec = ours_summary["decode_tok_s"]["median"]
         ratio = round(ours_med_dec / oracle_med_dec, 3) if oracle_med_dec > 0 else None
@@ -508,6 +553,9 @@ def benchmark_case(
         "ours": ours_summary,
         "oracle": oracle_summary,
         "ratio_decode_tok_s": ratio,
+        "row_start": row_start,
+        "row_end": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "power": power,
     }
 
 
@@ -834,6 +882,13 @@ def main():
     )
     gpu_info = get_gpu_info()
     timestamp = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    power_info = get_power_info()
+    if power_info.get("power_limit_w") is not None and abs(power_info["power_limit_w"] - 60.0) > 0.5:
+        print(
+            f"WARNING: GPU power limit is {power_info['power_limit_w']}W (expected 60W, AC). "
+            f"AC online={power_info.get('ac_online')}. Results NOT citable for parity.",
+            file=sys.stderr,
+        )
 
     meta = {
         "timestamp": timestamp,
@@ -844,6 +899,7 @@ def main():
         "gpu": gpu_info["gpu"],
         "sm": gpu_info["sm"],
         "cuda_version": gpu_info["cuda"],
+        "power": power_info,
         "runs": args.runs,
         "warmup": args.warmup,
         "gen_tokens": args.tokens,
@@ -932,6 +988,9 @@ def main():
                     "ours": case_res["ours"],
                     "oracle": case_res["oracle"],
                     "ratio_decode_tok_s": case_res["ratio_decode_tok_s"],
+                    "row_start": case_res.get("row_start"),
+                    "row_end": case_res.get("row_end"),
+                    "power": case_res.get("power"),
                 }
                 scoreboard_results.append(record)
 
