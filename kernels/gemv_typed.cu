@@ -795,72 +795,51 @@ __global__ void k_gemv_q6_K_v2(const uint8_t *__restrict__ W,
     const int row1 = row0 + 1;
     const int lane = threadIdx.x;
     const int nsb = K / 256;
-    const int nu  = nsb * 8;
     const uint8_t *rw0 = W + (long)row0 * nsb * 210;
     const uint8_t *rw1 = W + (long)row1 * nsb * 210;
     float s0 = 0.0f, s1 = 0.0f;
 
-    for (int u = lane; u < nu; u += 32) {
-        const int sb = u >> 3, sub = u & 7;
+    const int is = lane >> 4;
+    for (int sb = 0; sb < nsb; sb++) {
         const uint8_t *blk0 = rw0 + sb * 210;
         const uint8_t *blk1 = rw1 + sb * 210;
-        const uint8_t *ql0 = blk0,        *qh0 = blk0 + 128;
-        const int8_t  *sc0 = (const int8_t *)(blk0 + 192);
-        const float   d0  = half_at(blk0 + 208);
-        const uint8_t *ql1 = blk1,        *qh1 = blk1 + 128;
-        const int8_t  *sc1 = (const int8_t *)(blk1 + 192);
-        const float   d1  = half_at(blk1 + 208);
-        const float *xb = x + (long)sb * 256 + sub * 32;
-        const int c = sub >> 2;                  /* chunk: 0 or 1 */
-        const int r0 = (sub & 3) << 5;           /* r-base in chunk [0,32,64,96] */
-        const int sc_idx_base = c * 8 + (r0 >> 4);
-        /* For sub-block of 32 values starting at r0 (chunk-local), the 4
-         * 8-value sub-chunks use scales at indices sc_idx_base+0..+3.
-         * r advances as r0+0, r0+8, r0+16, r0+24 -- each sub-chunk
-         * spans r0+q*8 .. r0+(q+1)*8. */
-        const float4 *x4 = (const float4 *)xb;
-        float sum_qx[4] = {0.f, 0.f, 0.f, 0.f};
+        const float *xb = x + (long)sb * 256;
+        const float d0 = half_at(blk0 + 208);
+        const float d1 = half_at(blk1 + 208);
 #pragma unroll
-        for (int q = 0; q < 4; q++) {
-            const int r = r0 + q * 8;
-            /* ql address: ql0[c*64 + (r&63)]. Load 8 bytes covering r..r+7. */
-            const uint64_t ql8 = __ldg((const uint64_t *)(ql0 + c * 64 + (r & 63)));
-            /* qh address: qh0[c*32 + (r&31)] byte; bits 2*(r>>5)..2*(r>>5)+1
-             * of that byte. Load 4 bytes covering r..r+3 (then r+4..r+7
-             * from same +4 offset). */
-            const uint32_t qh_lo = __ldg((const uint32_t *)(qh0 + c * 32 + (r & 31)));
-            const uint32_t qh_hi = __ldg((const uint32_t *)(qh0 + c * 32 + (r & 31) + 4));
-            /* Extract 8 (q-32) values. */
-            const float4 xv0 = x4[q * 2 + 0];
-            const float4 xv1 = x4[q * 2 + 1];
-            const int shift0 = 2 * (r >> 5);
-#pragma unroll
-            for (int j = 0; j < 4; j++) {
-                const int ql_byte = (int)((ql8 >> (j * 8)) & 0xFFu);
-                const int lo = (j < 4 && (r + j) < 64) ? (ql_byte & 0xF) : (ql_byte >> 4);
-                const int qh_byte = (j < 4) ? (int)((qh_lo >> (j * 8)) & 0xFFu)
-                                            : (int)((qh_hi >> ((j - 4) * 8)) & 0xFFu);
-                const int hi = (qh_byte >> shift0) & 3;
-                const int q6 = (lo | (hi << 4)) - 32;
-                const float xv = (j < 4) ? ((j == 0) ? xv0.x : (j == 1) ? xv0.y : (j == 2) ? xv0.z : xv0.w)
-                                         : ((j == 4) ? xv1.x : (j == 5) ? xv1.y : (j == 6) ? xv1.z : xv1.w);
-                sum_qx[q] += (float)q6 * xv;
-            }
+        for (int chunk = 0; chunk < 2; chunk++) {
+            const uint8_t *ql0 = blk0 + chunk * 64;
+            const uint8_t *qh0 = blk0 + 128 + chunk * 32;
+            const int8_t  *sc0 = (const int8_t *)(blk0 + 192 + chunk * 8);
+            const uint8_t *ql1 = blk1 + chunk * 64;
+            const uint8_t *qh1 = blk1 + 128 + chunk * 32;
+            const int8_t  *sc1 = (const int8_t *)(blk1 + 192 + chunk * 8);
+            const float *xc = xb + chunk * 128;
+
+            const int ql0_0 = ql0[lane + 0];
+            const int ql0_1 = ql0[lane + 32];
+            const int qh0_val = qh0[lane];
+            const int8_t q1_0 = (int8_t)((ql0_0 & 0xF) | (((qh0_val >> 0) & 3) << 4)) - 32;
+            const int8_t q2_0 = (int8_t)((ql0_1 & 0xF) | (((qh0_val >> 2) & 3) << 4)) - 32;
+            const int8_t q3_0 = (int8_t)((ql0_0 >> 4)  | (((qh0_val >> 4) & 3) << 4)) - 32;
+            const int8_t q4_0 = (int8_t)((ql0_1 >> 4)  | (((qh0_val >> 6) & 3) << 4)) - 32;
+            s0 += d0 * (sc0[is + 0] * (float)q1_0 * xc[lane + 0] +
+                        sc0[is + 2] * (float)q2_0 * xc[lane + 32] +
+                        sc0[is + 4] * (float)q3_0 * xc[lane + 64] +
+                        sc0[is + 6] * (float)q4_0 * xc[lane + 96]);
+
+            const int ql1_0 = ql1[lane + 0];
+            const int ql1_1 = ql1[lane + 32];
+            const int qh1_val = qh1[lane];
+            const int8_t q1_1 = (int8_t)((ql1_0 & 0xF) | (((qh1_val >> 0) & 3) << 4)) - 32;
+            const int8_t q2_1 = (int8_t)((ql1_1 & 0xF) | (((qh1_val >> 2) & 3) << 4)) - 32;
+            const int8_t q3_1 = (int8_t)((ql1_0 >> 4)  | (((qh1_val >> 4) & 3) << 4)) - 32;
+            const int8_t q4_1 = (int8_t)((ql1_1 >> 4)  | (((qh1_val >> 6) & 3) << 4)) - 32;
+            s1 += d1 * (sc1[is + 0] * (float)q1_1 * xc[lane + 0] +
+                        sc1[is + 2] * (float)q2_1 * xc[lane + 32] +
+                        sc1[is + 4] * (float)q3_1 * xc[lane + 64] +
+                        sc1[is + 6] * (float)q4_1 * xc[lane + 96]);
         }
-        /* Apply per-row scales. Both rows' (q-32) values are the same
-         * (same x, same block bytes), only d and sc differ. */
-        const float dsc0_0 = d0 * (float)sc0[sc_idx_base + 0];
-        const float dsc0_1 = d0 * (float)sc0[sc_idx_base + 1];
-        const float dsc0_2 = d0 * (float)sc0[sc_idx_base + 2];
-        const float dsc0_3 = d0 * (float)sc0[sc_idx_base + 3];
-        const float dsc1_0 = d1 * (float)sc1[sc_idx_base + 0];
-        const float dsc1_1 = d1 * (float)sc1[sc_idx_base + 1];
-        const float dsc1_2 = d1 * (float)sc1[sc_idx_base + 2];
-        const float dsc1_3 = d1 * (float)sc1[sc_idx_base + 3];
-        s0 += dsc0_0 * sum_qx[0] + dsc0_1 * sum_qx[1]
-            + dsc0_2 * sum_qx[2] + dsc0_3 * sum_qx[3];
-        s1 += dsc1_0 * sum_qx[0] + dsc1_1 * sum_qx[1]
-            + dsc1_2 * sum_qx[2] + dsc1_3 * sum_qx[3];
     }
     s0 = warp_reduce_sum(s0);
     s1 = warp_reduce_sum(s1);
@@ -1215,6 +1194,19 @@ __global__ void k_embed_f32(const float *__restrict__ W, int tok,
 
 extern "C" {
 
+static int tt_typed_trace_on(void) {
+    static int cached = -1;
+    if (cached < 0) cached = getenv("TT_DISPATCH") ? 1 : 0;
+    return cached;
+}
+
+static void tt_trace_typed(int dtype, const char *path, int M, int K) {
+    static unsigned count = 0;
+    if (tt_typed_trace_on() && count++ < 512)
+        fprintf(stderr, "[dispatch] op=typed dtype=%d path=%s M=%d K=%d\n",
+                dtype, path, M, K);
+}
+
 static int gemv_dims(int M, dim3 *grid, dim3 *block) {
     if (M <= 0 || M > (1 << 22)) return -50;
     block->x = 32; block->y = 16; block->z = 1;
@@ -1280,6 +1272,7 @@ int tt_gemv_typed(const void *W, int dtype, const float *x, float *y,
              * shipped for future batched-decode work. The launcher is
              * in gemv_q4_cuda.cu next to the kernel (k_gemv_wmma_q4_0). */
             if (getenv("TT_USE_WMMA") && M >= 16 && K % 16 == 0) {
+                tt_trace_typed(dtype, "WMMA", M, K);
                 extern int tt_gemv_wmma_q4_0(const void *, const float *,
                                              float *, int, int, cudaStream_t);
                 int wrc = tt_gemv_wmma_q4_0(W, x, y, M, K, stream);
@@ -1287,6 +1280,7 @@ int tt_gemv_typed(const void *W, int dtype, const float *x, float *y,
                 /* fall through to V2 if WMMA returned bad dims */
             }
             /* delegate to the M6.3b-tuned kernel (same launch contract) */
+            tt_trace_typed(dtype, "q4-v2", M, K);
             extern int tt_gemv_q4_0(const void *, const float *, float *,
                                     int, int, cudaStream_t);
             return tt_gemv_q4_0(W, x, y, M, K, stream);
@@ -1313,8 +1307,10 @@ int tt_gemv_typed(const void *W, int dtype, const float *x, float *y,
                               * for the tiny M_kv shapes. */) {
                 extern int tt_gemv_q8_0(const void *, const float *, float *,
                                         int, int, cudaStream_t);
+                tt_trace_typed(dtype, "q8-v2", M, K);
                 return tt_gemv_q8_0(W, x, y, M, K, stream);
             }
+            tt_trace_typed(dtype, "q8-scalar", M, K);
             k_gemv_q8_0<<<g, b, 0, stream>>>((const uint8_t *)W, x, y, M, K);
             break;
         }
@@ -1340,7 +1336,10 @@ int tt_gemv_typed(const void *W, int dtype, const float *x, float *y,
                         k_gemv_q4_K_v2<<<g2, b2, 0, stream>>>((const uint8_t *)W, x, y, M, K);
                     else if (dtype == TTQ_Q5_K)
                         k_gemv_q5_K_v2<<<g2, b2, 0, stream>>>((const uint8_t *)W, x, y, M, K);
-                    else
+                    else if (M >= 2 && (M & 1) == 0 && !getenv("TT_DISABLE_Q6_V2")) {
+                        tt_trace_typed(dtype, "q6-k-v2", M, K);
+                        k_gemv_q6_K_v2<<<g2, b2, 0, stream>>>((const uint8_t *)W, x, y, M, K);
+                    } else
                         k_gemv_q6_K<<<g, b, 0, stream>>>((const uint8_t *)W, x, y, M, K);
                     break;
                 }
