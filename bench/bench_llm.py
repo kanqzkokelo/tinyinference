@@ -53,7 +53,8 @@ PRIMARY_MODELS = [
 DEFAULT_CTXS = [32, 512, 2048]
 DEFAULT_GEN_TOKENS = 64
 DEFAULT_RUNS = 5
-DEFAULT_WARMUP = 1
+DEFAULT_WARMUP = 3
+DEFAULT_COOLDOWN_SEC = 10.0
 
 FILLER = (
     "The quick brown fox jumps over the lazy dog near the river bank "
@@ -576,6 +577,7 @@ def write_markdown(results: List[Dict[str, Any]], out_path: Path, meta: Dict[str
         f"- **llama.cpp Commit**: `{meta['llamacpp_commit']}` (`{meta['llamacpp_bin']}`)",
         f"- **Hardware**: {meta['gpu']} ({meta['sm']}), CUDA {meta['cuda_version']}",
         f"- **Runs**: {meta['runs']} measured runs post-warmup",
+        f"- **Warmup/Cooldown**: {meta['warmup']} warmup, {meta.get('cooldown_sec', 0)}s cooldown between cells",
         "",
         "## Performance Scoreboard",
         "",
@@ -770,7 +772,13 @@ def main():
         "--warmup",
         type=int,
         default=DEFAULT_WARMUP,
-        help="Warmup runs (default: 1)",
+        help="Warmup runs (default: 3; v5 showed oracle cold-start ramp with 1)",
+    )
+    parser.add_argument(
+        "--cooldown-sec",
+        type=float,
+        default=DEFAULT_COOLDOWN_SEC,
+        help="Sleep between benchmark cells to reduce thermal drift (default: 10s; 0 disables)",
     )
     parser.add_argument(
         "--mode",
@@ -903,6 +911,7 @@ def main():
         "runs": args.runs,
         "warmup": args.warmup,
         "gen_tokens": args.tokens,
+        "cooldown_sec": args.cooldown_sec,
     }
 
     print("=" * 80)
@@ -964,6 +973,9 @@ def main():
                     f"done ({elapsed:.1f}s) | ours: {ours_med:.1f} tok/s | "
                     f"oracle: {orc_med:.1f} tok/s | ratio: {ratio_str} | status: {status}"
                 )
+
+                if args.cooldown_sec and args.cooldown_sec > 0:
+                    time.sleep(args.cooldown_sec)
 
                 # Format full result record
                 record = {
