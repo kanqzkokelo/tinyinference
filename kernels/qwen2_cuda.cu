@@ -4045,10 +4045,13 @@ Qwen2Engine *qwen2_engine_create(const TTConfig *cfg, GGUFModel *m) {
         qwen2_engine_enable_q4_kvcache(e, 1);
     } else {
         const char *q8_env = getenv("TT_Q8_KV");
-        /* Q8 KV default-ON (opt out with TT_Q8_KV=0): 4x KV traffic cut,
-         * top-1 stable vs FP32 (5/5 goldens + 32tok text A/B identical),
-         * graph-safe with thresh 0. TT_KV_F16/TT_Q4_KV still override. */
-        if (!q8_env || atoi(q8_env) != 0) {
+        /* Q8 KV opt-in (enable with TT_Q8_KV=1): 4x KV traffic cut,
+         * top-1 stable vs FP32 but median|dlogit| 0.25-1.0 exceeds the
+         * 0.15 gate (0/7 default-ON vs 7/7 OFF, 2026-09-09). Keep OFF
+         * by default so the acceptance baseline stays numerics-clean;
+         * opt-in remains for long-ctx experiments. TT_KV_F16/TT_Q4_KV
+         * still override. */
+        if (q8_env && atoi(q8_env) != 0) {
             qwen2_engine_enable_q8_kvcache(e, 1);
         }
     }
