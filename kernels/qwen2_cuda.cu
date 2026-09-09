@@ -97,15 +97,16 @@ static inline int tt_gemv_layer_dispatch(void *w_ptr, int w_dtype,
     return tt_gemv_typed(w_ptr, w_dtype, dx, dy, M, K, s);
 }
 
-/* Hybrid KV-cache dispatch helpers (Fix1). Threshold defaults to 256;
+/* Hybrid KV-cache dispatch helpers (Fix1). Threshold defaults to 0
+ * (quantized KV from first token; graph-safe static path).
  * override via TT_QKV_THRESH. Below thresh FP32 is used for parity;
  * above thresh Q4/Q8 is used for speed (4x/8x bandwidth). */
 static inline int kv_thresh_value(void) {
     static int cached = -1;
     if (cached < 0) {
         const char *ev = getenv("TT_QKV_THRESH");
-        cached = (ev && *ev) ? atoi(ev) : 256;
-        if (cached < 0) cached = 256;
+        cached = (ev && *ev) ? atoi(ev) : 0;
+        if (cached < 0) cached = 0;
     }
     return cached;
 }
@@ -198,6 +199,91 @@ __global__ void k_rmsnorm(const float *__restrict__ x, const float *__restrict__
  * (blockDim 256, so bits match), writes xn out, then its warps run the
  * k_gemv_q4_0 row-pair math verbatim against shared xn. Caller gates on
  * Q4_0/even-M/nb-even/D<=4096; anything else takes the old path. */
+/* Q8_0 twin of k_rmsnorm_qkv_q4_0 (decode fast path for Qwen3-0.6B-Q8_0).
+ * Same contract: caller gates on Q8_0/even-M/nb-even/D<=4096; inner GEMV
+ * math verbatim from k_gemv_q8_0 (kernels/gemv_q4_cuda.cu) against shared
+ * xn, so output is bit-identical to rmsnorm + 3x tt_gemv_q8_0 launches.
+ * Merges 4 launches (rmsnorm + q/k/v GEMV) into 1 with full occupancy. */
+__global__ void k_rmsnorm_qkv_q8_0(const float *__restrict__ x, const float *__restrict__ g,
+                          float *__restrict__ xn,
+                          const BlockQ8_0 *__restrict__ Wq, const BlockQ8_0 *__restrict__ Wk,
+                          const BlockQ8_0 *__restrict__ Wv,
+                          float *__restrict__ yq, float *__restrict__ yk, float *__restrict__ yv,
+                          int D, int Mq, int Mkv, float eps, float woff) {
+    extern __shared__ float sm[];
+    float *sh = sm;
+    float *red = sm + D;
+    const int tid = threadIdx.x;
+    const int lane = tid & 31;
+    float ss = 0.0f;
+    for (int i = tid; i < D; i += blockDim.x) ss += x[i] * x[i];
+    ss = warp_sum(ss);
+    if ((tid & 31) == 0) red[tid >> 5] = ss;
+    __syncthreads();
+    if (tid == 0) {
+        float t = 0.0f;
+        for (int w = 0; w < (blockDim.x + 31) / 32; w++) t += red[w];
+        red[0] = rsqrtf(t / (float)D + eps);
+    }
+    __syncthreads();
+    const float inv = red[0];
+    if (woff == 0.0f) {
+        for (int i = tid; i < D; i += blockDim.x) { float v = x[i] * inv * g[i]; sh[i] = v; xn[i] = v; }
+    } else {
+        for (int i = tid; i < D; i += blockDim.x) { float v = x[i] * inv * (woff + g[i]); sh[i] = v; xn[i] = v; }
+    }
+    __syncthreads();
+    const int nq2 = Mq >> 1, nkv2 = Mkv >> 1;
+    const int npair = nq2 + nkv2 * 2;
+    const int p = blockIdx.x * (blockDim.x >> 5) + (tid >> 5);
+    if (p >= npair) return;
+    const int nb = D >> 5;
+    const BlockQ8_0 *W;
+    float *y;
+    int row0;
+    if (p < nq2) { W = Wq; y = yq; row0 = p * 2; }
+    else if (p < nq2 + nkv2) { W = Wk; y = yk; row0 = (p - nq2) * 2; }
+    else { W = Wv; y = yv; row0 = (p - nq2 - nkv2) * 2; }
+    const int row1 = row0 + 1;
+    const uint32_t *rw0 = (const uint32_t *)((const char *)W + (long)row0 * nb * 34);
+    const uint32_t *rw1 = (const uint32_t *)((const char *)W + (long)row1 * nb * 34);
+    float s0 = 0.0f, s1 = 0.0f;
+    for (int b = lane; b < nb; b += 32) {
+        const int wsc = (34 * b) >> 2;
+        const int shf = (34 * b + 2) & 2;
+        const unsigned short d16a = (unsigned short)
+            (((34 * b) & 2) ? (rw0[wsc] >> 16) : (rw0[wsc] & 0xFFFFu));
+        const unsigned short d16b = (unsigned short)
+            (((34 * b) & 2) ? (rw1[wsc] >> 16) : (rw1[wsc] & 0xFFFFu));
+        const float da = __half2float(__ushort_as_half(d16a));
+        const float db = __half2float(__ushort_as_half(d16b));
+        const int a0 = (34 * b + 2) >> 2;
+        const float4 *x4 = (const float4 *)(sh + b * 32);
+#pragma unroll
+        for (int k = 0; k < 8; k++) {
+            const uint32_t la = rw0[a0 + k];
+            const uint32_t lb = rw1[a0 + k];
+            const uint32_t va = shf ? __byte_perm(la, rw0[a0 + k + 1], 0x5432) : la;
+            const uint32_t vb = shf ? __byte_perm(lb, rw1[a0 + k + 1], 0x5432) : lb;
+            const float4 xv = x4[k];
+            s0 += ((float)((int)(va << 24) >> 24)) * da * xv.x;
+            s0 += ((float)((int)(va << 16) >> 24)) * da * xv.y;
+            s0 += ((float)((int)(va <<  8) >> 24)) * da * xv.z;
+            s0 += ((float)((int)(va       ) >> 24)) * da * xv.w;
+            s1 += ((float)((int)(vb << 24) >> 24)) * db * xv.x;
+            s1 += ((float)((int)(vb << 16) >> 24)) * db * xv.y;
+            s1 += ((float)((int)(vb <<  8) >> 24)) * db * xv.z;
+            s1 += ((float)((int)(vb       ) >> 24)) * db * xv.w;
+        }
+    }
+    s0 = warp_sum(s0);
+    s1 = warp_sum(s1);
+    if (lane == 0) {
+        y[row0] = s0;
+        y[row1] = s1;
+    }
+}
+
 __global__ void k_rmsnorm_qkv_q4_0(const float *__restrict__ x, const float *__restrict__ g,
                           float *__restrict__ xn,
                           const BlockQ4_0 *__restrict__ Wq, const BlockQ4_0 *__restrict__ Wk,
@@ -461,6 +547,49 @@ __global__ void k_rope_gptj_ff(float *__restrict__ q, int n_heads, int head_dim,
     const float v0 = row[i0], v1 = row[i1];
     row[i0] = v0 * c - v1 * s;
     row[i1] = v0 * s + v1 * c;
+}
+
+/* Fused decode RoPE: q (all heads) + staged k row in ONE launch.
+ * Bit-identical to k_rope/k_rope_gptj pair: same freq/ang math, q rows
+ * then k rows. Skipped when partial-rope ff factors present (gemma4
+ * full layers take the old two-launch path). k==NULL skips k side
+ * (shared-KV layers). TT_NO_FUSE=1 forces old path. */
+__global__ void k_rope_qk(float *__restrict__ q, float *__restrict__ k,
+                          int nq, int nkv, int head_dim,
+                          const int *__restrict__ d_pos, float base, int gptj) {
+    const int pos = *d_pos;
+    const int i = threadIdx.x + blockIdx.x * blockDim.x;
+    const int h = blockIdx.y;
+    if (i >= head_dim / 2) return;
+    const float freq = powf(base, -2.0f * (float)i / (float)head_dim);
+    const float ang = (float)pos * freq;
+    const float c = cosf(ang), s = sinf(ang);
+    if (h < nq) {
+        float *row = q + (long)h * head_dim;
+        if (!gptj) {
+            const float v0 = row[i], v1 = row[i + head_dim / 2];
+            row[i] = v0 * c - v1 * s;
+            row[i + head_dim / 2] = v0 * s + v1 * c;
+        } else {
+            const int i0 = 2 * i, i1 = 2 * i + 1;
+            const float v0 = row[i0], v1 = row[i1];
+            row[i0] = v0 * c - v1 * s;
+            row[i1] = v0 * s + v1 * c;
+        }
+    }
+    if (k && h < nkv) {
+        float *row = k + (long)h * head_dim;
+        if (!gptj) {
+            const float v0 = row[i], v1 = row[i + head_dim / 2];
+            row[i] = v0 * c - v1 * s;
+            row[i + head_dim / 2] = v0 * s + v1 * c;
+        } else {
+            const int i0 = 2 * i, i1 = 2 * i + 1;
+            const float v0 = row[i0], v1 = row[i1];
+            row[i0] = v0 * c - v1 * s;
+            row[i1] = v0 * s + v1 * c;
+        }
+    }
 }
 
 
@@ -3084,6 +3213,21 @@ __global__ void k_embed_q6_K_dyn(const uint8_t *__restrict__ W, const int *__res
     }
 }
 
+/* Dynamic-token embedding for q8_0 (cudaGraph replay variant). Reads *d_tok */
+__global__ void k_embed_q8_0_dyn(const uint8_t *__restrict__ W, const int *__restrict__ d_tok,
+                                 float *__restrict__ dx, int dim) {
+    const int tok = *d_tok;
+    const int b = threadIdx.x + blockIdx.x * blockDim.x;
+    const int nb = dim / 32;
+    if (b >= nb) return;
+    const uint8_t *blk = W + (long)tok * nb * 34 + b * 34;
+    const float d = __half2float(*(const __half *)blk);
+    const int8_t *qs = (const int8_t *)(blk + 2);
+    float *out = dx + b * 32;
+#pragma unroll
+    for (int j = 0; j < 32; j++) out[j] = (float)qs[j] * d;
+}
+
 __global__ void k_embed_q2_K_dyn(const uint8_t *__restrict__ W, const int *__restrict__ d_tok,
                                  float *__restrict__ dx, int dim) {
     const int tok = *d_tok;
@@ -3875,7 +4019,10 @@ Qwen2Engine *qwen2_engine_create(const TTConfig *cfg, GGUFModel *m) {
         qwen2_engine_enable_q4_kvcache(e, 1);
     } else {
         const char *q8_env = getenv("TT_Q8_KV");
-        if (q8_env && atoi(q8_env) != 0) {
+        /* Q8 KV default-ON (opt out with TT_Q8_KV=0): 4x KV traffic cut,
+         * top-1 stable vs FP32 (5/5 goldens + 32tok text A/B identical),
+         * graph-safe with thresh 0. TT_KV_F16/TT_Q4_KV still override. */
+        if (!q8_env || atoi(q8_env) != 0) {
             qwen2_engine_enable_q8_kvcache(e, 1);
         }
     }
@@ -4365,8 +4512,9 @@ static int forward_layers(Qwen2Engine *e) {
         const int kvdim_l = KV_l * HDl;
         static int no_fuse = -1;
         if (no_fuse < 0) no_fuse = getenv("TT_NO_FUSE") ? 1 : 0;
-        const int use_fuse = (!no_fuse && !kv_shared &&
-            w->q.dtype == 2 && w->k.dtype == 2 && w->v.dtype == 2 &&
+        const int fuse_q4 = (w->q.dtype == 2 && w->k.dtype == 2 && w->v.dtype == 2);
+        const int fuse_q8 = (w->q.dtype == 8 && w->k.dtype == 8 && w->v.dtype == 8);
+        const int use_fuse = (!no_fuse && !kv_shared && (fuse_q4 || fuse_q8) &&
             c->dim > 0 && c->dim <= 4096 && (c->dim & 63) == 0 &&
             attn_qout > 0 && (attn_qout & 1) == 0 &&
             kvdim_l > 0 && (kvdim_l & 1) == 0 &&
@@ -4378,11 +4526,19 @@ static int forward_layers(Qwen2Engine *e) {
             const int npair = (attn_qout >> 1) + (kvdim_l >> 1) * 2;
             const dim3 fg((npair + 7) / 8, 1, 1), fb(256, 1, 1);
             const size_t fsh = ((size_t)c->dim + 8) * sizeof(float);
-            k_rmsnorm_qkv_q4_0<<<fg, fb, fsh, e->stream>>>(
-                e->d_x, w->attn_norm, e->d_xn,
-                (const BlockQ4_0 *)w->q.ptr, (const BlockQ4_0 *)w->k.ptr,
-                (const BlockQ4_0 *)w->v.ptr, e->d_q, e->d_k_stage, e->d_v_stage,
-                c->dim, attn_qout, kvdim_l, c->rms_eps, c->tr.norm_offset);
+            if (fuse_q8) {
+                k_rmsnorm_qkv_q8_0<<<fg, fb, fsh, e->stream>>>(
+                    e->d_x, w->attn_norm, e->d_xn,
+                    (const BlockQ8_0 *)w->q.ptr, (const BlockQ8_0 *)w->k.ptr,
+                    (const BlockQ8_0 *)w->v.ptr, e->d_q, e->d_k_stage, e->d_v_stage,
+                    c->dim, attn_qout, kvdim_l, c->rms_eps, c->tr.norm_offset);
+            } else {
+                k_rmsnorm_qkv_q4_0<<<fg, fb, fsh, e->stream>>>(
+                    e->d_x, w->attn_norm, e->d_xn,
+                    (const BlockQ4_0 *)w->q.ptr, (const BlockQ4_0 *)w->k.ptr,
+                    (const BlockQ4_0 *)w->v.ptr, e->d_q, e->d_k_stage, e->d_v_stage,
+                    c->dim, attn_qout, kvdim_l, c->rms_eps, c->tr.norm_offset);
+            }
             CHK_STAGE("2 qkv-gemv");
         } else {
         if (tt_profiling()) tt_prof_begin(TT_P_RMSNORM, e->stream);
@@ -4443,6 +4599,21 @@ static int forward_layers(Qwen2Engine *e) {
                 (c->tr.rope == ROPE_GPTJ) ? k_rope_gptj : k_rope;
             void (*rope_ff_fn)(float *, int, int, const int *, float, const float *) =
                 (c->tr.rope == ROPE_GPTJ) ? k_rope_gptj_ff : k_rope_ff;
+            /* Fused single-launch rope q+k (no ff factors, decode path).
+             * Falls back to the two-launch path for partial-rope layers.
+             * TT_NO_ROPEQK=1 forces old path (independent of TT_NO_FUSE). */
+            static int no_ropeqk = -2;
+            if (no_ropeqk == -2) no_ropeqk = getenv("TT_NO_ROPEQK") ? 1 : 0;
+            if (!ff_l && !no_ropeqk && H_l > 0 && H_l <= 64 && KV_l > 0 && KV_l <= 64
+                && HDl > 0 && HDl <= 512) {
+                g.x = (HDl / 2 + 63) / 64;
+                g.y = H_l > KV_l ? H_l : KV_l; g.z = 1;
+                b.x = 64; b.y = 1; b.z = 1;
+                k_rope_qk<<<g, b, 0, e->stream>>>(
+                    e->d_q, kv_shared ? (float *)0 : e->d_k_stage,
+                    H_l, KV_l, HDl, e->d_pos, base_l,
+                    (c->tr.rope == ROPE_GPTJ) ? 1 : 0);
+            } else {
             g.x = (HDl / 2 + 63) / 64; g.y = H_l; g.z = 1;
             b.x = 64; b.y = 1; b.z = 1;
             if (ff_l)
@@ -4455,6 +4626,7 @@ static int forward_layers(Qwen2Engine *e) {
                 rope_ff_fn<<<g, b, 0, e->stream>>>(e->d_k_stage, KV_l, HDl, e->d_pos, base_l, ff_l);
             else
                 rope_fn<<<g, b, 0, e->stream>>>(e->d_k_stage, KV_l, HDl, e->d_pos, base_l);
+            }
             }
         }
 
@@ -4491,11 +4663,22 @@ static int forward_layers(Qwen2Engine *e) {
          * source layer's already-populated slab. */
         if (!kv_shared) {
         if (tt_profiling()) tt_prof_begin(TT_P_SCATTER, e->stream);
-        /* Dual-write: always FP32, plus Q4/Q8 when allocated (ptr-gated,
-         * threshold-independent). Decode flash read stays threshold-gated. */
+        /* Decode scatter: skip the FP32 write when the quantized path is
+         * authoritative for this step (decode flash reads Q4/Q8 only).
+         * Prefill (batched path below) still dual-writes: prefill flash
+         * always reads FP32. Gated on the same effective predicates as
+         * the attn dispatch (thresh + TT_NO_BACKFILL aware) plus ptrs,
+         * so TT_NO_BACKFILL / missing-slab configs keep FP32. Under
+         * graph capture the host branch bakes the capture-ctx path;
+         * hybrid thresh>0 disables graph, so baked == correct. */
+        {
+        int q_eff = (kv_use_q8_eff(e) && Kl_q8 && Vl_q8)
+                 || (kv_use_q4_eff(e) && Kl_q4 && Vl_q4);
+        if (!q_eff) {
         k_kv_scatter<<<(kvdim_l + 255) / 256, 256, 0, e->stream>>>(
             e->d_k_stage, e->d_v_stage, Kl_f, Vl_f, e->d_pos,
             KV_l, HDl, c->max_ctx);
+        }
         if (Kl_q4 && Vl_q4) {
             const int num_blocks = kvdim_l / 32;
             k_kv_scatter_q4_0<<<(num_blocks + 255) / 256, 256, 0, e->stream>>>(
@@ -4507,6 +4690,7 @@ static int forward_layers(Qwen2Engine *e) {
             k_kv_scatter_q8_0<<<(num_blocks + 255) / 256, 256, 0, e->stream>>>(
                 e->d_k_stage, e->d_v_stage, Kl_q8, Vl_q8, e->d_pos,
                 KV_l, HDl, c->max_ctx);
+        }
         }
         if (tt_profiling()) tt_prof_end(TT_P_SCATTER, e->stream);
         }
@@ -4564,8 +4748,8 @@ static int forward_layers(Qwen2Engine *e) {
                     e->d_att, H_l, HDl, S);
             } else {
                 // FP32 FA2 tiled split-K: BC=32, smem 2*BC*HD*4, S=ceil(ctx/64) chunk=64 O(1) per slice
-                // Bypass tiled when ctx<=32 (L2, serial faster) or HD!=128 (fallback to serial/splitK)
-                if (ctx_l > 32 && HDl == 128) {
+                // Bypass tiled when ctx<=32 (L2, serial faster) or HD>128
+                if (ctx_l > 32 && HDl <= 128) {
                     /* capture bakes eager S at capture ctx (see split_S_fp32) */
                     int S = split_S_fp32(ctx_l, e->d_split_S_max);
                     dim3 grid_split(S, KV_l);
@@ -5341,6 +5525,27 @@ static void cublas_fp16_build(Qwen2Engine *e, GGUFModel *m) {
     }
 }
 
+typedef int (*tt_prefill_gemm_fn)(const void *, const float *, float *, int, int, int, cudaStream_t);
+extern "C" int tt_gemm_q8_0_prefill(const void *, const float *, float *, int, int, int, cudaStream_t);
+
+/* Route one prefill matmul by weight dtype: Q4_0 keeps the cuBLAS/Q4-GEMM
+ * path, Q8_0 uses the batched Q8 GEMM, anything else keeps the per-row
+ * GEMV loop. Dispatch is per-tensor so mixed-quant layers route correctly. */
+static void prefill_gemm_dtype(Qwen2Engine *e, int l, int kind, int dtype,
+        tt_prefill_gemm_fn q4fn,
+        const void *w, const float *x, float *y,
+        int M, int K, int n, long xrow, long yrow) {
+    if (dtype == TTQ_Q4_0) {
+        if (cublas_prefill_try(e, l, kind, x, y, M, K, n, e->stream) != 0)
+            q4fn(w, x, y, M, K, n, e->stream);
+    } else if (dtype == TTQ_Q8_0) {
+        tt_gemm_q8_0_prefill(w, x, y, M, K, n, e->stream);
+    } else {
+        for (int i = 0; i < n; i++)
+            tt_gemv_layer_dispatch((void *)w, dtype, x + (long)i * xrow, y + (long)i * yrow, M, K, e->stream);
+    }
+}
+
 int prefill_batched_gemm(Qwen2Engine *e, const int *toks, int n, float *h_x_out) {
     if (!e || !toks || n <= 0) return -1;
     const TTConfig *c = &e->cfg;
@@ -5485,23 +5690,10 @@ int prefill_batched_gemm(Qwen2Engine *e, const int *toks, int n, float *h_x_out)
 
         /* 2. Batched QKV GEMM */
         if (tt_profiling()) tt_prof_begin(TT_P_QKV, e->stream);
-        if (w->q.dtype == TTQ_Q4_0) {
-            if (cublas_prefill_try(e, l, 0, d_Xn, d_Q, attn_qout, dim, n, e->stream) != 0)
-                prefill_gemm_fn(w->q.ptr, d_Xn, d_Q, attn_qout, dim, n, e->stream);
-            if (!kv_shared) {
-                if (cublas_prefill_try(e, l, 1, d_Xn, d_K, kvdim_l, dim, n, e->stream) != 0)
-                    prefill_gemm_fn(w->k.ptr, d_Xn, d_K, kvdim_l, dim, n, e->stream);
-                if (cublas_prefill_try(e, l, 2, d_Xn, d_V, kvdim_l, dim, n, e->stream) != 0)
-                    prefill_gemm_fn(w->v.ptr, d_Xn, d_V, kvdim_l, dim, n, e->stream);
-            }
-        } else {
-            for (int i = 0; i < n; i++) {
-                tt_gemv_layer_dispatch(w->q.ptr, w->q.dtype, d_Xn + (long)i * dim, d_Q + (long)i * attn_qout, attn_qout, dim, e->stream);
-                if (!kv_shared) {
-                    tt_gemv_layer_dispatch(w->k.ptr, w->k.dtype, d_Xn + (long)i * dim, d_K + (long)i * kvdim_l, kvdim_l, dim, e->stream);
-                    tt_gemv_layer_dispatch(w->v.ptr, w->v.dtype, d_Xn + (long)i * dim, d_V + (long)i * kvdim_l, kvdim_l, dim, e->stream);
-                }
-            }
+        prefill_gemm_dtype(e, l, 0, w->q.dtype, prefill_gemm_fn, w->q.ptr, d_Xn, d_Q, attn_qout, dim, n, dim, attn_qout);
+        if (!kv_shared) {
+            prefill_gemm_dtype(e, l, 1, w->k.dtype, prefill_gemm_fn, w->k.ptr, d_Xn, d_K, kvdim_l, dim, n, dim, kvdim_l);
+            prefill_gemm_dtype(e, l, 2, w->v.dtype, prefill_gemm_fn, w->v.ptr, d_Xn, d_V, kvdim_l, dim, n, dim, kvdim_l);
         }
         if (tt_profiling()) tt_prof_end(TT_P_QKV, e->stream);
 
@@ -5630,14 +5822,7 @@ int prefill_batched_gemm(Qwen2Engine *e, const int *toks, int n, float *h_x_out)
 
         /* 4. O projection */
         if (tt_profiling()) tt_prof_begin(TT_P_OPROJ, e->stream);
-        if (w->o.dtype == TTQ_Q4_0) {
-            if (cublas_prefill_try(e, l, 3, d_Att, d_Xn, dim, attn_qout, n, e->stream) != 0)
-                prefill_gemm_fn(w->o.ptr, d_Att, d_Xn, dim, attn_qout, n, e->stream);
-        } else {
-            for (int i = 0; i < n; i++) {
-                tt_gemv_layer_dispatch(w->o.ptr, w->o.dtype, d_Att + (long)i * attn_qout, d_Xn + (long)i * dim, dim, attn_qout, e->stream);
-            }
-        }
+        prefill_gemm_dtype(e, l, 3, w->o.dtype, prefill_gemm_fn, w->o.ptr, d_Att, d_Xn, dim, attn_qout, n, attn_qout, dim);
         if (tt_profiling()) tt_prof_end(TT_P_OPROJ, e->stream);
 
         if (w->post_attn_norm) {
@@ -5655,17 +5840,8 @@ int prefill_batched_gemm(Qwen2Engine *e, const int *toks, int n, float *h_x_out)
         /* 6. Gate & Up GEMM projections */
         const int act_gelu = (c->tr.act == ACT_GELU) ? 1 : 0;
         if (tt_profiling()) tt_prof_begin(TT_P_FFGATEUP, e->stream);
-        if (w->gate.dtype == TTQ_Q4_0) {
-            if (cublas_prefill_try(e, l, 4, d_Xn, d_G, FF_l, dim, n, e->stream) != 0)
-                prefill_gemm_fn(w->gate.ptr, d_Xn, d_G, FF_l, dim, n, e->stream);
-            if (cublas_prefill_try(e, l, 5, d_Xn, d_U, FF_l, dim, n, e->stream) != 0)
-                prefill_gemm_fn(w->up.ptr, d_Xn, d_U, FF_l, dim, n, e->stream);
-        } else {
-            for (int i = 0; i < n; i++) {
-                tt_gemv_layer_dispatch(w->gate.ptr, w->gate.dtype, d_Xn + (long)i * dim, d_G + (long)i * FF_l, FF_l, dim, e->stream);
-                tt_gemv_layer_dispatch(w->up.ptr, w->up.dtype, d_Xn + (long)i * dim, d_U + (long)i * FF_l, FF_l, dim, e->stream);
-            }
-        }
+        prefill_gemm_dtype(e, l, 4, w->gate.dtype, prefill_gemm_fn, w->gate.ptr, d_Xn, d_G, FF_l, dim, n, dim, FF_l);
+        prefill_gemm_dtype(e, l, 5, w->up.dtype, prefill_gemm_fn, w->up.ptr, d_Xn, d_U, FF_l, dim, n, dim, FF_l);
         if (tt_profiling()) tt_prof_end(TT_P_FFGATEUP, e->stream);
 
         /* 7. SwiGLU activation */
@@ -5673,14 +5849,7 @@ int prefill_batched_gemm(Qwen2Engine *e, const int *toks, int n, float *h_x_out)
 
         /* 8. Down projection GEMM */
         if (tt_profiling()) tt_prof_begin(TT_P_FFDOWN, e->stream);
-        if (w->down.dtype == TTQ_Q4_0) {
-            if (cublas_prefill_try(e, l, 6, d_H, d_Xn, dim, FF_l, n, e->stream) != 0)
-                prefill_gemm_fn(w->down.ptr, d_H, d_Xn, dim, FF_l, n, e->stream);
-        } else {
-            for (int i = 0; i < n; i++) {
-                tt_gemv_layer_dispatch(w->down.ptr, w->down.dtype, d_H + (long)i * FF_l, d_Xn + (long)i * dim, dim, FF_l, e->stream);
-            }
-        }
+        prefill_gemm_dtype(e, l, 6, w->down.dtype, prefill_gemm_fn, w->down.ptr, d_H, d_Xn, dim, FF_l, n, FF_l, dim);
         if (tt_profiling()) tt_prof_end(TT_P_FFDOWN, e->stream);
 
         if (w->post_ffn_norm) {
@@ -5860,23 +6029,10 @@ int prefill_batched_gemm_dx(Qwen2Engine *e, const int *toks, int n, float *d_x_o
         k_rmsnorm_batched<<<n, 256, 256*sizeof(float), e->stream>>>(d_X, w->attn_norm, d_Xn, dim, c->rms_eps, c->tr.norm_offset, n);
 
         /* 2. Batched QKV GEMM */
-        if (w->q.dtype == TTQ_Q4_0) {
-            if (cublas_prefill_try(e, l, 0, d_Xn, d_Q, attn_qout, dim, n, e->stream) != 0)
-                prefill_gemm_fn(w->q.ptr, d_Xn, d_Q, attn_qout, dim, n, e->stream);
-            if (!kv_shared) {
-                if (cublas_prefill_try(e, l, 1, d_Xn, d_K, kvdim_l, dim, n, e->stream) != 0)
-                    prefill_gemm_fn(w->k.ptr, d_Xn, d_K, kvdim_l, dim, n, e->stream);
-                if (cublas_prefill_try(e, l, 2, d_Xn, d_V, kvdim_l, dim, n, e->stream) != 0)
-                    prefill_gemm_fn(w->v.ptr, d_Xn, d_V, kvdim_l, dim, n, e->stream);
-            }
-        } else {
-            for (int i = 0; i < n; i++) {
-                tt_gemv_layer_dispatch(w->q.ptr, w->q.dtype, d_Xn + (long)i * dim, d_Q + (long)i * attn_qout, attn_qout, dim, e->stream);
-                if (!kv_shared) {
-                    tt_gemv_layer_dispatch(w->k.ptr, w->k.dtype, d_Xn + (long)i * dim, d_K + (long)i * kvdim_l, kvdim_l, dim, e->stream);
-                    tt_gemv_layer_dispatch(w->v.ptr, w->v.dtype, d_Xn + (long)i * dim, d_V + (long)i * kvdim_l, kvdim_l, dim, e->stream);
-                }
-            }
+        prefill_gemm_dtype(e, l, 0, w->q.dtype, prefill_gemm_fn, w->q.ptr, d_Xn, d_Q, attn_qout, dim, n, dim, attn_qout);
+        if (!kv_shared) {
+            prefill_gemm_dtype(e, l, 1, w->k.dtype, prefill_gemm_fn, w->k.ptr, d_Xn, d_K, kvdim_l, dim, n, dim, kvdim_l);
+            prefill_gemm_dtype(e, l, 2, w->v.dtype, prefill_gemm_fn, w->v.ptr, d_Xn, d_V, kvdim_l, dim, n, dim, kvdim_l);
         }
 
         /* Biases & QK norm - batched */
@@ -6000,14 +6156,7 @@ int prefill_batched_gemm_dx(Qwen2Engine *e, const int *toks, int n, float *d_x_o
         }
 
         /* 4. O projection */
-        if (w->o.dtype == TTQ_Q4_0) {
-            if (cublas_prefill_try(e, l, 3, d_Att, d_Xn, dim, attn_qout, n, e->stream) != 0)
-                prefill_gemm_fn(w->o.ptr, d_Att, d_Xn, dim, attn_qout, n, e->stream);
-        } else {
-            for (int i = 0; i < n; i++) {
-                tt_gemv_layer_dispatch(w->o.ptr, w->o.dtype, d_Att + (long)i * attn_qout, d_Xn + (long)i * dim, dim, attn_qout, e->stream);
-            }
-        }
+        prefill_gemm_dtype(e, l, 3, w->o.dtype, prefill_gemm_fn, w->o.ptr, d_Att, d_Xn, dim, attn_qout, n, attn_qout, dim);
 
         if (w->post_attn_norm) {
             k_rmsnorm_batched<<<n,256,256*sizeof(float),e->stream>>>(d_Xn, w->post_attn_norm, d_Xn, dim, c->rms_eps, c->tr.norm_offset, n);
@@ -6021,30 +6170,14 @@ int prefill_batched_gemm_dx(Qwen2Engine *e, const int *toks, int n, float *d_x_o
 
         /* 6. Gate & Up GEMM projections */
         const int act_gelu = (c->tr.act == ACT_GELU) ? 1 : 0;
-        if (w->gate.dtype == TTQ_Q4_0) {
-            if (cublas_prefill_try(e, l, 4, d_Xn, d_G, FF_l, dim, n, e->stream) != 0)
-                prefill_gemm_fn(w->gate.ptr, d_Xn, d_G, FF_l, dim, n, e->stream);
-            if (cublas_prefill_try(e, l, 5, d_Xn, d_U, FF_l, dim, n, e->stream) != 0)
-                prefill_gemm_fn(w->up.ptr, d_Xn, d_U, FF_l, dim, n, e->stream);
-        } else {
-            for (int i = 0; i < n; i++) {
-                tt_gemv_layer_dispatch(w->gate.ptr, w->gate.dtype, d_Xn + (long)i * dim, d_G + (long)i * FF_l, FF_l, dim, e->stream);
-                tt_gemv_layer_dispatch(w->up.ptr, w->up.dtype, d_Xn + (long)i * dim, d_U + (long)i * FF_l, FF_l, dim, e->stream);
-            }
-        }
+        prefill_gemm_dtype(e, l, 4, w->gate.dtype, prefill_gemm_fn, w->gate.ptr, d_Xn, d_G, FF_l, dim, n, dim, FF_l);
+        prefill_gemm_dtype(e, l, 5, w->up.dtype, prefill_gemm_fn, w->up.ptr, d_Xn, d_U, FF_l, dim, n, dim, FF_l);
 
         /* 7. SwiGLU activation */
         k_swiglu_apply<<<(n * FF_l + 255) / 256, 256, 0, e->stream>>>(d_G, d_U, d_H, n * FF_l, act_gelu);
 
         /* 8. Down projection GEMM */
-        if (w->down.dtype == TTQ_Q4_0) {
-            if (cublas_prefill_try(e, l, 6, d_H, d_Xn, dim, FF_l, n, e->stream) != 0)
-                prefill_gemm_fn(w->down.ptr, d_H, d_Xn, dim, FF_l, n, e->stream);
-        } else {
-            for (int i = 0; i < n; i++) {
-                tt_gemv_layer_dispatch(w->down.ptr, w->down.dtype, d_H + (long)i * FF_l, d_Xn + (long)i * dim, dim, FF_l, e->stream);
-            }
-        }
+        prefill_gemm_dtype(e, l, 6, w->down.dtype, prefill_gemm_fn, w->down.ptr, d_H, d_Xn, dim, FF_l, n, FF_l, dim);
 
         if (w->post_ffn_norm) {
             k_rmsnorm_batched<<<n,256,256*sizeof(float),e->stream>>>(d_Xn, w->post_ffn_norm, d_Xn, dim, c->rms_eps, c->tr.norm_offset, n);
@@ -6354,7 +6487,7 @@ static int qwen2_engine_graph_capture(Qwen2Engine *e) {
      * variant; fall back to eager for those. Captured graph works for
      * qwen2.5 (q4_0), llama-3.2 (q6_k despite filename), gemma2 (q6_k). */
     const int edt = e->d_embd.dtype;
-    if (edt != GGUF_TYPE_Q4_0 && edt != GGUF_TYPE_Q2_K && edt != GGUF_TYPE_Q3_K && edt != GGUF_TYPE_Q6_K) return -1;
+    if (edt != GGUF_TYPE_Q4_0 && edt != GGUF_TYPE_Q8_0 && edt != GGUF_TYPE_Q2_K && edt != GGUF_TYPE_Q3_K && edt != GGUF_TYPE_Q6_K) return -1;
     const int dummy = e->pending_tok >= 0 ? e->pending_tok : 0;
     cudaMemcpy(e->d_next_tok, &dummy, sizeof(int), cudaMemcpyHostToDevice);
     cudaStreamSynchronize(e->stream);
@@ -6382,6 +6515,10 @@ static int qwen2_engine_graph_capture(Qwen2Engine *e) {
         } else if (edt == GGUF_TYPE_Q3_K) {
             const int nu = (c->dim / 256) * 16;
             k_embed_q3_K_dyn<<<(nu + 255) / 256, 256, 0, e->stream>>>(
+                (const uint8_t *)e->d_embd.ptr, e->d_next_tok, e->d_x, c->dim);
+        } else if (edt == GGUF_TYPE_Q8_0) {
+            const int nb = c->dim / 32;
+            k_embed_q8_0_dyn<<<(nb + 255) / 256, 256, 0, e->stream>>>(
                 (const uint8_t *)e->d_embd.ptr, e->d_next_tok, e->d_x, c->dim);
         } else { /* GGUF_TYPE_Q6_K */
             const int nu = (c->dim / 256) * 8;
@@ -6457,9 +6594,34 @@ static int qwen2_engine_graph_capture(Qwen2Engine *e) {
     cudaGraph_t graph = NULL;
     const cudaError_t enderr = cudaStreamEndCapture(e->stream, &graph);
     g_capturing = 0;
-    if (enderr != cudaSuccess || !graph || frc || lrc) {
-        if (graph) cudaGraphDestroy(graph);
-        return -1;
+   if (enderr != cudaSuccess || !graph || frc || lrc) {
+       if (graph) cudaGraphDestroy(graph);
+       return -1;
+   }
+    if (getenv("TT_GRAPH_DUMP")) {
+        size_t nn = 0;
+        if (cudaGraphGetNodes(graph, NULL, &nn) == cudaSuccess && nn > 0) {
+            cudaGraphNode_t *nodes = (cudaGraphNode_t*)malloc(nn * sizeof(cudaGraphNode_t));
+            if (nodes && cudaGraphGetNodes(graph, nodes, &nn) == cudaSuccess) {
+                fprintf(stderr, "[graph-dump] nodes=%zu\n", nn);
+                for (size_t i = 0; i < nn; i++) {
+                    cudaGraphNodeType t;
+                    if (cudaGraphNodeGetType(nodes[i], &t) != cudaSuccess) continue;
+                    if (t == cudaGraphNodeTypeKernel) {
+                        cudaKernelNodeParams p;
+                        const char *fn = "?";
+                        const char *nm = NULL;
+                        if (cudaGraphKernelNodeGetParams(nodes[i], &p) == cudaSuccess && p.func
+                            && cudaFuncGetName(&nm, (const void*)p.func) == cudaSuccess && nm)
+                            fn = nm;
+                        fprintf(stderr, "[graph-dump] #%zu kernel %s\n", i, fn);
+                    } else {
+                        fprintf(stderr, "[graph-dump] #%zu type=%d\n", i, (int)t);
+                    }
+                }
+            }
+            free(nodes);
+        }
     }
 
     /* CUDA 12 signature: flags as unsigned long long (cuda_runtime_api.h).
