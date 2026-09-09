@@ -86,6 +86,22 @@ primary model >= 0.90x, so three cells block parity.
 - Still open: rope q/k 2x launches per layer (32 nodes), k_add residuals
   (32 nodes), gumbel/penalty passes when greedy — next fusions in that order.
 
+### Progress 2026-09-09 — bench hardening + attn duel + 60W stage table
+
+- Bench hardening (ccb1918): get_power_info snapshots Current Power Limit
+  + AC state into every jsonl row and meta, warns when limit != 60W.
+  Oracle stores prompt_n/predicted_n per run. Per-row start/end stamps.
+  Empty-prompt oracle call refused (was the 25-min hang).
+- Attention duel (bfb3111, tools/micro_duel_attn.cu, Llama shapes):
+  A=30.6us B(u32 staging)=29.5us C(+fastexp)=28.7us. +6.7% total, KILLED
+  as lever; per-token FMA/shuffle dominates, S-sweep already flat.
+- 60W AC stage table (llama ctx512 eager, /tmp/prof60w.csv): qkv 0.75 /
+  attn 0.75 / o 0.37 / ffn 4.08 / head 1.61 / other 0.35 = 7.92ms.
+  qkv at roofline, head 87%, o+ffn ~70% eff. Gap drivers: small-M GEMV
+  occupancy + ~64 fusable graph nodes (rope q/k, k_add) + launch gaps.
+- Next: 1) split-K-within-block GEMV prototype in /tmp. 2) rope/k_add
+  fusion. 3) v6 fleet on AC + commit per change.
+
 ## Current state
 
 Already implemented:
