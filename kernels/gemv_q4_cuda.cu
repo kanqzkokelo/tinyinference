@@ -1865,6 +1865,18 @@ void k_gemm_wmma_q4_0_prefill(
 // ---------------- host launchers ----------------
 extern "C" {
 
+static int tt_dispatch_trace_on(void) {
+    static int cached = -1;
+    if (cached < 0) cached = getenv("TT_DISPATCH") ? 1 : 0;
+    return cached;
+}
+
+static void tt_trace_dispatch(const char *op, const char *path, int M, int K) {
+    static unsigned count = 0;
+    if (tt_dispatch_trace_on() && count++ < 512)
+        fprintf(stderr, "[dispatch] op=%s path=%s M=%d K=%d\n", op, path, M, K);
+}
+
 static void gemv_dims(int M, dim3 *grid, dim3 *block) {
     block->x = 32; block->y = 16; block->z = 1;
     grid->x = (M + block->y - 1) / block->y; grid->y = 1; grid->z = 1;
@@ -2049,10 +2061,12 @@ int tt_gemv_q4_0_dispatch(const void *dW, const float *dx, float *dy,
                            int M, int K, cudaStream_t stream) {
     const int nb = K / 32;
     if ((K & 31) == 0 && (nb & 1) == 0 && (M & 3) == 0 && M >= 128) {
+        tt_trace_dispatch("q4_gemv", "V4", M, K);
         int rc = tt_gemv_q4_0_v4(dW, dx, dy, M, K, stream);
         if (rc == 0) return 0;
         /* fall through to V2 on launch failure */
     }
+    tt_trace_dispatch("q4_gemv", "V2", M, K);
     dim3 g, b; gemv_dims2(M, &g, &b);
     k_gemv_q4_0<<<g, b, 0, stream>>>((const BlockQ4_0 *)dW, dx, dy, M, K);
     return (int)cudaGetLastError();
@@ -2127,6 +2141,7 @@ int tt_embed_q4_0(const void *dW, int tok, float *dx, int dim, cudaStream_t stre
 int tt_logits_dispatch(const void *dW, int dtype, const float *dx,
                        float *dlogits, int vocab, int K, cudaStream_t stream) {
     if (dtype != 2 /*q4_0*/ && dtype != 8 /*q8_0*/) {
+        tt_trace_dispatch("lm_head", "typed", vocab, K);
         extern int tt_logits_typed(const void *, int, const float *,
                                    float *, int, int, cudaStream_t);
         return tt_logits_typed(dW, dtype, dx, dlogits, vocab, K, stream);
@@ -2134,6 +2149,7 @@ int tt_logits_dispatch(const void *dW, int dtype, const float *dx,
     dim3 g, b; gemv_dims(vocab, &g, &b);
     if (dtype == 8) {
         if ((vocab & 3) == 0 && (K & 31) == 0) {
+            tt_trace_dispatch("lm_head_q8", "V4", vocab, K);
             return tt_logits_q8_0_v4(dW, dx, dlogits, vocab, K, stream);
         }
         /* M6.3b: one warp per block for the head (y sweep 16->8->4->2->1
@@ -2143,6 +2159,7 @@ int tt_logits_dispatch(const void *dW, int dtype, const float *dx,
          * zeroed every token id >= vocab/16. */
         b.y = 1;
         g.x = (vocab + b.y - 1) / b.y;
+        tt_trace_dispatch("lm_head_q8", "scalar", vocab, K);
         k_logits_q8_0<<<g, b, 0, stream>>>((const BlockQ8_0 *)dW, dx, dlogits, vocab, K);
     } else {
         /* M9.5+: route q4_0 to V4 (4 rows/warp) when eligible, else V2,
@@ -2154,17 +2171,20 @@ int tt_logits_dispatch(const void *dW, int dtype, const float *dx,
          *   V2 needs: K%32==0, nb even (same uint32 streaming contract).
          *   scalar k_logits_q4_0 is the fallback for odd-nb or odd-K. */
         if ((K & 31) == 0 && ((K >> 5) & 1) == 0 && (vocab & 3) == 0) {
+            tt_trace_dispatch("lm_head_q4", "V4", vocab, K);
             b.x = 32; b.y = 8; b.z = 1;
             g.x = (vocab + b.y * 4 - 1) / (b.y * 4); g.y = 1; g.z = 1;
             k_logits_q4_0_v4<<<g, b, 0, stream>>>(
                 (const BlockQ4_0 *)dW, dx, dlogits, vocab, K);
         } else if (((K >> 5) & 1) == 0 && (K & 31) == 0) {
+            tt_trace_dispatch("lm_head_q4", "V2", vocab, K);
             /* V2 path: grid.x * blockDim.y * 2 >= vocab. Re-derive via
              * gemv_dims2 (same as tt_gemv_q4_0) so we don't waste warps. */
             gemv_dims2(vocab, &g, &b);
             k_logits_q4_0_v2<<<g, b, 0, stream>>>(
                 (const BlockQ4_0 *)dW, dx, dlogits, vocab, K);
         } else {
+            tt_trace_dispatch("lm_head_q4", "scalar", vocab, K);
             k_logits_q4_0<<<g, b, 0, stream>>>(
                 (const BlockQ4_0 *)dW, dx, dlogits, vocab, K);
         }
@@ -2172,12 +2192,183 @@ int tt_logits_dispatch(const void *dW, int dtype, const float *dx,
     return (int)cudaGetLastError();
 }
 
+/*
+ * CUDA-core Batched Q8_0 Prefill GEMM Kernel (twin of k_gemm_q4_0_prefill).
+ * Y = X * W^T, X:[N,K] float, W:[M,K] BlockQ8_0, Y:[N,M] float.
+ * Same 64x32x32 tiling; Q8 blocks map 1:1 onto K-tiles so the weight tile
+ * is a plain 64x32 int8 load (no nibble swizzle unlike Q4_0).
+ */
+__global__ __launch_bounds__(256, 4)
+void k_gemm_q8_0_prefill(
+    const void *__restrict__ dW,
+    const float *__restrict__ dX,
+    float *__restrict__ dY,
+    int M, int K, int N)
+{
+    const int tx = threadIdx.x; // 0..15 (M dimension)
+    const int ty = threadIdx.y; // 0..15 (N dimension)
+    const int tid = ty * 16 + tx; // 0..255
+
+    const int m_base = blockIdx.x * 64 + tx * 4;
+    const int n_base = blockIdx.y * 32 + ty * 2;
+
+    const int nb = K / 32; // q8_0 blocks per row
+
+    __shared__ float sX[32][33];
+    __shared__ float sW_d[65];
+    __shared__ uint32_t sW_v[64][8];
+
+    float acc[2][4];
+    #pragma unroll
+    for (int in = 0; in < 2; in++) {
+        #pragma unroll
+        for (int im = 0; im < 4; im++) {
+            acc[in][im] = 0.0f;
+        }
+    }
+
+    const int n_load = tid / 8;     // 0..31
+    const int k_vec_load = tid % 8; // 0..7
+    const int n_global = blockIdx.y * 32 + n_load;
+
+    for (int k_tile = 0; k_tile < nb; k_tile++) {
+        // 1. Cooperative load X tile into sX (same as Q4 twin)
+        const int k_global = k_tile * 32 + k_vec_load * 4;
+        float4 x_vec;
+        if (n_global < N && (k_global + 3) < K) {
+            x_vec = *reinterpret_cast<const float4*>(&dX[n_global * K + k_global]);
+        } else {
+            x_vec.x = (n_global < N && (k_global + 0) < K) ? dX[n_global * K + k_global + 0] : 0.0f;
+            x_vec.y = (n_global < N && (k_global + 1) < K) ? dX[n_global * K + k_global + 1] : 0.0f;
+            x_vec.z = (n_global < N && (k_global + 2) < K) ? dX[n_global * K + k_global + 2] : 0.0f;
+            x_vec.w = (n_global < N && (k_global + 3) < K) ? dX[n_global * K + k_global + 3] : 0.0f;
+        }
+        sX[n_load][k_vec_load * 4 + 0] = x_vec.x;
+        sX[n_load][k_vec_load * 4 + 1] = x_vec.y;
+        sX[n_load][k_vec_load * 4 + 2] = x_vec.z;
+        sX[n_load][k_vec_load * 4 + 3] = x_vec.w;
+
+        // 2. Cooperative load W tile: 64 rows x 1 Q8 block each.
+        // qs starts at byte offset 2 of the 34-byte block, so it is only
+        // 2-byte aligned: word-copy via int32 faults with misaligned
+        // address (cudaError 716). Stage byte-wise into shared, then consume
+        // as 8 words per row (word loads avoid int8 shared-bank conflicts).
+        if (tid < 64) {
+            int m_row = blockIdx.x * 64 + tid;
+            uint8_t *dst8 = (uint8_t *)sW_v[tid];
+            if (m_row < M) {
+                const BlockQ8_0 *blk = (const BlockQ8_0 *)dW + (long)m_row * nb + k_tile;
+                sW_d[tid] = __half2float(blk->d);
+                const uint8_t *qs8 = (const uint8_t *)(blk->qs);
+                #pragma unroll
+                for (int j = 0; j < 32; j++) dst8[j] = qs8[j];
+            } else {
+                sW_d[tid] = 0.0f;
+                #pragma unroll
+                for (int j = 0; j < 32; j++) dst8[j] = 0;
+            }
+        }
+
+        __syncthreads();
+
+        // 3. Hoist this thread's 4 weight rows into registers (Q4-twin style:
+        // shared is read once per K-tile, not once per k_sub).
+        float da[4];
+        uint32_t wa[4][8];
+        #pragma unroll
+        for (int im = 0; im < 4; im++) {
+            int m_local = tx * 4 + im;
+            da[im] = sW_d[m_local];
+            #pragma unroll
+            for (int w = 0; w < 8; w++) {
+                wa[im][w] = sW_v[m_local][w];
+            }
+        }
+
+        // 4. Dot products: 2 tokens x 4 rows x 8 consecutive K each, with
+        // explicit scalars (no indexed register arrays, no shared reloads).
+        #pragma unroll
+        for (int k_sub = 0; k_sub < 4; k_sub++) {
+            const int n0_local = ty * 2;
+            const int n1_local = ty * 2 + 1;
+            float x0_0 = sX[n0_local][8 * k_sub + 0];
+            float x0_1 = sX[n0_local][8 * k_sub + 1];
+            float x0_2 = sX[n0_local][8 * k_sub + 2];
+            float x0_3 = sX[n0_local][8 * k_sub + 3];
+            float x0_4 = sX[n0_local][8 * k_sub + 4];
+            float x0_5 = sX[n0_local][8 * k_sub + 5];
+            float x0_6 = sX[n0_local][8 * k_sub + 6];
+            float x0_7 = sX[n0_local][8 * k_sub + 7];
+            float x1_0 = sX[n1_local][8 * k_sub + 0];
+            float x1_1 = sX[n1_local][8 * k_sub + 1];
+            float x1_2 = sX[n1_local][8 * k_sub + 2];
+            float x1_3 = sX[n1_local][8 * k_sub + 3];
+            float x1_4 = sX[n1_local][8 * k_sub + 4];
+            float x1_5 = sX[n1_local][8 * k_sub + 5];
+            float x1_6 = sX[n1_local][8 * k_sub + 6];
+            float x1_7 = sX[n1_local][8 * k_sub + 7];
+            #pragma unroll
+            for (int im = 0; im < 4; im++) {
+                uint32_t w0 = wa[im][2 * k_sub];
+                uint32_t w1 = wa[im][2 * k_sub + 1];
+                float d = da[im];
+                int q0 = (int)(int8_t)(w0 & 0xFFu);
+                int q1 = (int)(int8_t)((w0 >> 8) & 0xFFu);
+                int q2 = (int)(int8_t)((w0 >> 16) & 0xFFu);
+                int q3 = (int)(int8_t)(w0 >> 24);
+                int q4 = (int)(int8_t)(w1 & 0xFFu);
+                int q5 = (int)(int8_t)((w1 >> 8) & 0xFFu);
+                int q6 = (int)(int8_t)((w1 >> 16) & 0xFFu);
+                int q7 = (int)(int8_t)(w1 >> 24);
+                float sum0 = (float)q0 * x0_0 + (float)q1 * x0_1
+                           + (float)q2 * x0_2 + (float)q3 * x0_3
+                           + (float)q4 * x0_4 + (float)q5 * x0_5
+                           + (float)q6 * x0_6 + (float)q7 * x0_7;
+                float sum1 = (float)q0 * x1_0 + (float)q1 * x1_1
+                           + (float)q2 * x1_2 + (float)q3 * x1_3
+                           + (float)q4 * x1_4 + (float)q5 * x1_5
+                           + (float)q6 * x1_6 + (float)q7 * x1_7;
+                acc[0][im] += sum0 * d;
+                acc[1][im] += sum1 * d;
+            }
+        }
+
+        __syncthreads();
+    }
+
+    // 4. Store Y accumulators (same as Q4 twin)
+    #pragma unroll
+    for (int in = 0; in < 2; in++) {
+        int n_g = n_base + in;
+        if (n_g < N) {
+            #pragma unroll
+            for (int im = 0; im < 4; im++) {
+                int m_g = m_base + im;
+                if (m_g < M) {
+                    dY[n_g * M + m_g] = acc[in][im];
+                }
+            }
+        }
+    }
+}
+
+
 int tt_gemm_q4_0_prefill(const void *dW, const float *dX_NxK, float *dY_NxM,
                          int M, int K, int N, cudaStream_t stream)
 {
     dim3 grid((M + 63) / 64, (N + 31) / 32);
     dim3 block(16, 16);
     k_gemm_q4_0_prefill<<<grid, block, 0, stream>>>(dW, dX_NxK, dY_NxM, M, K, N);
+    return (int)cudaGetLastError();
+}
+
+int tt_gemm_q8_0_prefill(const void *dW, const float *dX_NxK, float *dY_NxM,
+                         int M, int K, int N, cudaStream_t stream)
+{
+    tt_trace_dispatch("prefill_gemm", "q8", M, K);
+    dim3 grid((M + 63) / 64, (N + 31) / 32);
+    dim3 block(16, 16);
+    k_gemm_q8_0_prefill<<<grid, block, 0, stream>>>(dW, dX_NxK, dY_NxM, M, K, N);
     return (int)cudaGetLastError();
 }
 
