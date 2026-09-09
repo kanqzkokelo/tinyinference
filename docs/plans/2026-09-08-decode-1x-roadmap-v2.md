@@ -543,7 +543,24 @@ Geomean **0.947x** (v4 0.973x). Dropped despite the Qwen3 fix because oracle num
   q6-k-v2. No slow-path leaks; routing is clean.
 * Gate Q2-lite re-verified on live tree: 0/7 default (known Q8KV drift),
   7/7 with `TT_Q8_KV=0`. Prior-session dirt (Q6_K v2, Q8 prefill GEMM,
-  dispatch trace) is numerics-clean; Q8KV default still needs YOUR call.
+ dispatch trace) is numerics-clean; Q8KV default still needs YOUR call.
+### 2026-09-09 eve checkpoint 11: down-anomaly decomposed, 4 theories killed (no code change)
+
+* Clean (env -u TT_PROFILE) Llama-512: eager 136.7, graph 139.9 tok/s.
+  TT_PROFILE set (even =0) costs ~12pct via per-stage event-syncs; fleet v5
+  is clean (bench never sets it), so 0.947x stands.
+* Graph only +2.3pct over eager: launch gaps hidden by pipelining; fusion
+  that only removes launches cannot move decode (confirms add-norm NO-GO).
+* Killed: L2-cold (duel +6pct only), thermal/power (sustained 8000-iter
+  V4-down flat, no climb), fused-qkv-4row (duel won, production -1pct,
+  reverted), R8 GEMV (loses everywhere, explains why never wired).
+* Standalone stack rebuilt: 16-layer GEMV 4186us at 135GB/s; Q6_K head duel:
+  1720us at 125GB/s, roofline. Both fine standalone, so the ~1ms in-situ
+  deficit is launch environment (85pct SM clock in-pipe + queue bubbles).
+* Scoreboard split: fixed ~1.6ms/tok gap at ALL ctx plus ~0.5ms attn gap at
+  ctx512 (fa2_q8 split S=8+combine). Qwen/SmolLM at parity, work is Llama-only.
+* Next: (1) attn serial-vs-split duel at Llama 32h/8kv/HD64 ctx512,
+  (2) Q6_K v3 sweep, (3) prefill track (18x behind, token-at-a-time).
 * Red-cell accounting (Llama ctx542, per tok): Q4 stack ~4.1ms + head 1.9ms
   + KV 0.25ms + tiny kernels ~0.7ms ~= 6.9-7.1 vs actual 7.43. Biggest
   quantified levers left: Q6_K tune (-0.4ms), attention kernel (-0.4ms est),
