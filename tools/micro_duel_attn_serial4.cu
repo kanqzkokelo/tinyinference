@@ -27,6 +27,12 @@ extern int tt_flash_gqa_q8_0_splitk(const float *q, const void *Kc_q8, const voi
     float *p_acc, float *p_m, float *p_l, float *out,
     const int *d_pos, int n_heads, int n_kv_heads, int head_dim,
     float scale, int window, int S, cudaStream_t stream);
+extern int tt_attn_q8_split_only(const float *q, const void *Kc_q8, const void *Vc_q8,
+    float *p_acc, float *p_m, float *p_l,
+    const int *d_pos, int n_heads, int n_kv_heads, int head_dim,
+    float scale, int window, int S, cudaStream_t stream);
+extern int tt_attn_combine_only(const float *p_acc, const float *p_m, const float *p_l,
+    float *out, int n_heads, int head_dim, int S, cudaStream_t stream);
 }
 
 struct BlockQ8 { half d; int8_t qs[32]; };
@@ -127,19 +133,19 @@ static void sweep_S_llama2k() {
     CK(cudaMalloc(&dK, sizeof(BlockQ8) * nblk));
     CK(cudaMalloc(&dV, sizeof(BlockQ8) * nblk));
     CK(cudaMalloc(&dout, sizeof(float) * H * HD));
-    CK(cudaMalloc(&dacc, sizeof(float) * (size_t)32 * H * HD));
-    CK(cudaMalloc(&dm, sizeof(float) * (size_t)32 * H));
-    CK(cudaMalloc(&dl, sizeof(float) * (size_t)32 * H));
+    CK(cudaMalloc(&dacc, sizeof(float) * (size_t)64 * H * HD));
+    CK(cudaMalloc(&dm, sizeof(float) * (size_t)64 * H));
+    CK(cudaMalloc(&dl, sizeof(float) * (size_t)64 * H));
     CK(cudaMalloc(&dpos, sizeof(int)));
     char *dflush; CK(cudaMalloc(&dflush, 64<<20));
     CK(cudaMemcpy(dq, hq.data(), sizeof(float) * H * HD, cudaMemcpyHostToDevice));
     CK(cudaMemcpy(dK, hkv.data(), sizeof(BlockQ8) * nblk, cudaMemcpyHostToDevice));
     CK(cudaMemcpy(dV, hkv.data(), sizeof(BlockQ8) * nblk, cudaMemcpyHostToDevice));
     CK(cudaMemcpy(dpos, &pos, sizeof(int), cudaMemcpyHostToDevice));
-    const int Ss[] = {4, 8, 16, 32};
+    const int Ss[] = {1, 8, 16, 32, 64};
     cudaEvent_t a, b; CK(cudaEventCreate(&a)); CK(cudaEventCreate(&b));
     double kvbytes = (double)(pos+1) * KV * HD * 2 + (double)(pos+1) * KV * bph * 2 * 2;
-    for (int si = 0; si < 4; si++) {
+    for (int si = 0; si < 5; si++) {
         int S = Ss[si];
         for (int w = 0; w < 20; w++) tt_flash_gqa_q8_0_splitk(dq, dK, dV, dacc, dm, dl, dout, dpos, H, KV, HD, scale, 0, S, 0);
         CK(cudaDeviceSynchronize());
@@ -154,7 +160,33 @@ static void sweep_S_llama2k() {
         double med = med_ms(ms)*1000.0;
         printf("[sweep] S=%d median=%7.2f us usefulGB/s=%6.1f", S, med, kvbytes/(med/1e6)/1e9);
     }
-    CK(cudaEventDestroy(a)); CK(cudaEventDestroy(b));
+        int S32 = 32;
+    std::vector<float> ms2;
+    for (int w = 0; w < 20; w++) tt_attn_q8_split_only(dq, dK, dV, dacc, dm, dl, dpos, H, KV, HD, scale, 0, S32, 0);
+    CK(cudaDeviceSynchronize());
+    ms2.clear();
+    for (int i = 0; i < 200; i++) {
+        CK(cudaMemset(dflush, i & 255, 64<<20));
+        CK(cudaEventRecord(a, 0));
+        tt_attn_q8_split_only(dq, dK, dV, dacc, dm, dl, dpos, H, KV, HD, scale, 0, S32, 0);
+        CK(cudaEventRecord(b, 0)); CK(cudaEventSynchronize(b));
+        float m; CK(cudaEventElapsedTime(&m, a, b)); ms2.push_back(m);
+    }
+    double med2 = med_ms(ms2)*1000.0;
+        printf("[splitonly] S=%d median=%7.2f us", S32, med2);
+    for (int w = 0; w < 20; w++) tt_attn_combine_only(dacc, dm, dl, dout, H, HD, S32, 0);
+    CK(cudaDeviceSynchronize());
+    ms2.clear();
+    for (int i = 0; i < 200; i++) {
+        CK(cudaMemset(dflush, i & 255, 64<<20));
+        CK(cudaEventRecord(a, 0));
+        tt_attn_combine_only(dacc, dm, dl, dout, H, HD, S32, 0);
+        CK(cudaEventRecord(b, 0)); CK(cudaEventSynchronize(b));
+        float m; CK(cudaEventElapsedTime(&m, a, b)); ms2.push_back(m);
+    }
+    med2 = med_ms(ms2)*1000.0;
+        printf("[combonly] S=%d median=%7.2f us", S32, med2);
+CK(cudaEventDestroy(a)); CK(cudaEventDestroy(b));
 }
 int main() {
     run_shape("qwen3", 16, 8, 128, 525);

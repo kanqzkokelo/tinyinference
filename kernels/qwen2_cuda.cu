@@ -3103,6 +3103,29 @@ extern "C" int tt_flash_gqa_q8_0(const float *q, const void *Kc_q8, const void *
         n_heads, n_kv_heads, head_dim, max_ctx, scale, window);
     return 0;
 }
+extern "C" int tt_attn_q8_split_only(const float *q, const void *Kc_q8, const void *Vc_q8,
+    float *p_acc, float *p_m, float *p_l,
+    const int *d_pos, int n_heads, int n_kv_heads, int head_dim,
+    float scale, int window, int S, cudaStream_t stream) {
+    dim3 grid_split(S, n_kv_heads);
+    int threads_split = (n_heads / n_kv_heads) * 32;
+    int blocks_per_head = head_dim / 32;
+    size_t smem_bytes = 2 * (size_t)BC_SPLIT * blocks_per_head * sizeof(half)
+                      + 2 * (size_t)BC_SPLIT * head_dim * sizeof(int8_t);
+    k_fa2_q8_split<<<grid_split, threads_split, smem_bytes, stream>>>(
+        q, (const BlockQ8_0 *)Kc_q8, (const BlockQ8_0 *)Vc_q8,
+        p_acc, p_m, p_l,
+        d_pos, n_heads, n_kv_heads, head_dim,
+        scale, window, S);
+    return 0;
+}
+extern "C" int tt_attn_combine_only(const float *p_acc, const float *p_m, const float *p_l,
+    float *out, int n_heads, int head_dim, int S, cudaStream_t stream) {
+    k_fa2_combine<<<n_heads, 32, 0, stream>>>(
+        p_acc, p_m, p_l,
+        out, n_heads, head_dim, S);
+    return 0;
+}
 
 extern "C" int tt_flash_gqa_q8_0_splitk(const float *q, const void *Kc_q8, const void *Vc_q8,
                                         float *p_acc, float *p_m, float *p_l, float *out,
