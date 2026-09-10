@@ -563,6 +563,23 @@ Geomean **0.947x** (v4 0.973x). Dropped despite the Qwen3 fix because oracle num
   (2) Q6_K v3 sweep, (3) prefill track (18x behind, token-at-a-time).
 * Red-cell accounting (Llama ctx542, per tok): Q4 stack ~4.1ms + head 1.9ms
   + KV 0.25ms + tiny kernels ~0.7ms ~= 6.9-7.1 vs actual 7.43. Biggest
-  quantified levers left: Q6_K tune (-0.4ms), attention kernel (-0.4ms est),
-  ~1ms unexplained GEMV in-situ deficit. Next: Q6_K v3 micro sweep, then
-  attention t-unroll, both same-process A/B + gate before commit.
+ quantified levers left: Q6_K tune (-0.4ms), attention kernel (-0.4ms est),
+ ~1ms unexplained GEMV in-situ deficit. Next: Q6_K v3 micro sweep, then
+ attention t-unroll, both same-process A/B + gate before commit.
+
+### 2026-09-10 am checkpoint 12: down-occupancy killed, Llama gap re-confirmed on AC (no code change)
+
+* V4-b4 occupancy variant (same k_gemv_q4_0_v4 kernel, 4 warps/block ->
+  128 blocks on down shape) measured NO-GO, reverted clean (tree back to
+  KT2-only dirt): down M=2048 K=8192 V4 68.6us vs V4-b4 68.6us identical
+  @~138 GB/s; gate M=8192 K=2048 V4 68.6us vs V4-b4 69.6us (-1.5pct).
+  Tool: tools/micro_down_occ.cu (untracked). Down-vs-gate anomaly from the
+  throttled battery microbench does NOT reproduce on AC: both shapes hit the
+  same roof at equal bytes (9.44MB). Occupancy is not the down-proj cause.
+* Llama-512 graph probe on AC (commit 6a1d757, FP32-KV default, 3 warmup +
+  5 runs): ours 121.0 vs oracle 169.5 tok/s = 0.714x, matching v5 0.721x and
+  the interleaved 0.735x. Ours variance 0.7pct (tight). Row: /tmp/v6_probe2.*
+  (prompt 520, gen 48). Prefill still 17x behind (386 vs 6747 tok/s) -
+  separate prefill track, out of scope for decode parity.
+* Next: Q6_K head 4-row variant + attention kernel, same-process A/B + gate
+  before commit. Still do NOT touch: Q4-KV, spec-decode, prefill-for-decode.
