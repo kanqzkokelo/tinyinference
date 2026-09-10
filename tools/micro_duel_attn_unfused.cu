@@ -90,6 +90,7 @@ __global__ void k2_pv(const float *__restrict__ scores, const BlockQ8KV *__restr
     int GD2 = G * HD2; // <= 256 for our shapes (max 224)
     __shared__ half sVd[TT2 * 4];
     __shared__ unsigned sVq[TT2 * 32];
+    __shared__ float sP[8 * 256];
     float acc = 0.f;
     int gd = tid; // one (g,d) per thread
     int g = (gd < GD2) ? gd / HD2 : 0;
@@ -108,12 +109,16 @@ __global__ void k2_pv(const float *__restrict__ scores, const BlockQ8KV *__restr
             dst[4]=src[4]; dst[5]=src[5]; dst[6]=src[6]; dst[7]=src[7];
         }
         __syncthreads();
+        for (int i = tid; i < G * tact; i += NT)
+            sP[(long)(i / tact) * TT2 + i % tact] =
+                scores[((long)(kv * G + i / tact)) * n + t0 + i % tact];
+        __syncthreads();
         if (gd < GD2) {
             int w_of_d = (d % 32) / 4, sh = (d % 4) * 8;
             for (int tt = 0; tt < tact; tt++) {
                 float dv = __half2float(sVd[tt * bph + b_of_d]);
                 unsigned u = sVq[((long)tt * bph + b_of_d) * 8 + w_of_d];
-                acc += prow[t0 + tt] * ((float)((signed char)(u >> sh)) * dv);
+                acc += sP[(long)g * TT2 + tt] * ((float)((signed char)(u >> sh)) * dv);
             }
         }
         __syncthreads();
