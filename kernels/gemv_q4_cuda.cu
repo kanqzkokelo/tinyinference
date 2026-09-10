@@ -744,6 +744,116 @@ __global__ void k_gemv_q4_0_v4(const BlockQ4_0 *__restrict__ W,
 
 // R8: 8-rows-per-warp q4_0 layer GEMV for the FFN regime (M>=512).
 // Same uint32-streaming + __byte_perm merge scheme as k_gemv_q4_0_v4,
+//
+// DP4A path (TT_Q4_DP=1): x quantized once per token to Q8_0-style int8
+// (per-32 absmax, ggml-compatible), then each 32-block dot is 8x __dp4a
+// over raw nibbles minus the 8*sum(xq) correction, times w-scale*x-scale.
+// Per 32 MACs: ~28 instructions vs ~128 in the fp32 V4 path (~4x cut).
+// Nibble pairing is GGML q4_0: low nibbles of the 16 qs bytes are quants
+// 0..15, high nibbles are quants 16..31, so v0=(w&0x0F..) dots x[0..15]
+// words and v1=((w>>4)&0x0F..) dots x[16..31] words. Weight streaming
+// reuses the V4 wsc/a0/sh + __byte_perm scheme (same nb-even contract).
+static int8_t *g_q4dp_xq = 0;
+static float *g_q4dp_xs = 0;
+static int *g_q4dp_xsum = 0;
+static int g_q4dp_cap = 0;
+__global__ void k_q4dp_quant_x(const float *__restrict__ x, int8_t *__restrict__ xq,
+                               float *__restrict__ xs, int *__restrict__ xsum, int K) {
+    const int b = blockIdx.x * blockDim.x + threadIdx.x;
+    if (b >= K / 32) return;
+    const float *xb = x + b * 32;
+    float mx = 0.0f;
+#pragma unroll
+    for (int i = 0; i < 32; i++) { float v = xb[i] < 0 ? -xb[i] : xb[i]; if (v > mx) mx = v; }
+    const float s = mx > 0.0f ? mx * 0.0078740157f : 1.0f;
+    xs[b] = s;
+    const float inv = 1.0f / s;
+    int sum = 0;
+#pragma unroll
+    for (int i = 0; i < 32; i++) {
+        int q = (int)rintf(xb[i] * inv);
+        q = q < -127 ? -127 : (q > 127 ? 127 : q);
+        xq[b * 32 + i] = (int8_t)q;
+        sum += q;
+    }
+    xsum[b] = sum;
+}
+__global__ void k_gemv_q4_0_dp(const BlockQ4_0 *__restrict__ W,
+                               const int8_t *__restrict__ xq,
+                               const float *__restrict__ xs,
+                               const int *__restrict__ xsum,
+                               float *__restrict__ y, int M, int K) {
+    const int row0 = (blockIdx.x * blockDim.y + threadIdx.y) * 4;
+    if (row0 >= M) return;
+    const int row1 = row0 + 1;
+    const int row2 = row0 + 2;
+    const int row3 = row0 + 3;
+    const int lane = threadIdx.x;
+    const int nb = K / 32;
+    const uint32_t *rw0 = (const uint32_t *)((const char *)W + (long)row0 * nb * 18);
+    const uint32_t *rw1 = (const uint32_t *)((const char *)W + (long)row1 * nb * 18);
+    const uint32_t *rw2 = (const uint32_t *)((const char *)W + (long)row2 * nb * 18);
+    const uint32_t *rw3 = (const uint32_t *)((const char *)W + (long)row3 * nb * 18);
+    const uint32_t *xq32 = (const uint32_t *)xq;
+    int d0 = 0, d1 = 0, d2 = 0, d3 = 0;
+    float s0 = 0.0f, s1 = 0.0f, s2 = 0.0f, s3 = 0.0f;
+    for (int b = lane; b < nb; b += 32) {
+        const int wsc = (18 * b) >> 2;
+        const unsigned short d16a = (unsigned short)
+            (((18 * b) & 2) ? (rw0[wsc] >> 16) : (rw0[wsc] & 0xFFFFu));
+        const unsigned short d16b = (unsigned short)
+            (((18 * b) & 2) ? (rw1[wsc] >> 16) : (rw1[wsc] & 0xFFFFu));
+        const unsigned short d16c = (unsigned short)
+            (((18 * b) & 2) ? (rw2[wsc] >> 16) : (rw2[wsc] & 0xFFFFu));
+        const unsigned short d16d = (unsigned short)
+            (((18 * b) & 2) ? (rw3[wsc] >> 16) : (rw3[wsc] & 0xFFFFu));
+        const float da = __half2float(__ushort_as_half(d16a));
+        const float db = __half2float(__ushort_as_half(d16b));
+        const float dc = __half2float(__ushort_as_half(d16c));
+        const float dd = __half2float(__ushort_as_half(d16d));
+        const int a0 = (18 * b + 2) >> 2;
+        const int sh  = (18 * b + 2) & 2;
+        const float xsb = xs[b];
+        const int corr = 8 * xsum[b];
+        const uint32_t *xb = xq32 + b * 8;
+#pragma unroll
+        for (int k = 0; k < 4; k++) {
+            const uint32_t la = rw0[a0 + k];
+            const uint32_t lb = rw1[a0 + k];
+            const uint32_t lc = rw2[a0 + k];
+            const uint32_t ld = rw3[a0 + k];
+            const uint32_t wa = sh ? __byte_perm(la, rw0[a0 + k + 1], 0x5432) : la;
+            const uint32_t wb = sh ? __byte_perm(lb, rw1[a0 + k + 1], 0x5432) : lb;
+            const uint32_t wc = sh ? __byte_perm(lc, rw2[a0 + k + 1], 0x5432) : lc;
+            const uint32_t wd = sh ? __byte_perm(ld, rw3[a0 + k + 1], 0x5432) : ld;
+            const uint32_t y0 = xb[k];
+            const uint32_t y1 = xb[k + 4];
+            d0 += __dp4a((int)(wa & 0x0F0F0F0Fu), (int)y0, 0);
+            d0 += __dp4a((int)(((wa >> 4) & 0x0F0F0F0Fu)), (int)y1, 0);
+            d1 += __dp4a((int)(wb & 0x0F0F0F0Fu), (int)y0, 0);
+            d1 += __dp4a((int)(((wb >> 4) & 0x0F0F0F0Fu)), (int)y1, 0);
+            d2 += __dp4a((int)(wc & 0x0F0F0F0Fu), (int)y0, 0);
+            d2 += __dp4a((int)(((wc >> 4) & 0x0F0F0F0Fu)), (int)y1, 0);
+            d3 += __dp4a((int)(wd & 0x0F0F0F0Fu), (int)y0, 0);
+            d3 += __dp4a((int)(((wd >> 4) & 0x0F0F0F0Fu)), (int)y1, 0);
+        }
+        s0 += (float)(d0 - corr) * da * xsb;
+        s1 += (float)(d1 - corr) * db * xsb;
+        s2 += (float)(d2 - corr) * dc * xsb;
+        s3 += (float)(d3 - corr) * dd * xsb;
+        d0 = 0; d1 = 0; d2 = 0; d3 = 0;
+    }
+    s0 = warp_reduce_sum(s0);
+    s1 = warp_reduce_sum(s1);
+    s2 = warp_reduce_sum(s2);
+    s3 = warp_reduce_sum(s3);
+    if (lane == 0) {
+        y[row0] = s0;
+        if (row1 < M) y[row1] = s1;
+        if (row2 < M) y[row2] = s2;
+        if (row3 < M) y[row3] = s3;
+    }
+}
 // extended to 8 rows per warp so each float4 x load amortizes across
 // 8 outputs (vs 4 in V4). Bit-exact vs V4 (same per-element FMA order
 // per row; only the row tiling differs). Requires M%8==0, K%32==0,
@@ -2030,6 +2140,125 @@ int tt_logits_q8_0_v4(const void *dW, const float *dx, float *dlogits,
 /* R8 launcher: 8-rows-per-warp q4_0 layer GEMV. Caller (dispatcher)
  * must have verified (K%32==0), (M%8==0) and nb-even. 4 warps per
  * block -> 32 rows per block, same block-row count as the V4 launcher. */
+/* QKV-fused V4 (M11): one launch for Q,K,V GEMVs sharing the same x.
+ * Warps are partitioned uniformly: first Mq/4 do Q rows, next Mk/4 do K,
+ * next Mv/4 do V (4 rows/warp, exact V4 math, x from global via float4
+ * like V4 -- NOT smem, whose lane-strided layout bank-conflicts).
+ * Bit-exact vs 3x tt_gemv_q4_0_v4 (same per-row accumulation order).
+ * Requires Mq,Mk,Mv %4==0, K%32==0, nb even (V4 byte_perm contract). */
+__global__ void k_gemv_q4_0_qkv(const BlockQ4_0 *__restrict__ Wq,
+                                const BlockQ4_0 *__restrict__ Wk,
+                                const BlockQ4_0 *__restrict__ Wv,
+                                const float *__restrict__ x,
+                                float *__restrict__ yq,
+                                float *__restrict__ yk,
+                                float *__restrict__ yv,
+                                int Mq, int Mk, int Mv, int K) {
+    const int warp = blockIdx.x * blockDim.y + threadIdx.y;
+    const int nq4 = Mq / 4, nk4 = Mk / 4;
+    const BlockQ4_0 *W;
+    float *y;
+    int row0;
+    if (warp < nq4) { W = Wq; y = yq; row0 = warp * 4; }
+    else if (warp < nq4 + nk4) { W = Wk; y = yk; row0 = (warp - nq4) * 4; }
+    else if (warp < nq4 + nk4 + Mv / 4) { W = Wv; y = yv; row0 = (warp - nq4 - nk4) * 4; }
+    else return;
+    const int M = (W == Wq) ? Mq : ((W == Wk) ? Mk : Mv);
+    const int row1 = row0 + 1;
+    const int row2 = row0 + 2;
+    const int row3 = row0 + 3;
+    const int lane = threadIdx.x;
+    const int nb = K / 32;
+    const uint32_t *rw0 = (const uint32_t *)((const char *)W + (long)row0 * nb * 18);
+    const uint32_t *rw1 = (const uint32_t *)((const char *)W + (long)row1 * nb * 18);
+    const uint32_t *rw2 = (const uint32_t *)((const char *)W + (long)row2 * nb * 18);
+    const uint32_t *rw3 = (const uint32_t *)((const char *)W + (long)row3 * nb * 18);
+    float s0 = 0.0f, s1 = 0.0f, s2 = 0.0f, s3 = 0.0f;
+    for (int b = lane; b < nb; b += 32) {
+        const int wsc = (18 * b) >> 2;
+        const unsigned short d16a = (unsigned short)
+            (((18 * b) & 2) ? (rw0[wsc] >> 16) : (rw0[wsc] & 0xFFFFu));
+        const unsigned short d16b = (unsigned short)
+            (((18 * b) & 2) ? (rw1[wsc] >> 16) : (rw1[wsc] & 0xFFFFu));
+        const unsigned short d16c = (unsigned short)
+            (((18 * b) & 2) ? (rw2[wsc] >> 16) : (rw2[wsc] & 0xFFFFu));
+        const unsigned short d16d = (unsigned short)
+            (((18 * b) & 2) ? (rw3[wsc] >> 16) : (rw3[wsc] & 0xFFFFu));
+        const float da = __half2float(__ushort_as_half(d16a));
+        const float db = __half2float(__ushort_as_half(d16b));
+        const float dc = __half2float(__ushort_as_half(d16c));
+        const float dd = __half2float(__ushort_as_half(d16d));
+        const int a0 = (18 * b + 2) >> 2;
+        const int sh  = (18 * b + 2) & 2;
+        const float4 *x4 = (const float4 *)(x + b * 32);
+#pragma unroll
+        for (int k = 0; k < 4; k++) {
+            const uint32_t la = rw0[a0 + k];
+            const uint32_t lb = rw1[a0 + k];
+            const uint32_t lc = rw2[a0 + k];
+            const uint32_t ld = rw3[a0 + k];
+            const uint32_t va = sh ? __byte_perm(la, rw0[a0 + k + 1], 0x5432) : la;
+            const uint32_t vb = sh ? __byte_perm(lb, rw1[a0 + k + 1], 0x5432) : lb;
+            const uint32_t vc = sh ? __byte_perm(lc, rw2[a0 + k + 1], 0x5432) : lc;
+            const uint32_t vd = sh ? __byte_perm(ld, rw3[a0 + k + 1], 0x5432) : ld;
+            const float4 xa = x4[k];
+            const float4 xb = x4[k + 4];
+            s0 += (float)((int)(va         & 0xFu) - 8) * da * xa.x;
+            s0 += (float)((int)((va >>  4) & 0xFu) - 8) * da * xb.x;
+            s0 += (float)((int)((va >>  8) & 0xFu) - 8) * da * xa.y;
+            s0 += (float)((int)((va >> 12) & 0xFu) - 8) * da * xb.y;
+            s0 += (float)((int)((va >> 16) & 0xFu) - 8) * da * xa.z;
+            s0 += (float)((int)((va >> 20) & 0xFu) - 8) * da * xb.z;
+            s0 += (float)((int)((va >> 24) & 0xFu) - 8) * da * xa.w;
+            s0 += (float)((int)(va >> 28) - 8) * da * xb.w;
+            s1 += (float)((int)(vb         & 0xFu) - 8) * db * xa.x;
+            s1 += (float)((int)((vb >>  4) & 0xFu) - 8) * db * xb.x;
+            s1 += (float)((int)((vb >>  8) & 0xFu) - 8) * db * xa.y;
+            s1 += (float)((int)((vb >> 12) & 0xFu) - 8) * db * xb.y;
+            s1 += (float)((int)((vb >> 16) & 0xFu) - 8) * db * xa.z;
+            s1 += (float)((int)((vb >> 20) & 0xFu) - 8) * db * xb.z;
+            s1 += (float)((int)((vb >> 24) & 0xFu) - 8) * db * xa.w;
+            s1 += (float)((int)(vb >> 28) - 8) * db * xb.w;
+            s2 += (float)((int)(vc         & 0xFu) - 8) * dc * xa.x;
+            s2 += (float)((int)((vc >>  4) & 0xFu) - 8) * dc * xb.x;
+            s2 += (float)((int)((vc >>  8) & 0xFu) - 8) * dc * xa.y;
+            s2 += (float)((int)((vc >> 12) & 0xFu) - 8) * dc * xb.y;
+            s2 += (float)((int)((vc >> 16) & 0xFu) - 8) * dc * xa.z;
+            s2 += (float)((int)((vc >> 20) & 0xFu) - 8) * dc * xb.z;
+            s2 += (float)((int)((vc >> 24) & 0xFu) - 8) * dc * xa.w;
+            s2 += (float)((int)(vc >> 28) - 8) * dc * xb.w;
+            s3 += (float)((int)(vd         & 0xFu) - 8) * dd * xa.x;
+            s3 += (float)((int)((vd >>  4) & 0xFu) - 8) * dd * xb.x;
+            s3 += (float)((int)((vd >>  8) & 0xFu) - 8) * dd * xa.y;
+            s3 += (float)((int)((vd >> 12) & 0xFu) - 8) * dd * xb.y;
+            s3 += (float)((int)((vd >> 16) & 0xFu) - 8) * dd * xa.z;
+            s3 += (float)((int)((vd >> 20) & 0xFu) - 8) * dd * xb.z;
+            s3 += (float)((int)((vd >> 24) & 0xFu) - 8) * dd * xa.w;
+            s3 += (float)((int)(vd >> 28) - 8) * dd * xb.w;
+        }
+    }
+    s0 = warp_reduce_sum(s0);
+    s1 = warp_reduce_sum(s1);
+    s2 = warp_reduce_sum(s2);
+    s3 = warp_reduce_sum(s3);
+    if (lane == 0) {
+        y[row0] = s0;
+        if (row1 < M) y[row1] = s1;
+        if (row2 < M) y[row2] = s2;
+        if (row3 < M) y[row3] = s3;
+    }
+}
+int tt_gemv_q4_0_qkv(const void *dWq, const void *dWk, const void *dWv,
+                     const float *dx, float *dyq, float *dyk, float *dyv,
+                     int Mq, int Mk, int Mv, int K, cudaStream_t stream) {
+    dim3 b; b.x = 32; b.y = 8; b.z = 1;
+    const int nwarp = Mq / 4 + Mk / 4 + Mv / 4;
+    dim3 g; g.x = (nwarp + 7) / 8; g.y = 1; g.z = 1;
+    k_gemv_q4_0_qkv<<<g, b, 0, stream>>>((const BlockQ4_0 *)dWq,
+        (const BlockQ4_0 *)dWk, (const BlockQ4_0 *)dWv, dx, dyq, dyk, dyv,
+        Mq, Mk, Mv, K);
+    return (int)cudaGetLastError();
+}
 int tt_gemv_q4_0_r8(const void *dW, const float *dx, float *dy,
                     int M, int K, cudaStream_t stream) {
     dim3 g, b; b.x = 32; b.y = 4; b.z = 1;
@@ -2089,6 +2318,27 @@ int tt_gemv_q4_0_dispatch(const void *dW, const float *dx, float *dy,
                            int M, int K, cudaStream_t stream) {
     const int nb = K / 32;
     if ((K & 31) == 0 && (nb & 1) == 0 && (M & 3) == 0 && M >= 128) {
+        if (getenv("TT_Q4_DP")) {
+            int nbl = K / 32;
+            if (K > g_q4dp_cap) {
+                cudaFree(g_q4dp_xq);
+                cudaFree(g_q4dp_xs);
+                cudaFree(g_q4dp_xsum);
+                g_q4dp_xq = 0;
+                cudaMalloc((void **)&g_q4dp_xq, K);
+                cudaMalloc((void **)&g_q4dp_xs, (K / 32) * 4);
+                cudaMalloc((void **)&g_q4dp_xsum, (K / 32) * 4);
+                g_q4dp_cap = K;
+            }
+            tt_trace_dispatch("q4_gemv", "DP", M, K);
+            k_q4dp_quant_x<<<(nbl + 255) / 256, 256, 0, stream>>>(
+                dx, g_q4dp_xq, g_q4dp_xs, g_q4dp_xsum, K);
+            dim3 g, b; b.x = 32; b.y = 8; b.z = 1;
+            g.x = (M + b.y * 4 - 1) / (b.y * 4); g.y = 1; g.z = 1;
+            k_gemv_q4_0_dp<<<g, b, 0, stream>>>((const BlockQ4_0 *)dW,
+                g_q4dp_xq, g_q4dp_xs, g_q4dp_xsum, dy, M, K);
+            return (int)cudaGetLastError();
+        }
         tt_trace_dispatch("q4_gemv", "V4", M, K);
         int rc = tt_gemv_q4_0_v4(dW, dx, dy, M, K, stream);
         if (rc == 0) return 0;
