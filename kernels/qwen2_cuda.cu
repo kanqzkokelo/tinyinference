@@ -90,6 +90,9 @@ int tt_gemv_q4_1_v4(const void *dW, const float *dx, float *dy,
 int tt_gemv_q4_1_v4_ok(int M, int K);
 int tt_gemv_q4_1_v4_res(const void *dW, const float *dx, const float *res,
                         float *dy, int M, int K, cudaStream_t stream);
+int tt_gemv_q4_0_qkv(const void *dWq, const void *dWk, const void *dWv,
+                     const float *dx, float *dyq, float *dyk, float *dyv,
+                     int Mq, int Mk, int Mv, int K, cudaStream_t stream);
 }
 
 static size_t q4_bytes(long numel) { return (size_t)(numel / Q4_VALS_PER_BLOCK) * Q4_BYTES_PER_BLOCK; }
@@ -4574,6 +4577,19 @@ static int forward_layers(Qwen2Engine *e) {
         if (use_fuse) {
             if (tt_profiling()) tt_prof_begin(TT_P_QKV, e->stream);
             const int npair = (attn_qout >> 1) + (kvdim_l >> 1) * 2;
+            /* M11: QKV-fused V4 (one launch, exact V4 math) beats both the
+             * scalar fused kernel and 3xV4 (-20% at llama shapes, bit-exact).
+             * Needs rmsnorm materialized first; falls back to scalar fused. */
+            const int qkv4_ok = fuse_q4 && !getenv("TT_QKV4_OFF") &&
+                (attn_qout & 3) == 0 && (kvdim_l & 3) == 0 &&
+                (c->dim & 31) == 0 && (((c->dim / 32) & 1) == 0);
+            if (qkv4_ok) {
+                k_rmsnorm<<<1, 256, 256 * sizeof(float), e->stream>>>(
+                    e->d_x, w->attn_norm, e->d_xn, c->dim, c->rms_eps, c->tr.norm_offset);
+                tt_gemv_q4_0_qkv(w->q.ptr, w->k.ptr, w->v.ptr, e->d_xn,
+                    e->d_q, e->d_k_stage, e->d_v_stage,
+                    attn_qout, kvdim_l, kvdim_l, c->dim, e->stream);
+            } else {
             const dim3 fg((npair + 7) / 8, 1, 1), fb(256, 1, 1);
             const size_t fsh = ((size_t)c->dim + 8) * sizeof(float);
             if (fuse_q8) {
@@ -4588,6 +4604,7 @@ static int forward_layers(Qwen2Engine *e) {
                     (const BlockQ4_0 *)w->q.ptr, (const BlockQ4_0 *)w->k.ptr,
                     (const BlockQ4_0 *)w->v.ptr, e->d_q, e->d_k_stage, e->d_v_stage,
                     c->dim, attn_qout, kvdim_l, c->rms_eps, c->tr.norm_offset);
+            }
             }
             CHK_STAGE("2 qkv-gemv");
         } else {
