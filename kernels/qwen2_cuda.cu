@@ -6664,6 +6664,10 @@ static int qwen2_engine_graph_capture(Qwen2Engine *e) {
             const int nu = (c->dim / 256) * 16;
             k_embed_q3_K_dyn<<<(nu + 255) / 256, 256, 0, e->stream>>>(
                 (const uint8_t *)e->d_embd.ptr, e->d_next_tok, e->d_x, c->dim);
+        } else if (edt == GGUF_TYPE_Q8_0) {
+            const int nb = c->dim / 32;
+            k_embed_q8_0_dyn<<<(nb + 255) / 256, 256, 0, e->stream>>>(
+                (const uint8_t *)e->d_embd.ptr, e->d_next_tok, e->d_x, c->dim);
         } else { /* GGUF_TYPE_Q6_K */
             const int nu = (c->dim / 256) * 8;
             k_embed_q6_K_dyn<<<(nu + 255) / 256, 256, 0, e->stream>>>(
