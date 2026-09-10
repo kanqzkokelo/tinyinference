@@ -2410,3 +2410,319 @@ int tt_gemm_wmma_q4_0_prefill(const void *dW, const float *dX_NxK, float *dY_NxM
 }
 
 } /* extern "C" */
+
+// K-tiled batched-4 q4_0 GEMV: same 4-rows/warp x 4-candidate contract as
+// k_gemv_q4_0_batch4, but stages X in 2 K-tiles so shmem is 4*KT*4 (KT=K/2)
+// instead of 4*K*4. Unlocks K=8192 (llama down-projection): 64KB vs 128KB,
+// fits sm_86. Requires K%128==0 (nb2 even preserves the __byte_perm merge
+// contract at tile edges), M%4==0. Per-lane accumulation order matches the
+// untiled kernel (tile0 blocks then tile1 blocks), so output is bit-exact
+// vs k_gemv_q4_0_batch4.
+__global__ void k_gemv_q4_0_batch4_kt2(const BlockQ4_0 *__restrict__ W,
+                                    const float    *__restrict__ X,
+                                    float          *__restrict__ Y,
+                                    int M, int K) {
+    extern __shared__ float sx[];   // [4][KT]
+    const int lane = threadIdx.x;
+    const int warp = threadIdx.y;
+    const int tid = warp * 32 + lane;
+    const int row0 = (blockIdx.x * blockDim.y + warp) * 4;
+    const int row1 = row0 + 1, row2 = row0 + 2, row3 = row0 + 3;
+    const int nb   = K / 32;
+    const int KT = K >> 1;
+    const int nb2 = nb >> 1;
+    const uint32_t *rw0 = (const uint32_t *)((const char *)W + (long)row0 * nb * 18);
+    const uint32_t *rw1 = (const uint32_t *)((const char *)W + (long)row1 * nb * 18);
+    const uint32_t *rw2 = (const uint32_t *)((const char *)W + (long)row2 * nb * 18);
+    const uint32_t *rw3 = (const uint32_t *)((const char *)W + (long)row3 * nb * 18);
+    const float4 *sx4_0 = (const float4 *)(sx + 0 * KT);
+    const float4 *sx4_1 = (const float4 *)(sx + 1 * KT);
+    const float4 *sx4_2 = (const float4 *)(sx + 2 * KT);
+    const float4 *sx4_3 = (const float4 *)(sx + 3 * KT);
+    float s00 = 0.f, s01 = 0.f, s02 = 0.f, s03 = 0.f;
+    float s10 = 0.f, s11 = 0.f, s12 = 0.f, s13 = 0.f;
+    float s20 = 0.f, s21 = 0.f, s22 = 0.f, s23 = 0.f;
+    float s30 = 0.f, s31 = 0.f, s32 = 0.f, s33 = 0.f;
+    for (int t = 0; t < 2; t++) {
+        const int total = 4 * KT;
+        for (int i = tid; i < total; i += 512) {
+            const int c = i / KT;
+            const int kk = i % KT;
+            sx[i] = X[(long)c * K + (long)t * KT + kk];
+        }
+        __syncthreads();
+        if (row0 < M) {
+        for (int b = lane; b < nb2; b += 32) {
+            const int b_g = t * nb2 + b;
+            const int wsc = (18 * b_g) >> 2;
+            const int sh  = (18 * b_g + 2) & 2;
+            const unsigned short d16a = (unsigned short)
+                (((18 * b_g) & 2) ? (rw0[wsc] >> 16) : (rw0[wsc] & 0xFFFFu));
+            const unsigned short d16b = (unsigned short)
+                (((18 * b_g) & 2) ? (rw1[wsc] >> 16) : (rw1[wsc] & 0xFFFFu));
+            const unsigned short d16c = (unsigned short)
+                (((18 * b_g) & 2) ? (rw2[wsc] >> 16) : (rw2[wsc] & 0xFFFFu));
+            const unsigned short d16d = (unsigned short)
+                (((18 * b_g) & 2) ? (rw3[wsc] >> 16) : (rw3[wsc] & 0xFFFFu));
+            const float da = __half2float(__ushort_as_half(d16a));
+            const float db = __half2float(__ushort_as_half(d16b));
+            const float dc = __half2float(__ushort_as_half(d16c));
+            const float dd = __half2float(__ushort_as_half(d16d));
+            const int a0 = (18 * b_g + 2) >> 2;
+            const int x_off = b * 8;
+#pragma unroll
+            for (int k = 0; k < 4; k++) {
+                const uint32_t la0 = __ldg(rw0 + a0 + k);
+                const uint32_t la1 = __ldg(rw1 + a0 + k);
+                const uint32_t la2 = __ldg(rw2 + a0 + k);
+                const uint32_t la3 = __ldg(rw3 + a0 + k);
+                const uint32_t va0 = sh ? __byte_perm(la0, __ldg(rw0 + a0 + k + 1), 0x5432) : la0;
+                const uint32_t va1 = sh ? __byte_perm(la1, __ldg(rw1 + a0 + k + 1), 0x5432) : la1;
+                const uint32_t va2 = sh ? __byte_perm(la2, __ldg(rw2 + a0 + k + 1), 0x5432) : la2;
+                const uint32_t va3 = sh ? __byte_perm(la3, __ldg(rw3 + a0 + k + 1), 0x5432) : la3;
+                const float a0_0 = (float)((int)( va0         & 0xFu) - 8) * da;
+                const float a0_1 = (float)((int)((va0 >>  4)  & 0xFu) - 8) * da;
+                const float a0_2 = (float)((int)((va0 >>  8)  & 0xFu) - 8) * da;
+                const float a0_3 = (float)((int)((va0 >> 12)  & 0xFu) - 8) * da;
+                const float a0_4 = (float)((int)((va0 >> 16)  & 0xFu) - 8) * da;
+                const float a0_5 = (float)((int)((va0 >> 20)  & 0xFu) - 8) * da;
+                const float a0_6 = (float)((int)((va0 >> 24)  & 0xFu) - 8) * da;
+                const float a0_7 = (float)((int)( va0 >> 28)        - 8) * da;
+                const float a1_0 = (float)((int)( va1         & 0xFu) - 8) * db;
+                const float a1_1 = (float)((int)((va1 >>  4)  & 0xFu) - 8) * db;
+                const float a1_2 = (float)((int)((va1 >>  8)  & 0xFu) - 8) * db;
+                const float a1_3 = (float)((int)((va1 >> 12)  & 0xFu) - 8) * db;
+                const float a1_4 = (float)((int)((va1 >> 16)  & 0xFu) - 8) * db;
+                const float a1_5 = (float)((int)((va1 >> 20)  & 0xFu) - 8) * db;
+                const float a1_6 = (float)((int)((va1 >> 24)  & 0xFu) - 8) * db;
+                const float a1_7 = (float)((int)( va1 >> 28)        - 8) * db;
+                const float a2_0 = (float)((int)( va2         & 0xFu) - 8) * dc;
+                const float a2_1 = (float)((int)((va2 >>  4)  & 0xFu) - 8) * dc;
+                const float a2_2 = (float)((int)((va2 >>  8)  & 0xFu) - 8) * dc;
+                const float a2_3 = (float)((int)((va2 >> 12)  & 0xFu) - 8) * dc;
+                const float a2_4 = (float)((int)((va2 >> 16)  & 0xFu) - 8) * dc;
+                const float a2_5 = (float)((int)((va2 >> 20)  & 0xFu) - 8) * dc;
+                const float a2_6 = (float)((int)((va2 >> 24)  & 0xFu) - 8) * dc;
+                const float a2_7 = (float)((int)( va2 >> 28)        - 8) * dc;
+                const float a3_0 = (float)((int)( va3         & 0xFu) - 8) * dd;
+                const float a3_1 = (float)((int)((va3 >>  4)  & 0xFu) - 8) * dd;
+                const float a3_2 = (float)((int)((va3 >>  8)  & 0xFu) - 8) * dd;
+                const float a3_3 = (float)((int)((va3 >> 12)  & 0xFu) - 8) * dd;
+                const float a3_4 = (float)((int)((va3 >> 16)  & 0xFu) - 8) * dd;
+                const float a3_5 = (float)((int)((va3 >> 20)  & 0xFu) - 8) * dd;
+                const float a3_6 = (float)((int)((va3 >> 24)  & 0xFu) - 8) * dd;
+                const float a3_7 = (float)((int)( va3 >> 28)        - 8) * dd;
+                const float4 xa0 = sx4_0[x_off + k],     xb0 = sx4_0[x_off + k + 4];
+                const float4 xa1 = sx4_1[x_off + k],     xb1 = sx4_1[x_off + k + 4];
+                const float4 xa2 = sx4_2[x_off + k],     xb2 = sx4_2[x_off + k + 4];
+                const float4 xa3 = sx4_3[x_off + k],     xb3 = sx4_3[x_off + k + 4];
+                s00 += a0_0 * xa0.x;  s00 += a0_1 * xb0.x;
+                s00 += a0_2 * xa0.y;  s00 += a0_3 * xb0.y;
+                s00 += a0_4 * xa0.z;  s00 += a0_5 * xb0.z;
+                s00 += a0_6 * xa0.w;  s00 += a0_7 * xb0.w;
+                s01 += a0_0 * xa1.x;  s01 += a0_1 * xb1.x;
+                s01 += a0_2 * xa1.y;  s01 += a0_3 * xb1.y;
+                s01 += a0_4 * xa1.z;  s01 += a0_5 * xb1.z;
+                s01 += a0_6 * xa1.w;  s01 += a0_7 * xb1.w;
+                s02 += a0_0 * xa2.x;  s02 += a0_1 * xb2.x;
+                s02 += a0_2 * xa2.y;  s02 += a0_3 * xb2.y;
+                s02 += a0_4 * xa2.z;  s02 += a0_5 * xb2.z;
+                s02 += a0_6 * xa2.w;  s02 += a0_7 * xb2.w;
+                s03 += a0_0 * xa3.x;  s03 += a0_1 * xb3.x;
+                s03 += a0_2 * xa3.y;  s03 += a0_3 * xb3.y;
+                s03 += a0_4 * xa3.z;  s03 += a0_5 * xb3.z;
+                s03 += a0_6 * xa3.w;  s03 += a0_7 * xb3.w;
+                s10 += a1_0 * xa0.x;  s10 += a1_1 * xb0.x;
+                s10 += a1_2 * xa0.y;  s10 += a1_3 * xb0.y;
+                s10 += a1_4 * xa0.z;  s10 += a1_5 * xb0.z;
+                s10 += a1_6 * xa0.w;  s10 += a1_7 * xb0.w;
+                s11 += a1_0 * xa1.x;  s11 += a1_1 * xb1.x;
+                s11 += a1_2 * xa1.y;  s11 += a1_3 * xb1.y;
+                s11 += a1_4 * xa1.z;  s11 += a1_5 * xb1.z;
+                s11 += a1_6 * xa1.w;  s11 += a1_7 * xb1.w;
+                s12 += a1_0 * xa2.x;  s12 += a1_1 * xb2.x;
+                s12 += a1_2 * xa2.y;  s12 += a1_3 * xb2.y;
+                s12 += a1_4 * xa2.z;  s12 += a1_5 * xb2.z;
+                s12 += a1_6 * xa2.w;  s12 += a1_7 * xb2.w;
+                s13 += a1_0 * xa3.x;  s13 += a1_1 * xb3.x;
+                s13 += a1_2 * xa3.y;  s13 += a1_3 * xb3.y;
+                s13 += a1_4 * xa3.z;  s13 += a1_5 * xb3.z;
+                s13 += a1_6 * xa3.w;  s13 += a1_7 * xb3.w;
+                s20 += a2_0 * xa0.x;  s20 += a2_1 * xb0.x;
+                s20 += a2_2 * xa0.y;  s20 += a2_3 * xb0.y;
+                s20 += a2_4 * xa0.z;  s20 += a2_5 * xb0.z;
+                s20 += a2_6 * xa0.w;  s20 += a2_7 * xb0.w;
+                s21 += a2_0 * xa1.x;  s21 += a2_1 * xb1.x;
+                s21 += a2_2 * xa1.y;  s21 += a2_3 * xb1.y;
+                s21 += a2_4 * xa1.z;  s21 += a2_5 * xb1.z;
+                s21 += a2_6 * xa1.w;  s21 += a2_7 * xb1.w;
+                s22 += a2_0 * xa2.x;  s22 += a2_1 * xb2.x;
+                s22 += a2_2 * xa2.y;  s22 += a2_3 * xb2.y;
+                s22 += a2_4 * xa2.z;  s22 += a2_5 * xb2.z;
+                s22 += a2_6 * xa2.w;  s22 += a2_7 * xb2.w;
+                s23 += a2_0 * xa3.x;  s23 += a2_1 * xb3.x;
+                s23 += a2_2 * xa3.y;  s23 += a2_3 * xb3.y;
+                s23 += a2_4 * xa3.z;  s23 += a2_5 * xb3.z;
+                s23 += a2_6 * xa3.w;  s23 += a2_7 * xb3.w;
+                s30 += a3_0 * xa0.x;  s30 += a3_1 * xb0.x;
+                s30 += a3_2 * xa0.y;  s30 += a3_3 * xb0.y;
+                s30 += a3_4 * xa0.z;  s30 += a3_5 * xb0.z;
+                s30 += a3_6 * xa0.w;  s30 += a3_7 * xb0.w;
+                s31 += a3_0 * xa1.x;  s31 += a3_1 * xb1.x;
+                s31 += a3_2 * xa1.y;  s31 += a3_3 * xb1.y;
+                s31 += a3_4 * xa1.z;  s31 += a3_5 * xb1.z;
+                s31 += a3_6 * xa1.w;  s31 += a3_7 * xb1.w;
+                s32 += a3_0 * xa2.x;  s32 += a3_1 * xb2.x;
+                s32 += a3_2 * xa2.y;  s32 += a3_3 * xb2.y;
+                s32 += a3_4 * xa2.z;  s32 += a3_5 * xb2.z;
+                s32 += a3_6 * xa2.w;  s32 += a3_7 * xb2.w;
+                s33 += a3_0 * xa3.x;  s33 += a3_1 * xb3.x;
+                s33 += a3_2 * xa3.y;  s33 += a3_3 * xb3.y;
+                s33 += a3_4 * xa3.z;  s33 += a3_5 * xb3.z;
+                s33 += a3_6 * xa3.w;  s33 += a3_7 * xb3.w;
+            }
+        }
+        } __syncthreads();
+    }
+    s00 = warp_reduce_sum(s00); s01 = warp_reduce_sum(s01); s02 = warp_reduce_sum(s02); s03 = warp_reduce_sum(s03);
+    s10 = warp_reduce_sum(s10); s11 = warp_reduce_sum(s11); s12 = warp_reduce_sum(s12); s13 = warp_reduce_sum(s13);
+    s20 = warp_reduce_sum(s20); s21 = warp_reduce_sum(s21); s22 = warp_reduce_sum(s22); s23 = warp_reduce_sum(s23);
+    s30 = warp_reduce_sum(s30); s31 = warp_reduce_sum(s31); s32 = warp_reduce_sum(s32); s33 = warp_reduce_sum(s33);
+    if (lane == 0) {
+        Y[0 * M + row0] = s00;  Y[1 * M + row0] = s01;  Y[2 * M + row0] = s02;  Y[3 * M + row0] = s03;
+        if (row1 < M) { Y[0 * M + row1] = s10;  Y[1 * M + row1] = s11;  Y[2 * M + row1] = s12;  Y[3 * M + row1] = s13; }
+        if (row2 < M) { Y[0 * M + row2] = s20;  Y[1 * M + row2] = s21;  Y[2 * M + row2] = s22;  Y[3 * M + row2] = s23; }
+        if (row3 < M) { Y[0 * M + row3] = s30;  Y[1 * M + row3] = s31;  Y[2 * M + row3] = s32;  Y[3 * M + row3] = s33; }
+    }
+}
+
+extern "C" {
+int tt_gemv_q4_0_batch4_kt2(const void *dW, const float *dX_4xK, float *dY_4xM,
+                            int M, int K, cudaStream_t stream) {
+    if (!dW || !dX_4xK || !dY_4xM) return -1;
+    if (M <= 0 || (M & 3) != 0 || (K & 127) != 0) return -1;
+    dim3 g, b; b.x = 32; b.y = 16; b.z = 1;
+    g.x = (M + b.y * 4 - 1) / (b.y * 4); g.y = 1; g.z = 1;
+    int shmem = 4 * (K >> 1) * 4;
+    if (shmem > 48 * 1024) {
+        cudaFuncSetAttribute(k_gemv_q4_0_batch4_kt2,
+            cudaFuncAttributeMaxDynamicSharedMemorySize, shmem);
+    }
+    k_gemv_q4_0_batch4_kt2<<<g, b, shmem, stream>>>(
+        (const BlockQ4_0 *)dW, dX_4xK, dY_4xM, M, K);
+    return (int)cudaGetLastError();
+}
+} /* extern "C" kt2 */
+
+extern "C" {
+// Q4_1 V4: 4-rows-per-warp GEMV for GGML Q4_1 (20B blocks).
+__global__ void k_gemv_q4_1_v4(const uint8_t *W,
+                               const float *x,
+                               float *y,
+                               const float *res,
+                               int M, int K) {
+    const int row0 = (blockIdx.x * blockDim.y + threadIdx.y) * 4;
+    if (row0 >= M) return;
+    const int row1 = row0 + 1;
+    const int row2 = row0 + 2;
+    const int row3 = row0 + 3;
+    const int lane = threadIdx.x;
+    const int nb = K / 32;
+    const uint32_t *rw0 = (const uint32_t *)((const char *)W + (long)row0 * nb * 20);
+    const uint32_t *rw1 = (const uint32_t *)((const char *)W + (long)row1 * nb * 20);
+    const uint32_t *rw2 = (const uint32_t *)((const char *)W + (long)row2 * nb * 20);
+    const uint32_t *rw3 = (const uint32_t *)((const char *)W + (long)row3 * nb * 20);
+    float s0 = 0.0f, s1 = 0.0f, s2 = 0.0f, s3 = 0.0f;
+    for (int b = lane; b < nb; b += 32) {
+        const uint32_t sc0 = rw0[5 * b], sc1 = rw1[5 * b];
+        const uint32_t sc2 = rw2[5 * b], sc3 = rw3[5 * b];
+        const float d0 = __half2float(__ushort_as_half((unsigned short)(sc0 & 0xFFFFu)));
+        const float m0 = __half2float(__ushort_as_half((unsigned short)(sc0 >> 16)));
+        const float d1 = __half2float(__ushort_as_half((unsigned short)(sc1 & 0xFFFFu)));
+        const float m1 = __half2float(__ushort_as_half((unsigned short)(sc1 >> 16)));
+        const float d2 = __half2float(__ushort_as_half((unsigned short)(sc2 & 0xFFFFu)));
+        const float m2 = __half2float(__ushort_as_half((unsigned short)(sc2 >> 16)));
+        const float d3 = __half2float(__ushort_as_half((unsigned short)(sc3 & 0xFFFFu)));
+        const float m3 = __half2float(__ushort_as_half((unsigned short)(sc3 >> 16)));
+        const int a0 = 5 * b + 1;
+       const float4 *x4 = (const float4 *)(x + b * 32);
+        for (int k = 0; k < 4; k++) {
+            const uint32_t va = rw0[a0 + k];
+            const uint32_t vb = rw1[a0 + k];
+            const uint32_t vc = rw2[a0 + k];
+            const uint32_t vd = rw3[a0 + k];
+            const float4 xa = x4[k];
+            const float4 xb = x4[k + 4];
+            s0 += ((float)( va         & 0xFu) * d0 + m0) * xa.x;
+            s0 += ((float)((va >>  4)  & 0xFu) * d0 + m0) * xb.x;
+            s0 += ((float)((va >>  8)  & 0xFu) * d0 + m0) * xa.y;
+            s0 += ((float)((va >> 12)  & 0xFu) * d0 + m0) * xb.y;
+            s0 += ((float)((va >> 16)  & 0xFu) * d0 + m0) * xa.z;
+            s0 += ((float)((va >> 20)  & 0xFu) * d0 + m0) * xb.z;
+            s0 += ((float)((va >> 24)  & 0xFu) * d0 + m0) * xa.w;
+            s0 += ((float)( va >> 28)          * d0 + m0) * xb.w;
+            s1 += ((float)( vb         & 0xFu) * d1 + m1) * xa.x;
+            s1 += ((float)((vb >>  4)  & 0xFu) * d1 + m1) * xb.x;
+            s1 += ((float)((vb >>  8)  & 0xFu) * d1 + m1) * xa.y;
+            s1 += ((float)((vb >> 12)  & 0xFu) * d1 + m1) * xb.y;
+            s1 += ((float)((vb >> 16)  & 0xFu) * d1 + m1) * xa.z;
+            s1 += ((float)((vb >> 20)  & 0xFu) * d1 + m1) * xb.z;
+            s1 += ((float)((vb >> 24)  & 0xFu) * d1 + m1) * xa.w;
+           s1 += ((float)( vb >> 28)          * d1 + m1) * xb.w;
+            s2 += ((float)( vc         & 0xFu) * d2 + m2) * xa.x;
+            s2 += ((float)((vc >>  4)  & 0xFu) * d2 + m2) * xb.x;
+            s2 += ((float)((vc >>  8)  & 0xFu) * d2 + m2) * xa.y;
+            s2 += ((float)((vc >> 12)  & 0xFu) * d2 + m2) * xb.y;
+            s2 += ((float)((vc >> 16)  & 0xFu) * d2 + m2) * xa.z;
+            s2 += ((float)((vc >> 20)  & 0xFu) * d2 + m2) * xb.z;
+            s2 += ((float)((vc >> 24)  & 0xFu) * d2 + m2) * xa.w;
+            s2 += ((float)( vc >> 28)          * d2 + m2) * xb.w;
+            s3 += ((float)( vd         & 0xFu) * d3 + m3) * xa.x;
+            s3 += ((float)((vd >>  4)  & 0xFu) * d3 + m3) * xb.x;
+            s3 += ((float)((vd >>  8)  & 0xFu) * d3 + m3) * xa.y;
+            s3 += ((float)((vd >> 12)  & 0xFu) * d3 + m3) * xb.y;
+            s3 += ((float)((vd >> 16)  & 0xFu) * d3 + m3) * xa.z;
+            s3 += ((float)((vd >> 20)  & 0xFu) * d3 + m3) * xb.z;
+            s3 += ((float)((vd >> 24)  & 0xFu) * d3 + m3) * xa.w;
+            s3 += ((float)( vd >> 28)          * d3 + m3) * xb.w;
+        }
+    }
+    s0 = warp_reduce_sum(s0);
+    s1 = warp_reduce_sum(s1);
+    s2 = warp_reduce_sum(s2);
+    s3 = warp_reduce_sum(s3);
+    if (lane == 0) {
+        if (res) {
+            y[row0] = s0 + res[row0];
+            if (row1 < M) y[row1] = s1 + res[row1];
+            if (row2 < M) y[row2] = s2 + res[row2];
+            if (row3 < M) y[row3] = s3 + res[row3];
+        } else {
+            y[row0] = s0;
+            if (row1 < M) y[row1] = s1;
+            if (row2 < M) y[row2] = s2;
+            if (row3 < M) y[row3] = s3;
+        }
+    }
+}
+int tt_gemv_q4_1_v4_ok(int M, int K) {
+    if ((K & 31) != 0) return 0;
+    if ((M & 3) != 0) return 0;
+    if (M < 128) return 0;
+    return 1;
+}
+int tt_gemv_q4_1_v4(const void *dW, const float *dx, float *dy,
+                    int M, int K, cudaStream_t stream) {
+    dim3 g, b; b.x = 32; b.y = 8; b.z = 1;
+    g.x = (M + b.y * 4 - 1) / (b.y * 4); g.y = 1; g.z = 1;
+    k_gemv_q4_1_v4<<<g, b, 0, stream>>>((const uint8_t *)dW, dx, dy, NULL, M, K);
+    return (int)cudaGetLastError();
+}
+int tt_gemv_q4_1_v4_res(const void *dW, const float *dx, const float *res,
+                        float *dy, int M, int K, cudaStream_t stream) {
+    dim3 g, b; b.x = 32; b.y = 8; b.z = 1;
+    g.x = (M + b.y * 4 - 1) / (b.y * 4); g.y = 1; g.z = 1;
+    k_gemv_q4_1_v4<<<g, b, 0, stream>>>((const uint8_t *)dW, dx, dy, res, M, K);
+    return (int)cudaGetLastError();
+}
+} /* extern C q4_1_v4 */
