@@ -83,6 +83,13 @@ int tt_gemv_q4_0_dispatch(const void *dW, const float *dx, float *dy,
 int tt_gemv_q4_0_v4_ok(int M, int K);
 int tt_gemv_q4_0_v4_res(const void *dW, const float *dx, const float *res,
                         float *dy, int M, int K, cudaStream_t stream);
+int tt_gemv_q4_0_v4(const void *dW, const float *dx, float *dy,
+                    int M, int K, cudaStream_t stream);
+int tt_gemv_q4_1_v4(const void *dW, const float *dx, float *dy,
+                    int M, int K, cudaStream_t stream);
+int tt_gemv_q4_1_v4_ok(int M, int K);
+int tt_gemv_q4_1_v4_res(const void *dW, const float *dx, const float *res,
+                        float *dy, int M, int K, cudaStream_t stream);
 }
 
 static size_t q4_bytes(long numel) { return (size_t)(numel / Q4_VALS_PER_BLOCK) * Q4_BYTES_PER_BLOCK; }
@@ -98,6 +105,8 @@ static inline int tt_gemv_layer_dispatch(void *w_ptr, int w_dtype,
                                           int M, int K, cudaStream_t s) {
     if (w_dtype == 2 /* GGUF_TYPE_Q4_0 */)
         return tt_gemv_q4_0_dispatch(w_ptr, dx, dy, M, K, s);
+    if (w_dtype == 3 /* GGUF_TYPE_Q4_1 */ && tt_gemv_q4_1_v4_ok(M, K))
+        return tt_gemv_q4_1_v4(w_ptr, dx, dy, M, K, s);
     return tt_gemv_typed(w_ptr, w_dtype, dx, dy, M, K, s);
 }
 
@@ -852,14 +861,26 @@ static inline int tt_gemv_res_try(void *w_ptr, int w_dtype,
                                   cudaStream_t s) {
     static int no_resadd = -2;
     if (no_resadd == -2) no_resadd = getenv("TT_NO_RESADD") ? 1 : 0;
-    if (no_resadd || w_dtype != 2 || !tt_gemv_q4_0_v4_ok(M, K)) return 0;
-    if (getenv("TT_DISPATCH")) {
-        static unsigned res_trace_n = 0;
-        if (res_trace_n++ < 64)
-            fprintf(stderr, "[dispatch] op=q4_gemv path=V4-res M=%d K=%d\n", M, K);
+    if (no_resadd) return 0;
+    if (w_dtype == 2 && tt_gemv_q4_0_v4_ok(M, K)) {
+        if (getenv("TT_DISPATCH")) {
+            static unsigned res_trace_n = 0;
+            if (res_trace_n++ < 64)
+                fprintf(stderr, "[dispatch] op=q4_gemv path=V4-res M=%d K=%d\n", M, K);
+        }
+        int rc = tt_gemv_q4_0_v4_res(w_ptr, dx, res, dy, M, K, s);
+        return (rc == 0);
     }
-    int rc = tt_gemv_q4_0_v4_res(w_ptr, dx, res, dy, M, K, s);
-    return (rc == 0);
+    if (w_dtype == 3 && tt_gemv_q4_1_v4_ok(M, K)) {
+        if (getenv("TT_DISPATCH")) {
+            static unsigned res_trace_n = 0;
+            if (res_trace_n++ < 64)
+                fprintf(stderr, "[dispatch] op=q4_1_gemv path=V4-res M=%d K=%d\n", M, K);
+        }
+        int rc = tt_gemv_q4_1_v4_res(w_ptr, dx, res, dy, M, K, s);
+        return (rc == 0);
+    }
+    return 0;
 }
 
 /* GQA flash-attention decode: one warp per query head.
