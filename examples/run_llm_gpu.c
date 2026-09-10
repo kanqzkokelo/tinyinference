@@ -214,6 +214,7 @@ int main(int argc, char **argv) {
         fprintf(stderr, "prefill failed\n"); return 1;
     }
     if (getenv("TT_PROFILE")) qwen2_debug_profile_report(1);
+    if (getenv("TT_PROFILE")) qwen2_debug_profile_reset();
     clock_gettime(CLOCK_MONOTONIC, &t0);   /* decode-only window starts here */
 
     int history[MAX_CTX];
