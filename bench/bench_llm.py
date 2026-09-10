@@ -145,8 +145,25 @@ def get_power_info() -> Dict[str, Any]:
     info: Dict[str, Any] = {
         "power_limit_w": None,
         "power_draw_w": None,
+        "clocks_gr_mhz": None,
+        "clocks_sm_mhz": None,
+        "clocks_mem_mhz": None,
         "ac_online": None,
     }
+    try:
+        r = subprocess.run(
+            ["nvidia-smi", "--query-gpu=clocks.gr,clocks.sm,clocks.mem",
+             "--format=csv,noheader,nounits"],
+            capture_output=True, text=True, timeout=10,
+        )
+        if r.returncode == 0 and r.stdout.strip():
+            parts = [x.strip() for x in r.stdout.strip().splitlines()[0].split(",")]
+            vals = [float(x) if x not in ("-", "N/A", "") else None for x in parts]
+            while len(vals) < 3:
+                vals.append(None)
+            info["clocks_gr_mhz"], info["clocks_sm_mhz"], info["clocks_mem_mhz"] = vals[:3]
+    except Exception:
+        pass
     try:
         r = subprocess.run(
             ["nvidia-smi", "-q", "-d", "POWER"],
