@@ -1412,6 +1412,133 @@ __global__ void k_flash_gqa_q8_0(
 
 #define BC_SPLIT 64 // tried 32 and 128 at N>32768: 64 best (2.18ms vs 2.20/2.19 at 131k paged), kept 64
 
+/* Slice-2 unfused Q8 decode attn (ported from tools/micro_duel_attn_unfused.cu):
+ * QK-gemv + row-softmax + PV-gemv, pure streaming, no warp-sync chain.
+ * KV-major cache: K[((kv*cap)+t)*bph+b], cap=c->max_ctx, n=ctx_l+1.
+ * Gate at dispatch: swa==0 && G<=8 && HD<=128 && G*HD<=512
+ * (sq smem 8*128, sP smem 8*256, pv 256 threads cover GD2=G*HD/2).
+ * Bit-exact vs k_fa2_q8_split. Duel: 1.36-1.58x hot, 1.57-2.04x cold. */
+#define UNF_TT 256
+__global__ void k_unf_qk(const float *__restrict__ q, const BlockQ8KV *__restrict__ Kn,
+                      float *__restrict__ scores, const int *__restrict__ d_pos, int cap, int G, int HD, float scale,
+                      int PART) {
+    const int n = *d_pos + 1;
+    int kv = blockIdx.x / PART;
+    int pp = blockIdx.x % PART;
+    int tid = threadIdx.x, NT = blockDim.x;
+    int bph = HD / 32;
+    int chunk = (n + PART - 1) / PART;
+    int r0 = min(n, pp * chunk), r1 = min(n, r0 + chunk);
+    __shared__ float sq[8 * 128];
+    for (int i = tid; i < G * HD; i += NT)
+        sq[i] = q[(long)(kv * G + i / HD) * HD + i % HD];
+    __shared__ half sKd[UNF_TT * 4];
+    __shared__ unsigned sKq[UNF_TT * 32];
+    for (int t0 = r0; t0 < r1; t0 += UNF_TT) {
+        int tact = min(UNF_TT, r1 - t0);
+        for (int i = tid; i < tact * bph; i += NT) {
+            int tt = i / bph, b = i % bph;
+            long gi = ((long)kv * cap + t0 + tt) * bph + b;
+            sKd[tt * bph + b] = Kn[gi].d;
+            const unsigned *src = (const unsigned *)&Kn[gi].qs[0];
+            unsigned *dst = sKq + ((long)tt * bph + b) * 8;
+            dst[0]=src[0]; dst[1]=src[1]; dst[2]=src[2]; dst[3]=src[3];
+            dst[4]=src[4]; dst[5]=src[5]; dst[6]=src[6]; dst[7]=src[7];
+        }
+        __syncthreads();
+        for (int gt = tid; gt < G * tact; gt += NT) {
+            int g = gt / tact, tt = gt % tact;
+            const float *qq = sq + (long)g * HD;
+            float dot = 0.f;
+            for (int b = 0; b < bph; b++) {
+                float dk = __half2float(sKd[tt * bph + b]);
+                const unsigned *kw = sKq + ((long)tt * bph + b) * 8;
+                const float *qb = qq + b * 32;
+                for (int w = 0; w < 8; w++) {
+                    unsigned u = kw[w];
+                    const float *q4 = qb + w * 4;
+                    dot += q4[0] * ((float)((signed char)(u      )) * dk)
+                         + q4[1] * ((float)((signed char)(u >>  8)) * dk)
+                         + q4[2] * ((float)((signed char)(u >> 16)) * dk)
+                         + q4[3] * ((float)((signed char)(u >> 24)) * dk);
+                }
+            }
+            scores[((long)(kv * G + g)) * n + t0 + tt] = dot * scale;
+        }
+        __syncthreads();
+    }
+}
+
+__global__ void k_unf_softmax(float *__restrict__ scores, const int *__restrict__ d_pos, int H) {
+    const int n = *d_pos + 1;
+    int h = blockIdx.x;
+    int tid = threadIdx.x, NT = blockDim.x;
+    float *row = scores + (long)h * n;
+    __shared__ float sb[256];
+    float m = -1e30f;
+    for (int t = tid; t < n; t += NT) m = fmaxf(m, row[t]);
+    sb[tid] = m; __syncthreads();
+    for (int s = NT >> 1; s > 0; s >>= 1) {
+        if (tid < s) sb[tid] = fmaxf(sb[tid], sb[tid + s]);
+        __syncthreads();
+    }
+    m = sb[0]; __syncthreads();
+    float l = 0.f;
+    for (int t = tid; t < n; t += NT) { float e = expf(row[t] - m); row[t] = e; l += e; }
+    sb[tid] = l; __syncthreads();
+    for (int s = NT >> 1; s > 0; s >>= 1) {
+        if (tid < s) sb[tid] += sb[tid + s];
+        __syncthreads();
+    }
+    l = sb[0];
+    for (int t = tid; t < n; t += NT) row[t] /= l;
+}
+
+__global__ void k_unf_pv(const float *__restrict__ scores, const BlockQ8KV *__restrict__ Vn,
+                      float *__restrict__ out, const int *__restrict__ d_pos, int cap, int G, int HD) {
+    const int n = *d_pos + 1;
+    int kv = blockIdx.x / 2, cc = blockIdx.x % 2;
+    int tid = threadIdx.x, NT = blockDim.x;
+    int bph = HD / 32;
+    int HD2 = HD / 2, d0 = cc * HD2;
+    int GD2 = G * HD2;
+    __shared__ half sVd[UNF_TT * 4];
+    __shared__ unsigned sVq[UNF_TT * 32];
+    __shared__ float sP[8 * 256];
+    float acc = 0.f;
+    int gd = tid;
+    int g = (gd < GD2) ? gd / HD2 : 0;
+    int d = (gd < GD2) ? d0 + gd % HD2 : 0;
+    int b_of_d = d / 32;
+    for (int t0 = 0; t0 < n; t0 += UNF_TT) {
+        int tact = min(UNF_TT, n - t0);
+        for (int i = tid; i < tact * bph; i += NT) {
+            int tt = i / bph, b = i % bph;
+            long gi = ((long)kv * cap + t0 + tt) * bph + b;
+            sVd[tt * bph + b] = Vn[gi].d;
+            const unsigned *src = (const unsigned *)&Vn[gi].qs[0];
+            unsigned *dst = sVq + ((long)tt * bph + b) * 8;
+            dst[0]=src[0]; dst[1]=src[1]; dst[2]=src[2]; dst[3]=src[3];
+            dst[4]=src[4]; dst[5]=src[5]; dst[6]=src[6]; dst[7]=src[7];
+        }
+        __syncthreads();
+        for (int i = tid; i < G * tact; i += NT)
+            sP[(long)(i / tact) * UNF_TT + i % tact] =
+                scores[((long)(kv * G + i / tact)) * n + t0 + i % tact];
+        __syncthreads();
+        if (gd < GD2) {
+            int w_of_d = (d % 32) / 4, sh = (d % 4) * 8;
+            for (int tt = 0; tt < tact; tt++) {
+                float dv = __half2float(sVd[tt * bph + b_of_d]);
+                unsigned u = sVq[((long)tt * bph + b_of_d) * 8 + w_of_d];
+                acc += sP[(long)g * UNF_TT + tt] * ((float)((signed char)(u >> sh)) * dv);
+            }
+        }
+        __syncthreads();
+    }
+    if (gd < GD2) out[((long)(kv * G + g)) * HD + d] = acc;
+}
+
 __global__ void k_fa2_q8_split(
     const float     *__restrict__ q,
     const BlockQ8KV *__restrict__ Kc_q8,
@@ -3523,6 +3650,7 @@ struct Qwen2Engine {
     float *d_split_pm;            /* [S_MAX * max_heads] */
     float *d_split_pl;            /* [S_MAX * max_heads] */
     int    d_split_S_max;         /* S at workspace alloc time (capacity) */
+    float *d_unf_scores;          /* [max_heads * max_ctx] unfused-attn scores */
     /* TT_SPEC_BATCH: persistent device buffers for the post-final-layer
      * activations of N verify candidates (layout [N, dim]). Lazy-alloc
      * on first verify call that uses TT_SPEC_BATCH>=2. */
@@ -4040,6 +4168,7 @@ Qwen2Engine *qwen2_engine_create(const TTConfig *cfg, GGUFModel *m) {
         cudaMalloc(&e->d_split_pm,   (size_t)S_MAX * per_ml  * sizeof(float));
         cudaMalloc(&e->d_split_pl,   (size_t)S_MAX * per_ml  * sizeof(float));
         e->d_split_S_max = S_MAX;
+        cudaMalloc(&e->d_unf_scores, (size_t)max_heads * cfg->max_ctx * sizeof(float));
     }
     /* per-layer max kv width: gemma4 full layers carry 2x the kv heads */
     /* Hybrid KV dispatch (Fix1): always allocate FP32 KV. Quantized caches
@@ -4237,6 +4366,7 @@ void qwen2_engine_free(Qwen2Engine *e) {
     if (e->d_split_pacc) cudaFree(e->d_split_pacc);
     if (e->d_split_pm)   cudaFree(e->d_split_pm);
     if (e->d_split_pl)   cudaFree(e->d_split_pl);
+    if (e->d_unf_scores) cudaFree(e->d_unf_scores);
     if (e->d_x_batch) cudaFree(e->d_x_batch);
     if (e->d_xn_batch) cudaFree(e->d_xn_batch);
     if (e->d_logits_batch) cudaFree(e->d_logits_batch);
@@ -4836,22 +4966,38 @@ static int forward_layers(Qwen2Engine *e) {
                     e->d_split_pacc, e->d_split_pm, e->d_split_pl,
                     e->d_att, H_l, HDl, S);
             } else if (kv_use_q8_eff(e)) {
-                /* capture bakes eager S at capture ctx (see split_S_q) */
-                int S = split_S_q(ctx_l, e->d_split_S_max);
-                dim3 grid_split(S, KV_l);
-                int threads_split = (H_l / KV_l) * 32;
-                int blocks_per_head = HDl / 32;
-                size_t smem_bytes = 2 * (size_t)BC_SPLIT * blocks_per_head * sizeof(half)
-                                  + 2 * (size_t)BC_SPLIT * HDl * sizeof(int8_t);
-                k_fa2_q8_split<<<grid_split, threads_split, smem_bytes, e->stream>>>(
-                    e->d_q, Kl_q8, Vl_q8,
-                    e->d_split_pacc, e->d_split_pm, e->d_split_pl,
-                    e->d_pos,
-                    H_l, KV_l, HDl,
-                    scale_l, swa_l, S, c->max_ctx);
-                k_fa2_combine<<<H_l, 32, 0, e->stream>>>(
-                    e->d_split_pacc, e->d_split_pm, e->d_split_pl,
-                    e->d_att, H_l, HDl, S);
+                const int G_l = H_l / KV_l;
+                if (swa_l == 0 && G_l <= 8 && HDl <= 128 && G_l * HDl <= 512 &&
+                    !getenv("TT_NO_UNFUSED")) {
+                    /* slice-2 unfused: bit-exact vs split, 1.4-2.0x in duel */
+                    /* n comes from d_pos device-side: launch args are baked
+                     * at graph capture, so a host n would go stale on replay */
+                    k_unf_qk<<<KV_l * 2, 256, 0, e->stream>>>(
+                        e->d_q, Kl_q8, e->d_unf_scores, e->d_pos, c->max_ctx,
+                        G_l, HDl, scale_l, 2);
+                    k_unf_softmax<<<H_l, 256, 0, e->stream>>>(
+                        e->d_unf_scores, e->d_pos, H_l);
+                    k_unf_pv<<<KV_l * 2, 256, 0, e->stream>>>(
+                        e->d_unf_scores, Vl_q8, e->d_att, e->d_pos, c->max_ctx,
+                        G_l, HDl);
+                } else {
+                    /* capture bakes eager S at capture ctx (see split_S_q) */
+                    int S = split_S_q(ctx_l, e->d_split_S_max);
+                    dim3 grid_split(S, KV_l);
+                    int threads_split = (H_l / KV_l) * 32;
+                    int blocks_per_head = HDl / 32;
+                    size_t smem_bytes = 2 * (size_t)BC_SPLIT * blocks_per_head * sizeof(half)
+                                      + 2 * (size_t)BC_SPLIT * HDl * sizeof(int8_t);
+                    k_fa2_q8_split<<<grid_split, threads_split, smem_bytes, e->stream>>>(
+                        e->d_q, Kl_q8, Vl_q8,
+                        e->d_split_pacc, e->d_split_pm, e->d_split_pl,
+                        e->d_pos,
+                        H_l, KV_l, HDl,
+                        scale_l, swa_l, S, c->max_ctx);
+                    k_fa2_combine<<<H_l, 32, 0, e->stream>>>(
+                        e->d_split_pacc, e->d_split_pm, e->d_split_pl,
+                        e->d_att, H_l, HDl, S);
+                }
             } else {
                 // FP32 FA2 tiled split-K: BC=32, smem 2*BC*HD*4, S=ceil(ctx/64) chunk=64 O(1) per slice
                 // Bypass tiled when ctx<=32 (L2, serial faster) or HD>128
