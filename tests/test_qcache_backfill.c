@@ -30,7 +30,7 @@ int tt_kv_scatter_q8_0(const float *kst, const float *vst, void *Kc_q8, void *Vc
 int tt_kv_scatter_q4_0(const float *kst, const float *vst, void *Kc_q4, void *Vc_q4,
                        const int *d_pos, int n_kv_heads, int head_dim, int max_ctx, cudaStream_t stream);
 int tt_kv_backfill_q8_0(const float *Kf, const float *Vf, void *Kc_q8, void *Vc_q8,
-                        int n_slots, int kvdim, cudaStream_t stream);
+                        int n_slots, int kvdim, int head_dim, int max_ctx, cudaStream_t stream);
 int tt_kv_backfill_q4_0(const float *Kf, const float *Vf, void *Kc_q4, void *Vc_q4,
                         int n_slots, int kvdim, cudaStream_t stream);
 
@@ -48,7 +48,7 @@ static int check_backfill_exact(int qmode, int n_kv_heads, int head_dim, int max
     const int kvdim = n_kv_heads * head_dim;
     const int nb = kvdim / 32;
     const size_t fp32_sz = (size_t)n_slots * kvdim * sizeof(float);
-    const size_t q8_sz = (size_t)n_slots * nb * 34;   /* BlockQ8_0 = 2 + 32 */
+    const size_t q8_sz = (size_t)max_ctx * nb * 36;   /* BlockQ8KV kv-major: cap=max_ctx slots/kv */
     const size_t q4_sz = (size_t)n_slots * nb * 18;   /* BlockQ4_0 = 2 + 16 */
     const size_t qsz = qmode ? q8_sz : q4_sz;
     float *hK = malloc(fp32_sz), *hV = malloc(fp32_sz);
@@ -74,7 +74,7 @@ static int check_backfill_exact(int qmode, int n_kv_heads, int head_dim, int max
         }
     }
     /* test: one-shot backfill */
-    if (qmode) tt_kv_backfill_q8_0(dK, dV, dQ2k, dQ2v, n_slots, kvdim, 0);
+    if (qmode) tt_kv_backfill_q8_0(dK, dV, dQ2k, dQ2v, n_slots, kvdim, head_dim, max_ctx, 0);
     else tt_kv_backfill_q4_0(dK, dV, dQ2k, dQ2v, n_slots, kvdim, 0);
     CK(cudaDeviceSynchronize());
     char *h1k = malloc(qsz), *h1v = malloc(qsz), *h2k = malloc(qsz), *h2v = malloc(qsz);

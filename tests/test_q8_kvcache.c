@@ -58,7 +58,7 @@ int main(void) {
 
     size_t fp32_cache_size = (size_t)max_ctx * kv_dim * sizeof(float);
     size_t blocks_per_slot = kv_dim / 32;
-    size_t q8_cache_size   = (size_t)max_ctx * blocks_per_slot * 34;
+    size_t q8_cache_size   = (size_t)max_ctx * blocks_per_slot * 36;
 
     float *d_Kc_fp32, *d_Vc_fp32;
     void *d_Kc_q8, *d_Vc_q8;
@@ -137,7 +137,7 @@ int main(void) {
         CK(cudaMemset(d_out_q8, 0, out_size));
         tt_flash_gqa_q8_0_splitk(d_q, d_Kc_q8, d_Vc_q8, d_pacc_q8, d_pm_q8, d_pl_q8,
                                  d_out_q8, d_pos, n_heads, n_kv_heads, head_dim,
-                                 scale, window, S, 0);
+                                 scale, window, S, max_ctx, 0);
         CK(cudaDeviceSynchronize());
 
         CK(cudaMemcpy(h_out_q8, d_out_q8, out_size, cudaMemcpyDeviceToHost));

@@ -174,7 +174,9 @@ int tt_flash_gqa_q8_0(const float *q, const void *Kc_q8, const void *Vc_q8, floa
 int tt_flash_gqa_q8_0_splitk(const float *q, const void *Kc_q8, const void *Vc_q8,
                              float *p_acc, float *p_m, float *p_l, float *out,
                              const int *d_pos, int n_heads, int n_kv_heads, int head_dim,
-                             float scale, int window, int S, cudaStream_t stream);
+                             float scale, int window, int S, int cap, cudaStream_t stream);
+int tt_kv_backfill_q8_0(const float *Kf, const float *Vf, void *Kc_q8, void *Vc_q8,
+                        int n_slots, int kvdim, int head_dim, int max_ctx, cudaStream_t stream);
 int tt_kv_scatter_q4_0(const float *kst, const float *vst, void *Kc_q4, void *Vc_q4,
                        const int *d_pos, int n_kv_heads, int head_dim, int max_ctx, cudaStream_t stream);
 int tt_flash_gqa_q4_0_splitk(const float *q, const void *Kc_q4, const void *Vc_q4,

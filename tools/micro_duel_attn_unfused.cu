@@ -22,7 +22,7 @@ long ttq_dequant(const void *a, int b, long c, float *d) {
 int tt_flash_gqa_q8_0_splitk(const float *q, const void *Kc_q8, const void *Vc_q8,
     float *acc, float *st_m, float *st_l, float *out, const int *d_pos,
     int n_heads, int n_kv_heads, int head_dim, float scale, int window, int S,
-    cudaStream_t stream);
+    int cap, cudaStream_t stream);
 }
 
 struct BlockQ8KV { signed char qs[32]; half d; short pad; };
@@ -186,6 +186,12 @@ static void run_shape(const char *name, int H, int KV, int HD, int pos, char *df
     std::vector<BlockQ8KV> hkv2n(nblk);
     for (int t = 0; t < n; t++) for (int k = 0; k < KV; k++) for (int bb = 0; bb < bph; bb++)
         hkv2n[((long)k * n + t) * bph + bb] = hkv2[((long)t * KV + k) * bph + bb];
+    /* split side wants d-first blocks in the same kv-major order */
+    std::vector<BlockQ8E> hkvE(nblk);
+    for (long i = 0; i < nblk; i++) {
+        hkvE[i].d = hkv2n[i].d; hkvE[i].pad = 0;
+        for (int j = 0; j < 32; j++) hkvE[i].qs[j] = hkv2n[i].qs[j];
+    }
     BlockQ8KV *dK2, *dV2;
     CK(cudaMalloc(&dK2, sizeof(BlockQ8KV) * nblk));
     CK(cudaMalloc(&dV2, sizeof(BlockQ8KV) * nblk));
@@ -196,8 +202,8 @@ static void run_shape(const char *name, int H, int KV, int HD, int pos, char *df
     CK(cudaMalloc(&dl, sizeof(float) * (long)S * H));
     CK(cudaMalloc(&dpos, sizeof(int)));
     CK(cudaMemcpy(dq, hq.data(), sizeof(float) * H * HD, cudaMemcpyHostToDevice));
-    CK(cudaMemcpy(dK, hkv.data(), sizeof(BlockQ8E) * nblk, cudaMemcpyHostToDevice));
-    CK(cudaMemcpy(dV, hkv.data(), sizeof(BlockQ8E) * nblk, cudaMemcpyHostToDevice));
+    CK(cudaMemcpy(dK, hkvE.data(), sizeof(BlockQ8E) * nblk, cudaMemcpyHostToDevice));
+    CK(cudaMemcpy(dV, hkvE.data(), sizeof(BlockQ8E) * nblk, cudaMemcpyHostToDevice));
     CK(cudaMemcpy(dpos, &pos, sizeof(int), cudaMemcpyHostToDevice));
     cudaEvent_t a, b;
     CK(cudaEventCreate(&a)); CK(cudaEventCreate(&b));
@@ -205,7 +211,7 @@ static void run_shape(const char *name, int H, int KV, int HD, int pos, char *df
     auto time_split = [&]() {
         flush(); CK(cudaEventRecord(a, 0));
         tt_flash_gqa_q8_0_splitk(dq, dK, dV, dacc, dm, dl, dout_split, dpos,
-                                 H, KV, HD, scale, 0, S, 0);
+                                 H, KV, HD, scale, 0, S, n, 0);
         CK(cudaEventRecord(b, 0)); CK(cudaEventSynchronize(b));
         float m; CK(cudaEventElapsedTime(&m, a, b)); return m;
     };

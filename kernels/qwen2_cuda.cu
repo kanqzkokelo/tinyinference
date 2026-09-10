@@ -723,8 +723,10 @@ __global__ void k_kv_scatter_q8_0_batched(const float *__restrict__ kst, const f
     const float inv_k = (max_k > 0.0f) ? (127.0f / max_k) : 0.0f;
     const float scale_v = (max_v > 0.0f) ? (max_v / 127.0f) : 1.0f;
     const float inv_v = (max_v > 0.0f) ? (127.0f / max_v) : 0.0f;
-    BlockQ8KV *k_dest = Kc + (long)slot * blocks_per_slot + blk;
-    BlockQ8KV *v_dest = Vc + (long)slot * blocks_per_slot + blk;
+    /* KV-major cache [kv][slot][b]: contiguous (slot,b) tiles per kv head */
+    const int bph_sc = head_dim / 32;
+    BlockQ8KV *k_dest = Kc + ((long)(blk / bph_sc) * max_ctx + slot) * bph_sc + blk % bph_sc;
+    BlockQ8KV *v_dest = Vc + ((long)(blk / bph_sc) * max_ctx + slot) * bph_sc + blk % bph_sc;
     k_dest->d = __float2half(scale_k);
     v_dest->d = __float2half(scale_v);
     #pragma unroll
@@ -1118,8 +1120,10 @@ __global__ void k_kv_scatter_q8_0(
     const float scale_v = (max_v > 0.0f) ? (max_v / 127.0f) : 1.0f;
     const float inv_v   = (max_v > 0.0f) ? (127.0f / max_v) : 0.0f;
 
-    BlockQ8KV *k_dest = Kc + (long)slot * num_blocks_per_slot + block_idx;
-    BlockQ8KV *v_dest = Vc + (long)slot * num_blocks_per_slot + block_idx;
+    /* KV-major cache [kv][slot][b]: contiguous (slot,b) tiles per kv head */
+    const int bph_s1 = head_dim / 32;
+    BlockQ8KV *k_dest = Kc + ((long)(block_idx / bph_s1) * max_ctx + slot) * bph_s1 + block_idx % bph_s1;
+    BlockQ8KV *v_dest = Vc + ((long)(block_idx / bph_s1) * max_ctx + slot) * bph_s1 + block_idx % bph_s1;
 
     k_dest->d = __float2half(scale_k);
     v_dest->d = __float2half(scale_v);
@@ -1194,7 +1198,7 @@ __global__ void k_kv_backfill_q8_0(
     const float *__restrict__ Vf,
     BlockQ8KV   *__restrict__ Kc,
     BlockQ8KV   *__restrict__ Vc,
-    int n_slots, int kvdim) {
+    int n_slots, int kvdim, int head_dim, int max_ctx) {
     const int nb = kvdim / 32;
     const int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= n_slots * nb) return;
@@ -1212,8 +1216,10 @@ __global__ void k_kv_backfill_q8_0(
     const float inv_k   = (max_k > 0.0f) ? (127.0f / max_k) : 0.0f;
     const float scale_v = (max_v > 0.0f) ? (max_v / 127.0f) : 1.0f;
     const float inv_v   = (max_v > 0.0f) ? (127.0f / max_v) : 0.0f;
-    BlockQ8KV *kd = Kc + (long)slot * nb + bi;
-    BlockQ8KV *vd = Vc + (long)slot * nb + bi;
+    /* KV-major cache [kv][slot][b], same max_ctx stride as scatter */
+    const int bph_bf = head_dim / 32;
+    BlockQ8KV *kd = Kc + ((long)(bi / bph_bf) * max_ctx + slot) * bph_bf + bi % bph_bf;
+    BlockQ8KV *vd = Vc + ((long)(bi / bph_bf) * max_ctx + slot) * bph_bf + bi % bph_bf;
     kd->d = __float2half(scale_k);
     vd->d = __float2half(scale_v);
     #pragma unroll
@@ -1301,8 +1307,8 @@ __global__ void k_flash_gqa_q8_0(
 
     const int block_in_head = (lane * elems) / 32;
     const int elem_sub_idx = (lane * elems) % 32;
-    const int block_idx = kvh * blocks_per_head + block_in_head;
-    const int block_byte_off = block_idx * 36;
+    /* KV-major cache: byte offset of block_in_head within (kv,slot) tile */
+    const int block_byte_off = block_in_head * 36;
     const int wsc = block_byte_off >> 2;
     const int sh_d = block_byte_off & 2;
     const int a0 = (block_byte_off + 4) >> 2;
@@ -1310,9 +1316,10 @@ __global__ void k_flash_gqa_q8_0(
 
     const int k_elem_word = elem_sub_idx >> 2;
 
-    const long stride = (long)blocks_per_slot * 36;
-    const char *k_ptr = (const char *)Kc_q8 + (long)t0 * stride;
-    const char *v_ptr = (const char *)Vc_q8 + (long)t0 * stride;
+    /* consecutive slots of one kv head are blocks_per_head*36 apart */
+    const long stride = (long)blocks_per_head * 36;
+    const char *k_ptr = (const char *)Kc_q8 + ((long)kvh * max_ctx + t0) * stride;
+    const char *v_ptr = (const char *)Vc_q8 + ((long)kvh * max_ctx + t0) * stride;
 
     for (int t = t0; t <= pos; t++) {
         const uint32_t *k_slot_u32 = (const uint32_t *)k_ptr;
@@ -1414,7 +1421,7 @@ __global__ void k_fa2_q8_split(
     float           *__restrict__ p_l,
     const int       *__restrict__ d_pos,
     int n_heads, int n_kv_heads, int head_dim,
-    float scale, int window, int S)
+    float scale, int window, int S, int cap)
 {
     const int pos = *d_pos;
     const int s = blockIdx.x;
@@ -1492,7 +1499,8 @@ __global__ void k_fa2_q8_split(
         for (int i = tid; i < total_blocks; i += blockDim.x) {
             int tok = i / blocks_per_head;
             int b   = i % blocks_per_head;
-            long g_idx = ((long)(t_tile + tok) * n_kv_heads + kv) * blocks_per_head + b;
+            /* KV-major cache [kv][slot][b], cap slots per kv head */
+            long g_idx = ((long)kv * cap + t_tile + tok) * blocks_per_head + b;
             const BlockQ8KV bk = Kc_q8[g_idx];
             const BlockQ8KV bv = Vc_q8[g_idx];
             sK_d[tok * blocks_per_head + b] = bk.d;
@@ -2104,7 +2112,7 @@ __global__ void k_prefill_flash_q8_0(
     float           *__restrict__ Att,
     int n, int ctx, int e_pos,
     int n_heads, int n_kv_heads, int head_dim,
-    float scale, int window)
+    float scale, int window, int cap)
 {
     const int G = n_heads / n_kv_heads;
     const int tid = threadIdx.x;
@@ -2182,7 +2190,8 @@ __global__ void k_prefill_flash_q8_0(
         for (int i = tid; i < total_blocks; i += blockDim.x) {
             const int tok = i / blocks_per_head;
             const int b   = i % blocks_per_head;
-            const long g_idx = ((long)(s_start + tok) * n_kv_heads + kv) * blocks_per_head + b;
+            /* KV-major cache [kv][slot][b], cap slots per kv head */
+            const long g_idx = ((long)kv * cap + s_start + tok) * blocks_per_head + b;
             const BlockQ8KV bk = Kc[g_idx];
             const BlockQ8KV bv = Vc[g_idx];
             sK_d[tok * blocks_per_head + b] = bk.d;
@@ -3087,10 +3096,10 @@ extern "C" int tt_kv_scatter_q4_0(const float *kst, const float *vst, void *Kc_q
  * [0..n_slots) into Q caches in one launch. Bit-identical to per-slot
  * tt_kv_scatter_q{4,8}_0 given the same FP32 slot contents. */
 extern "C" int tt_kv_backfill_q8_0(const float *Kf, const float *Vf, void *Kc_q8, void *Vc_q8,
-                                     int n_slots, int kvdim, cudaStream_t stream) {
+                                     int n_slots, int kvdim, int head_dim, int max_ctx, cudaStream_t stream) {
     long total = (long)n_slots * (kvdim / 32);
     k_kv_backfill_q8_0<<<(total + 255) / 256, 256, 0, stream>>>(
-        Kf, Vf, (BlockQ8KV *)Kc_q8, (BlockQ8KV *)Vc_q8, n_slots, kvdim);
+        Kf, Vf, (BlockQ8KV *)Kc_q8, (BlockQ8KV *)Vc_q8, n_slots, kvdim, head_dim, max_ctx);
     return 0;
 }
 
@@ -3113,7 +3122,7 @@ extern "C" int tt_flash_gqa_q8_0(const float *q, const void *Kc_q8, const void *
 extern "C" int tt_attn_q8_split_only(const float *q, const void *Kc_q8, const void *Vc_q8,
     float *p_acc, float *p_m, float *p_l,
     const int *d_pos, int n_heads, int n_kv_heads, int head_dim,
-    float scale, int window, int S, cudaStream_t stream) {
+    float scale, int window, int S, int cap, cudaStream_t stream) {
     dim3 grid_split(S, n_kv_heads);
     int threads_split = (n_heads / n_kv_heads) * 32;
     int blocks_per_head = head_dim / 32;
@@ -3123,7 +3132,7 @@ extern "C" int tt_attn_q8_split_only(const float *q, const void *Kc_q8, const vo
         q, (const BlockQ8KV *)Kc_q8, (const BlockQ8KV *)Vc_q8,
         p_acc, p_m, p_l,
         d_pos, n_heads, n_kv_heads, head_dim,
-        scale, window, S);
+        scale, window, S, cap);
     return 0;
 }
 extern "C" int tt_attn_combine_only(const float *p_acc, const float *p_m, const float *p_l,
@@ -3137,7 +3146,7 @@ extern "C" int tt_attn_combine_only(const float *p_acc, const float *p_m, const 
 extern "C" int tt_flash_gqa_q8_0_splitk(const float *q, const void *Kc_q8, const void *Vc_q8,
                                         float *p_acc, float *p_m, float *p_l, float *out,
                                         const int *d_pos, int n_heads, int n_kv_heads, int head_dim,
-                                        float scale, int window, int S, cudaStream_t stream) {
+                                        float scale, int window, int S, int cap, cudaStream_t stream) {
     dim3 grid_split(S, n_kv_heads);
     int threads_split = (n_heads / n_kv_heads) * 32;
     int blocks_per_head = head_dim / 32;
@@ -3147,7 +3156,7 @@ extern "C" int tt_flash_gqa_q8_0_splitk(const float *q, const void *Kc_q8, const
         q, (const BlockQ8KV *)Kc_q8, (const BlockQ8KV *)Vc_q8,
         p_acc, p_m, p_l,
         d_pos, n_heads, n_kv_heads, head_dim,
-        scale, window, S);
+        scale, window, S, cap);
     k_fa2_combine<<<n_heads, 32, 0, stream>>>(
         p_acc, p_m, p_l,
         out, n_heads, head_dim, S);
@@ -4839,7 +4848,7 @@ static int forward_layers(Qwen2Engine *e) {
                     e->d_split_pacc, e->d_split_pm, e->d_split_pl,
                     e->d_pos,
                     H_l, KV_l, HDl,
-                    scale_l, swa_l, S);
+                    scale_l, swa_l, S, c->max_ctx);
                 k_fa2_combine<<<H_l, 32, 0, e->stream>>>(
                     e->d_split_pacc, e->d_split_pm, e->d_split_pl,
                     e->d_att, H_l, HDl, S);
@@ -5927,7 +5936,7 @@ int prefill_batched_gemm(Qwen2Engine *e, const int *toks, int n, float *h_x_out)
                               + 2 * (size_t)BC_PREFILL * HDl * sizeof(int8_t);
             k_prefill_flash_q8_0<<<grid_pf, threads_pf, smem_bytes, e->stream>>>(
                 d_Q, Kl_q8, Vl_q8, d_Att,
-                n, e->pos + n, e->pos, H_l, KV_l, HDl, scale_l, swa_l);
+                n, e->pos + n, e->pos, H_l, KV_l, HDl, scale_l, swa_l, c->max_ctx);
         } else {
             launch_prefill_flash(d_Q, Kl_f, Vl_f, d_Att,
                 n, e->pos + n, e->pos, H_l, KV_l, HDl, scale_l, swa_l, e->stream);
@@ -6263,7 +6272,7 @@ int prefill_batched_gemm_dx(Qwen2Engine *e, const int *toks, int n, float *d_x_o
                               + 2 * (size_t)BC_PREFILL * HDl * sizeof(int8_t);
             k_prefill_flash_q8_0<<<grid_pf, threads_pf, smem_bytes, e->stream>>>(
                 d_Q, Kl_q8, Vl_q8, d_Att,
-                n, e->pos + n, e->pos, H_l, KV_l, HDl, scale_l, swa_l);
+                n, e->pos + n, e->pos, H_l, KV_l, HDl, scale_l, swa_l, c->max_ctx);
         } else {
             launch_prefill_flash(d_Q, Kl_f, Vl_f, d_Att,
                 n, e->pos + n, e->pos, H_l, KV_l, HDl, scale_l, swa_l, e->stream);
@@ -6906,7 +6915,7 @@ extern "C" void qwen2_engine_enable_q8_kvcache(Qwen2Engine *e, int enable) {
                     e->d_vc + (long)l * cache_layer,
                     e->d_kc_q8 + (long)l * cache_per_blocks,
                     e->d_vc_q8 + (long)l * cache_per_blocks,
-                    n_slots, kvdim);
+                    n_slots, kvdim, HDl, e->cfg.max_ctx);
             }
             cudaStreamSynchronize(e->stream);
         }
