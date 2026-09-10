@@ -40,6 +40,13 @@ struct BlockQ8_0 {
 };
 #endif
 
+/* Q8 KV-cache-only block: 36B, 4-aligned. Same values as BlockQ8_0; the
+ * 2B pad lets readers use aligned u32 loads (GGUF Q8 weights keep 34B). */
+struct BlockQ8KV {
+    half d;          // FP16 scale, identical to BlockQ8_0
+    int16_t pad;     // padding, never read
+    int8_t qs[32];   // signed int8 block
+};
 #define Q4_BYTES_PER_BLOCK 18
 #define Q4_VALS_PER_BLOCK 32
 
@@ -697,7 +704,7 @@ __global__ void k_kv_scatter_batched(const float *__restrict__ kst, const float 
     Vc[(long)slot * kvdim + elem] = vst[(long)tok * kvdim + elem];
 }
 __global__ void k_kv_scatter_q8_0_batched(const float *__restrict__ kst, const float *__restrict__ vst,
-                                          BlockQ8_0 *__restrict__ Kc, BlockQ8_0 *__restrict__ Vc,
+                                          BlockQ8KV *__restrict__ Kc, BlockQ8KV *__restrict__ Vc,
                                           const int *__restrict__ d_pos_batch,
                                           int n_kv_heads, int head_dim, int max_ctx, int n) {
     const int block_idx = blockIdx.x * blockDim.x + threadIdx.x;
@@ -716,8 +723,8 @@ __global__ void k_kv_scatter_q8_0_batched(const float *__restrict__ kst, const f
     const float inv_k = (max_k > 0.0f) ? (127.0f / max_k) : 0.0f;
     const float scale_v = (max_v > 0.0f) ? (max_v / 127.0f) : 1.0f;
     const float inv_v = (max_v > 0.0f) ? (127.0f / max_v) : 0.0f;
-    BlockQ8_0 *k_dest = Kc + (long)slot * blocks_per_slot + blk;
-    BlockQ8_0 *v_dest = Vc + (long)slot * blocks_per_slot + blk;
+    BlockQ8KV *k_dest = Kc + (long)slot * blocks_per_slot + blk;
+    BlockQ8KV *v_dest = Vc + (long)slot * blocks_per_slot + blk;
     k_dest->d = __float2half(scale_k);
     v_dest->d = __float2half(scale_v);
     #pragma unroll
@@ -1086,8 +1093,8 @@ __global__ void k_kv_scatter(const float *__restrict__ kst, const float *__restr
 __global__ void k_kv_scatter_q8_0(
     const float *__restrict__ kst,
     const float *__restrict__ vst,
-    BlockQ8_0   *__restrict__ Kc,
-    BlockQ8_0   *__restrict__ Vc,
+    BlockQ8KV   *__restrict__ Kc,
+    BlockQ8KV   *__restrict__ Vc,
     const int   *__restrict__ d_pos,
     int n_kv_heads, int head_dim, int max_ctx) {
     const int block_idx = blockIdx.x * blockDim.x + threadIdx.x;
@@ -1111,8 +1118,8 @@ __global__ void k_kv_scatter_q8_0(
     const float scale_v = (max_v > 0.0f) ? (max_v / 127.0f) : 1.0f;
     const float inv_v   = (max_v > 0.0f) ? (127.0f / max_v) : 0.0f;
 
-    BlockQ8_0 *k_dest = Kc + (long)slot * num_blocks_per_slot + block_idx;
-    BlockQ8_0 *v_dest = Vc + (long)slot * num_blocks_per_slot + block_idx;
+    BlockQ8KV *k_dest = Kc + (long)slot * num_blocks_per_slot + block_idx;
+    BlockQ8KV *v_dest = Vc + (long)slot * num_blocks_per_slot + block_idx;
 
     k_dest->d = __float2half(scale_k);
     v_dest->d = __float2half(scale_v);
@@ -1185,8 +1192,8 @@ __global__ void k_kv_scatter_q4_0(
 __global__ void k_kv_backfill_q8_0(
     const float *__restrict__ Kf,
     const float *__restrict__ Vf,
-    BlockQ8_0   *__restrict__ Kc,
-    BlockQ8_0   *__restrict__ Vc,
+    BlockQ8KV   *__restrict__ Kc,
+    BlockQ8KV   *__restrict__ Vc,
     int n_slots, int kvdim) {
     const int nb = kvdim / 32;
     const int idx = blockIdx.x * blockDim.x + threadIdx.x;
@@ -1205,8 +1212,8 @@ __global__ void k_kv_backfill_q8_0(
     const float inv_k   = (max_k > 0.0f) ? (127.0f / max_k) : 0.0f;
     const float scale_v = (max_v > 0.0f) ? (max_v / 127.0f) : 1.0f;
     const float inv_v   = (max_v > 0.0f) ? (127.0f / max_v) : 0.0f;
-    BlockQ8_0 *kd = Kc + (long)slot * nb + bi;
-    BlockQ8_0 *vd = Vc + (long)slot * nb + bi;
+    BlockQ8KV *kd = Kc + (long)slot * nb + bi;
+    BlockQ8KV *vd = Vc + (long)slot * nb + bi;
     kd->d = __float2half(scale_k);
     vd->d = __float2half(scale_v);
     #pragma unroll
@@ -1262,8 +1269,8 @@ __global__ void k_kv_backfill_q4_0(
 /* Flash GQA kernel reading Q8_0 KV cache, dequantizing on-the-fly in registers */
 __global__ void k_flash_gqa_q8_0(
     const float     *__restrict__ q,
-    const BlockQ8_0 *__restrict__ Kc_q8,
-    const BlockQ8_0 *__restrict__ Vc_q8,
+    const BlockQ8KV *__restrict__ Kc_q8,
+    const BlockQ8KV *__restrict__ Vc_q8,
     float           *__restrict__ out,
     const int       *__restrict__ d_pos,
     int n_heads, int n_kv_heads, int head_dim, int max_ctx,
@@ -1295,15 +1302,15 @@ __global__ void k_flash_gqa_q8_0(
     const int block_in_head = (lane * elems) / 32;
     const int elem_sub_idx = (lane * elems) % 32;
     const int block_idx = kvh * blocks_per_head + block_in_head;
-    const int block_byte_off = block_idx * 34;
+    const int block_byte_off = block_idx * 36;
     const int wsc = block_byte_off >> 2;
     const int sh_d = block_byte_off & 2;
-    const int a0 = (block_byte_off + 2) >> 2;
-    const int sh_qs = (block_byte_off + 2) & 2;
+    const int a0 = (block_byte_off + 4) >> 2;
+    const int sh_qs = (block_byte_off + 4) & 2;
 
     const int k_elem_word = elem_sub_idx >> 2;
 
-    const long stride = (long)blocks_per_slot * 34;
+    const long stride = (long)blocks_per_slot * 36;
     const char *k_ptr = (const char *)Kc_q8 + (long)t0 * stride;
     const char *v_ptr = (const char *)Vc_q8 + (long)t0 * stride;
 
@@ -1400,8 +1407,8 @@ __global__ void k_flash_gqa_q8_0(
 
 __global__ void k_fa2_q8_split(
     const float     *__restrict__ q,
-    const BlockQ8_0 *__restrict__ Kc_q8,
-    const BlockQ8_0 *__restrict__ Vc_q8,
+    const BlockQ8KV *__restrict__ Kc_q8,
+    const BlockQ8KV *__restrict__ Vc_q8,
     float           *__restrict__ p_acc,
     float           *__restrict__ p_m,
     float           *__restrict__ p_l,
@@ -1480,14 +1487,14 @@ __global__ void k_fa2_q8_split(
         int bc_active = t_tile_end - t_tile;
 
         // Cooperative load of bc_active KV blocks into smem
-        // FIX: byte-wise copy avoids misaligned 4-byte loads (qs at offset 2 in 34-byte BlockQ8_0)
+        // FIX: byte-wise copy avoids misaligned 4-byte loads (qs at offset 4 in 36-byte BlockQ8KV)
         int total_blocks = bc_active * blocks_per_head;
         for (int i = tid; i < total_blocks; i += blockDim.x) {
             int tok = i / blocks_per_head;
             int b   = i % blocks_per_head;
             long g_idx = ((long)(t_tile + tok) * n_kv_heads + kv) * blocks_per_head + b;
-            const BlockQ8_0 bk = Kc_q8[g_idx];
-            const BlockQ8_0 bv = Vc_q8[g_idx];
+            const BlockQ8KV bk = Kc_q8[g_idx];
+            const BlockQ8KV bv = Vc_q8[g_idx];
             sK_d[tok * blocks_per_head + b] = bk.d;
             sV_d[tok * blocks_per_head + b] = bv.d;
             int row_off = tok * head_dim + b * 32;
@@ -2092,8 +2099,8 @@ __global__ void k_prefill_flash_q4_0(
 
 __global__ void k_prefill_flash_q8_0(
     const float     *__restrict__ Q,
-    const BlockQ8_0 *__restrict__ Kc,
-    const BlockQ8_0 *__restrict__ Vc,
+    const BlockQ8KV *__restrict__ Kc,
+    const BlockQ8KV *__restrict__ Vc,
     float           *__restrict__ Att,
     int n, int ctx, int e_pos,
     int n_heads, int n_kv_heads, int head_dim,
@@ -2176,8 +2183,8 @@ __global__ void k_prefill_flash_q8_0(
             const int tok = i / blocks_per_head;
             const int b   = i % blocks_per_head;
             const long g_idx = ((long)(s_start + tok) * n_kv_heads + kv) * blocks_per_head + b;
-            const BlockQ8_0 bk = Kc[g_idx];
-            const BlockQ8_0 bv = Vc[g_idx];
+            const BlockQ8KV bk = Kc[g_idx];
+            const BlockQ8KV bv = Vc[g_idx];
             sK_d[tok * blocks_per_head + b] = bk.d;
             sV_d[tok * blocks_per_head + b] = bv.d;
             const int row_off = tok * head_dim + b * 32;
@@ -3064,7 +3071,7 @@ extern "C" int tt_kv_scatter_q8_0(const float *kst, const float *vst, void *Kc_q
                                   const int *d_pos, int n_kv_heads, int head_dim, int max_ctx, cudaStream_t stream) {
     const int num_blocks = (n_kv_heads * head_dim) / 32;
     k_kv_scatter_q8_0<<<(num_blocks + 255) / 256, 256, 0, stream>>>(
-        kst, vst, (BlockQ8_0 *)Kc_q8, (BlockQ8_0 *)Vc_q8, d_pos, n_kv_heads, head_dim, max_ctx);
+        kst, vst, (BlockQ8KV *)Kc_q8, (BlockQ8KV *)Vc_q8, d_pos, n_kv_heads, head_dim, max_ctx);
     return 0;
 }
 
@@ -3083,7 +3090,7 @@ extern "C" int tt_kv_backfill_q8_0(const float *Kf, const float *Vf, void *Kc_q8
                                      int n_slots, int kvdim, cudaStream_t stream) {
     long total = (long)n_slots * (kvdim / 32);
     k_kv_backfill_q8_0<<<(total + 255) / 256, 256, 0, stream>>>(
-        Kf, Vf, (BlockQ8_0 *)Kc_q8, (BlockQ8_0 *)Vc_q8, n_slots, kvdim);
+        Kf, Vf, (BlockQ8KV *)Kc_q8, (BlockQ8KV *)Vc_q8, n_slots, kvdim);
     return 0;
 }
 
@@ -3099,7 +3106,7 @@ extern "C" int tt_flash_gqa_q8_0(const float *q, const void *Kc_q8, const void *
                                  const int *d_pos, int n_heads, int n_kv_heads, int head_dim,
                                  int max_ctx, float scale, int window, cudaStream_t stream) {
     k_flash_gqa_q8_0<<<n_heads, 32, 0, stream>>>(
-        q, (const BlockQ8_0 *)Kc_q8, (const BlockQ8_0 *)Vc_q8, out, d_pos,
+        q, (const BlockQ8KV *)Kc_q8, (const BlockQ8KV *)Vc_q8, out, d_pos,
         n_heads, n_kv_heads, head_dim, max_ctx, scale, window);
     return 0;
 }
@@ -3113,7 +3120,7 @@ extern "C" int tt_attn_q8_split_only(const float *q, const void *Kc_q8, const vo
     size_t smem_bytes = 2 * (size_t)BC_SPLIT * blocks_per_head * sizeof(half)
                       + 2 * (size_t)BC_SPLIT * head_dim * sizeof(int8_t);
     k_fa2_q8_split<<<grid_split, threads_split, smem_bytes, stream>>>(
-        q, (const BlockQ8_0 *)Kc_q8, (const BlockQ8_0 *)Vc_q8,
+        q, (const BlockQ8KV *)Kc_q8, (const BlockQ8KV *)Vc_q8,
         p_acc, p_m, p_l,
         d_pos, n_heads, n_kv_heads, head_dim,
         scale, window, S);
@@ -3137,7 +3144,7 @@ extern "C" int tt_flash_gqa_q8_0_splitk(const float *q, const void *Kc_q8, const
     size_t smem_bytes = 2 * (size_t)BC_SPLIT * blocks_per_head * sizeof(half)
                       + 2 * (size_t)BC_SPLIT * head_dim * sizeof(int8_t);
     k_fa2_q8_split<<<grid_split, threads_split, smem_bytes, stream>>>(
-        q, (const BlockQ8_0 *)Kc_q8, (const BlockQ8_0 *)Vc_q8,
+        q, (const BlockQ8KV *)Kc_q8, (const BlockQ8KV *)Vc_q8,
         p_acc, p_m, p_l,
         d_pos, n_heads, n_kv_heads, head_dim,
         scale, window, S);
@@ -3475,7 +3482,7 @@ struct Qwen2Engine {
     /* caches: [layer][kv_head][slot][head_dim] */
     float *d_kc, *d_vc;
     /* Q8_0 and Q4_0 KV caches: allocated when enabled */
-    BlockQ8_0 *d_kc_q8, *d_vc_q8;
+    BlockQ8KV *d_kc_q8, *d_vc_q8;
     int use_q8_kvcache;
     BlockQ4_0 *d_kc_q4, *d_vc_q4;
     int use_q4_kvcache;
@@ -4546,8 +4553,8 @@ static int forward_layers(Qwen2Engine *e) {
         LayerW *w = &e->L[l];
         float *Kl_f = e->d_kc + l * cache_layer;
         float *Vl_f = e->d_vc + l * cache_layer;
-        BlockQ8_0 *Kl_q8 = e->d_kc_q8 ? (e->d_kc_q8 + (long)l * cache_layer_q8) : NULL;
-        BlockQ8_0 *Vl_q8 = e->d_vc_q8 ? (e->d_vc_q8 + (long)l * cache_layer_q8) : NULL;
+        BlockQ8KV *Kl_q8 = e->d_kc_q8 ? (e->d_kc_q8 + (long)l * cache_layer_q8) : NULL;
+        BlockQ8KV *Vl_q8 = e->d_vc_q8 ? (e->d_vc_q8 + (long)l * cache_layer_q8) : NULL;
         BlockQ4_0 *Kl_q4 = e->d_kc_q4 ? (e->d_kc_q4 + (long)l * cache_layer_q8) : NULL;
         BlockQ4_0 *Vl_q4 = e->d_vc_q4 ? (e->d_vc_q4 + (long)l * cache_layer_q8) : NULL;
         /* gemma4 KV sharing: shared layers (pl_src[l] >= 0) read the source
@@ -5765,8 +5772,8 @@ int prefill_batched_gemm(Qwen2Engine *e, const int *toks, int n, float *h_x_out)
         LayerW *w = &e->L[l];
         float *Kl_f = e->d_kc + (long)l * cache_layer;
         float *Vl_f = e->d_vc + (long)l * cache_layer;
-        BlockQ8_0 *Kl_q8 = e->d_kc_q8 ? (e->d_kc_q8 + (long)l * cache_layer_q8) : NULL;
-        BlockQ8_0 *Vl_q8 = e->d_vc_q8 ? (e->d_vc_q8 + (long)l * cache_layer_q8) : NULL;
+        BlockQ8KV *Kl_q8 = e->d_kc_q8 ? (e->d_kc_q8 + (long)l * cache_layer_q8) : NULL;
+        BlockQ8KV *Vl_q8 = e->d_vc_q8 ? (e->d_vc_q8 + (long)l * cache_layer_q8) : NULL;
         BlockQ4_0 *Kl_q4 = e->d_kc_q4 ? (e->d_kc_q4 + (long)l * cache_layer_q8) : NULL;
         BlockQ4_0 *Vl_q4 = e->d_vc_q4 ? (e->d_vc_q4 + (long)l * cache_layer_q8) : NULL;
         const int kv_shared = e->has_pl_embd && e->pl_src[l] >= 0;
@@ -6107,8 +6114,8 @@ int prefill_batched_gemm_dx(Qwen2Engine *e, const int *toks, int n, float *d_x_o
         LayerW *w = &e->L[l];
         float *Kl_f = e->d_kc + (long)l * cache_layer;
         float *Vl_f = e->d_vc + (long)l * cache_layer;
-        BlockQ8_0 *Kl_q8 = e->d_kc_q8 ? (e->d_kc_q8 + (long)l * cache_layer_q8) : NULL;
-        BlockQ8_0 *Vl_q8 = e->d_vc_q8 ? (e->d_vc_q8 + (long)l * cache_layer_q8) : NULL;
+        BlockQ8KV *Kl_q8 = e->d_kc_q8 ? (e->d_kc_q8 + (long)l * cache_layer_q8) : NULL;
+        BlockQ8KV *Vl_q8 = e->d_vc_q8 ? (e->d_vc_q8 + (long)l * cache_layer_q8) : NULL;
         BlockQ4_0 *Kl_q4 = e->d_kc_q4 ? (e->d_kc_q4 + (long)l * cache_layer_q8) : NULL;
         BlockQ4_0 *Vl_q4 = e->d_vc_q4 ? (e->d_vc_q4 + (long)l * cache_layer_q8) : NULL;
         const int kv_shared = e->has_pl_embd && e->pl_src[l] >= 0;
@@ -6863,12 +6870,12 @@ extern "C" void qwen2_engine_enable_q8_kvcache(Qwen2Engine *e, int enable) {
             cache_per_blocks = mx_q8 * e->cfg.max_ctx;
         }
         if (!e->d_kc_q8) {
-            cudaMalloc(&e->d_kc_q8, cache_per_blocks * e->cfg.n_layers * sizeof(BlockQ8_0));
-            cudaMemset(e->d_kc_q8, 0, cache_per_blocks * e->cfg.n_layers * sizeof(BlockQ8_0));
+            cudaMalloc(&e->d_kc_q8, cache_per_blocks * e->cfg.n_layers * sizeof(BlockQ8KV));
+            cudaMemset(e->d_kc_q8, 0, cache_per_blocks * e->cfg.n_layers * sizeof(BlockQ8KV));
         }
         if (!e->d_vc_q8) {
-            cudaMalloc(&e->d_vc_q8, cache_per_blocks * e->cfg.n_layers * sizeof(BlockQ8_0));
-            cudaMemset(e->d_vc_q8, 0, cache_per_blocks * e->cfg.n_layers * sizeof(BlockQ8_0));
+            cudaMalloc(&e->d_vc_q8, cache_per_blocks * e->cfg.n_layers * sizeof(BlockQ8KV));
+            cudaMemset(e->d_vc_q8, 0, cache_per_blocks * e->cfg.n_layers * sizeof(BlockQ8KV));
         }
         /* Late-enable backfill (P1-2): FP32 decoding may have populated slots
          * [0..pos) before this call; the memset above left those Q8 slots
