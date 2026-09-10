@@ -117,6 +117,90 @@ std::sort(ms.begin(), ms.end()); double med = ms[25];
 printf("%s median=%.3f ms GBps=%.1f\n", tag, med, wb / (med / 1000.0) / 1e9);
 return med;
 }
+/* Q6_K v3: v2 math with split accumulators (even/odd sb) + float4 x loads.
+ * Same unpack order within a chunk; only accumulation reassociation differs.
+ * M%2==0 required (head shapes satisfy). */
+__global__ void k_gemv_q6_K_v3(const uint8_t *__restrict__ W,
+                               const float *__restrict__ x,
+                               float *__restrict__ y,
+                               int M, int K) {
+    const int row0 = (blockIdx.x * blockDim.y + threadIdx.y) * 2;
+    if (row0 >= M) return;
+    const int row1 = row0 + 1;
+    const int lane = threadIdx.x;
+    const int nsb = K / 256;
+    const uint8_t *rw0 = W + (long)row0 * nsb * 210;
+    const uint8_t *rw1 = W + (long)row1 * nsb * 210;
+    float s0a = 0.0f, s0b = 0.0f, s1a = 0.0f, s1b = 0.0f;
+    const int is = lane >> 4;
+    for (int sb = 0; sb < nsb; sb++) {
+        const uint8_t *blk0 = rw0 + sb * 210;
+        const uint8_t *blk1 = rw1 + sb * 210;
+        const float *xb = x + (long)sb * 256;
+        const float d0 = q6v4_half(blk0 + 208);
+        const float d1 = q6v4_half(blk1 + 208);
+        const int odd = sb & 1;
+#pragma unroll
+        for (int chunk = 0; chunk < 2; chunk++) {
+            const uint8_t *ql0 = blk0 + chunk * 64;
+            const uint8_t *qh0 = blk0 + 128 + chunk * 32;
+            const int8_t  *sc0 = (const int8_t *)(blk0 + 192 + chunk * 8);
+            const uint8_t *ql1 = blk1 + chunk * 64;
+            const uint8_t *qh1 = blk1 + 128 + chunk * 32;
+            const int8_t  *sc1 = (const int8_t *)(blk1 + 192 + chunk * 8);
+            const float *xc = xb + chunk * 128;
+            const float x0 = xc[lane], x1 = xc[lane + 32], x2 = xc[lane + 64], x3 = xc[lane + 96];
+            const int ql0_0 = ql0[lane + 0];
+            const int ql0_1 = ql0[lane + 32];
+            const int qh0_val = qh0[lane];
+            const int8_t q1_0 = (int8_t)((ql0_0 & 0xF) | (((qh0_val >> 0) & 3) << 4)) - 32;
+            const int8_t q2_0 = (int8_t)((ql0_1 & 0xF) | (((qh0_val >> 2) & 3) << 4)) - 32;
+            const int8_t q3_0 = (int8_t)((ql0_0 >> 4)  | (((qh0_val >> 4) & 3) << 4)) - 32;
+            const int8_t q4_0 = (int8_t)((ql0_1 >> 4)  | (((qh0_val >> 6) & 3) << 4)) - 32;
+            const float t0 = d0 * (sc0[is + 0] * (float)q1_0 * x0 +
+                        sc0[is + 2] * (float)q2_0 * x1 +
+                        sc0[is + 4] * (float)q3_0 * x2 +
+                        sc0[is + 6] * (float)q4_0 * x3);
+            const int ql1_0 = ql1[lane + 0];
+            const int ql1_1 = ql1[lane + 32];
+            const int qh1_val = qh1[lane];
+            const int8_t q1_1 = (int8_t)((ql1_0 & 0xF) | (((qh1_val >> 0) & 3) << 4)) - 32;
+            const int8_t q2_1 = (int8_t)((ql1_1 & 0xF) | (((qh1_val >> 2) & 3) << 4)) - 32;
+            const int8_t q3_1 = (int8_t)((ql1_0 >> 4)  | (((qh1_val >> 4) & 3) << 4)) - 32;
+            const int8_t q4_1 = (int8_t)((ql1_1 >> 4)  | (((qh1_val >> 6) & 3) << 4)) - 32;
+            const float t1 = d1 * (sc1[is + 0] * (float)q1_1 * x0 +
+                        sc1[is + 2] * (float)q2_1 * x1 +
+                        sc1[is + 4] * (float)q3_1 * x2 +
+                        sc1[is + 6] * (float)q4_1 * x3);
+            if (odd) { s0b += t0; s1b += t1; } else { s0a += t0; s1a += t1; }
+        }
+    }
+    float s0 = s0a + s0b;
+    float s1 = s1a + s1b;
+    s0 = q6v4_red(s0);
+    s1 = q6v4_red(s1);
+    if (lane == 0) {
+        y[row0] = s0;
+        if (row1 < M) y[row1] = s1;
+    }
+}
+static int tt_q6v3(const void *dW, const float *dx, float *dy, int M, int K) {
+    dim3 b(32, 16, 1);
+    dim3 g((M + 31) / 32, 1, 1);
+    k_gemv_q6_K_v3<<<g, b>>>((const uint8_t *)dW, dx, dy, M, K);
+    return (int)cudaGetLastError();
+}
+static double bench_v3(const void* dW, const float* dx, float* dy, int M, int K, size_t wb) {
+for (int i = 0; i < 10; i++) tt_q6v3(dW, dx, dy, M, K);
+CK(cudaDeviceSynchronize());
+cudaEvent_t a, b; CK(cudaEventCreate(&a)); CK(cudaEventCreate(&b));
+std::vector<float> ms; ms.reserve(50);
+for (int i = 0; i < 50; i++) { CK(cudaEventRecord(a, 0)); tt_q6v3(dW, dx, dy, M, K); CK(cudaEventRecord(b, 0)); CK(cudaEventSynchronize(b)); float m = 0; CK(cudaEventElapsedTime(&m, a, b)); ms.push_back(m); }
+CK(cudaEventDestroy(a)); CK(cudaEventDestroy(b));
+std::sort(ms.begin(), ms.end()); double med = ms[25];
+printf("v3    : median=%.3f ms GBps=%.1f ", med, wb / (med / 1000.0) / 1e9);
+return med;
+}
 int main() {
 const int M = 128256; const int K = 2048; const int nsb = 8;
 size_t wb = (size_t)M * (size_t)nsb * 210;
@@ -143,5 +227,9 @@ double m_v4 = bench_v4(dW, dx, dy, M, K, wb);
 std::vector<float> yv4(M); CK(cudaMemcpy(yv4.data(), dy, (size_t)M * 4, cudaMemcpyDeviceToHost));
 mx = 0; for (int i = 0; i < M; i++) { double d = (double)yv4[i] - (double)yv2[i]; double a = d < 0 ? -d : d; if (a > mx) mx = a; }
 printf("v4-vs-v2 maxabs=%.3e speedup=%.2f\n", mx, m_v2 / m_v4);
+double m_v3 = bench_v3(dW, dx, dy, M, K, wb);
+std::vector<float> yv3(M); CK(cudaMemcpy(yv3.data(), dy, (size_t)M * 4, cudaMemcpyDeviceToHost));
+mx = 0; for (int i = 0; i < M; i++) { double d = (double)yv3[i] - (double)yv2[i]; double a = d < 0 ? -d : d; if (a > mx) mx = a; }
+printf("v3-vs-v2 maxabs=%.3e speedup=%.2f ", mx, m_v2 / m_v3);
 return 0;
 }
