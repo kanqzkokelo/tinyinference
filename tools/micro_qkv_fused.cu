@@ -358,8 +358,10 @@ int main(int argc, char **argv) {
     printf("micro_qkv_fused: %d timed iters per path\n", iters);
 
     // qwen2.5-0.5b layer shapes: Q head = 14*64 = 896; KV = 2*64 = 128.
+    // llama-3.2-1b layer shapes: Q = 32*64 = 2048; KV = 8*64 = 512; K = 2048.
     std::vector<Shape> shapes = {
         {"qwen2.5-0.5b layer", 896, 128, 128, 896},
+        {"llama-3.2-1b layer", 2048, 512, 512, 2048},
     };
 
     // RNG seed for reproducible activations/weights.
