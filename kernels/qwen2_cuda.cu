@@ -121,7 +121,7 @@ static inline int kv_thresh_value(void) {
     static int cached = -1;
     if (cached < 0) {
         const char *ev = getenv("TT_QKV_THRESH");
-        cached = (ev && *ev) ? atoi(ev) : 0;
+        cached = (ev && *ev) ? atoi(ev) : 256;
         if (cached < 0) cached = 0;
     }
     return cached;
@@ -4069,13 +4069,13 @@ Qwen2Engine *qwen2_engine_create(const TTConfig *cfg, GGUFModel *m) {
         qwen2_engine_enable_q4_kvcache(e, 1);
     } else {
         const char *q8_env = getenv("TT_Q8_KV");
-        /* Q8 KV opt-in (enable with TT_Q8_KV=1): 4x KV traffic cut,
-         * top-1 stable vs FP32 but median|dlogit| 0.25-1.0 exceeds the
-         * 0.15 gate (0/7 default-ON vs 7/7 OFF, 2026-09-09). Keep OFF
-         * by default so the acceptance baseline stays numerics-clean;
-         * opt-in remains for long-ctx experiments. TT_KV_F16/TT_Q4_KV
-         * still override. */
-        if (q8_env && atoi(q8_env) != 0) {
+        /* Q8 KV default-ON with hybrid threshold (default 256): 4x KV
+         * traffic cut above thresh, FP32 below for parity. Short-ctx
+         * gates stay FP32 (bit-identical to before); long-ctx decode
+         * + prefill switch to Q8 for speed. Opt-out via TT_Q8_KV=0 or
+         * TT_KV_F16=1. TT_Q4_KV still overrides. TT_QKV_THRESH tunes
+         * the crossover (0 = Q8 from first token). */
+        if (!q8_env || atoi(q8_env) != 0) {
             qwen2_engine_enable_q8_kvcache(e, 1);
         }
     }
