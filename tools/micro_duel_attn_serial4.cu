@@ -111,6 +111,51 @@ static void run_shape(const char *name, int H, int KV, int HD, int pos) {
     printf("[%s] splitS%d median=%7.2f us  usefulGB/s=%6.1f\n", name, S, med, kvbytes/(med/1e6)/1e9);
 }
 
+static void sweep_S_llama2k() {
+    const int H = 32, KV = 8, HD = 64, pos = 2048;
+    int max_ctx = pos + 64;
+    int bph = HD / 32;
+    size_t nblk = (size_t)max_ctx * KV * bph;
+    float scale = 1.0f / sqrtf((float)HD);
+    std::vector<float> hq((size_t)H * HD);
+    std::vector<BlockQ8> hkv(nblk);
+    srand(777);
+    for (auto &x : hq) x = ((rand() % 2000) - 1000) / 1000.0f;
+    for (auto &b : hkv) { b.d = __float2half(0.02f); for (int i = 0; i < 32; i++) b.qs[i] = (int8_t)((rand() % 256) - 128); }
+    float *dq; BlockQ8 *dK, *dV; float *dout, *dacc, *dm, *dl; int *dpos;
+    CK(cudaMalloc(&dq, sizeof(float) * H * HD));
+    CK(cudaMalloc(&dK, sizeof(BlockQ8) * nblk));
+    CK(cudaMalloc(&dV, sizeof(BlockQ8) * nblk));
+    CK(cudaMalloc(&dout, sizeof(float) * H * HD));
+    CK(cudaMalloc(&dacc, sizeof(float) * (size_t)32 * H * HD));
+    CK(cudaMalloc(&dm, sizeof(float) * (size_t)32 * H));
+    CK(cudaMalloc(&dl, sizeof(float) * (size_t)32 * H));
+    CK(cudaMalloc(&dpos, sizeof(int)));
+    char *dflush; CK(cudaMalloc(&dflush, 64<<20));
+    CK(cudaMemcpy(dq, hq.data(), sizeof(float) * H * HD, cudaMemcpyHostToDevice));
+    CK(cudaMemcpy(dK, hkv.data(), sizeof(BlockQ8) * nblk, cudaMemcpyHostToDevice));
+    CK(cudaMemcpy(dV, hkv.data(), sizeof(BlockQ8) * nblk, cudaMemcpyHostToDevice));
+    CK(cudaMemcpy(dpos, &pos, sizeof(int), cudaMemcpyHostToDevice));
+    const int Ss[] = {4, 8, 16, 32};
+    cudaEvent_t a, b; CK(cudaEventCreate(&a)); CK(cudaEventCreate(&b));
+    double kvbytes = (double)(pos+1) * KV * HD * 2 + (double)(pos+1) * KV * bph * 2 * 2;
+    for (int si = 0; si < 4; si++) {
+        int S = Ss[si];
+        for (int w = 0; w < 20; w++) tt_flash_gqa_q8_0_splitk(dq, dK, dV, dacc, dm, dl, dout, dpos, H, KV, HD, scale, 0, S, 0);
+        CK(cudaDeviceSynchronize());
+        std::vector<float> ms;
+        for (int i = 0; i < 200; i++) {
+            CK(cudaMemset(dflush, i & 255, 64<<20));
+            CK(cudaEventRecord(a, 0));
+            tt_flash_gqa_q8_0_splitk(dq, dK, dV, dacc, dm, dl, dout, dpos, H, KV, HD, scale, 0, S, 0);
+            CK(cudaEventRecord(b, 0)); CK(cudaEventSynchronize(b));
+            float m; CK(cudaEventElapsedTime(&m, a, b)); ms.push_back(m);
+        }
+        double med = med_ms(ms)*1000.0;
+        printf("[sweep] S=%d median=%7.2f us usefulGB/s=%6.1f", S, med, kvbytes/(med/1e6)/1e9);
+    }
+    CK(cudaEventDestroy(a)); CK(cudaEventDestroy(b));
+}
 int main() {
     run_shape("qwen3", 16, 8, 128, 525);
     run_shape("llama", 32, 8, 64, 510);
@@ -118,5 +163,7 @@ int main() {
     run_shape("qwen2.5", 14, 2, 64, 525);
     run_shape("qwen3-2k", 16, 8, 128, 2048);
     run_shape("smollm2-2k", 9, 3, 64, 2048);
+    run_shape("llama-2k", 32, 8, 64, 2048);
+    sweep_S_llama2k();
     return 0;
 }
