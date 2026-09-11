@@ -4108,6 +4108,11 @@ Qwen2Engine *qwen2_engine_create(const TTConfig *cfg, GGUFModel *m) {
     cudaMalloc(&e->d_xn, D * sizeof(float));
     int max_hd = cfg->head_dim;
     int max_heads = cfg->dim / cfg->head_dim;
+    /* Qwen3-style wide-q: n_heads*head_dim may exceed dim (q proj wider
+     * than hidden). Score rows are indexed by query head so the head
+     * count must cover n_heads not dim/head_dim. Undersizing lets the
+     * 16-row unfused qk overwrite the scalar slot past the buffer end. */
+    if (cfg->n_heads > max_heads) max_heads = cfg->n_heads;
     long max_ffn = F;
     int max_kv = cfg->n_kv_heads;
     /* Default max_qout is the homogeneous case:
