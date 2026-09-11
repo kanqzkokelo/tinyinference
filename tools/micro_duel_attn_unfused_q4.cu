@@ -1,6 +1,11 @@
 // Duel: unfused decode attention over Q4_0 KV (QK-gemv + softmax + PV-gemv)
 // vs fused k_fa2_q4_split (tt_flash_gqa_q4_0_splitk). Same-process A-B.
 // NOTE Q4 engine cache is t-major: blk[((t*KV)+kv)*bph+b], d raw fp16 bits.
+// VERDICT v2 2026-09-11 NO-GO for engine port: vectorized nibble loads are
+// bit-exact and win llama shapes (510 1.3x, 2k 1.15x) but lose small-KV
+// shapes (qwen25-2k 0.49x, smol-2k 0.67x: 4-6 blocks vs split-K SxKV grid).
+// Independent killer: fleet default env runs Q8 KV so the Q4 split path
+// never serves fleet cells (TT_Q4_KV opt-in only and diverged). See plan v3.
 // argv[1] present = hot L2 (skip flush).
 #include <cstdio>
 #include <vector>
@@ -43,7 +48,7 @@ __global__ void k4_qk(const float *__restrict__ q, const BlockQ4KV *__restrict__
     for (int i = tid; i < G * HD; i += NT)
         sq[i] = q[(long)(kv * G + i / HD) * HD + i % HD];
     __shared__ half sKd[TT2 * 4];
-    __shared__ uint8_t sKq[TT2 * 4 * 16];
+    __shared__ unsigned sKq[TT2 * 4 * 4];
     for (int t0 = r0; t0 < r1; t0 += TT2) {
         int tact = min(TT2, r1 - t0);
         for (int i = tid; i < tact * bph; i += NT) {
@@ -51,8 +56,9 @@ __global__ void k4_qk(const float *__restrict__ q, const BlockQ4KV *__restrict__
             long gi = ((long)(t0 + tt) * KV + kv) * bph + b;
             BlockQ4KV blk = Kn[gi];
             sKd[tt * bph + b] = __ushort_as_half(blk.d);
-            uint8_t *dst = sKq + ((long)tt * bph + b) * 16;
-            for (int j = 0; j < 16; j++) dst[j] = blk.qs[j];
+            const unsigned *src = (const unsigned *)&blk.qs[0];
+            unsigned *dst = sKq + ((long)tt * bph + b) * 4;
+            dst[0]=src[0]; dst[1]=src[1]; dst[2]=src[2]; dst[3]=src[3];
         }
         __syncthreads();
         for (int gt = tid; gt < G * tact; gt += NT) {
@@ -61,12 +67,22 @@ __global__ void k4_qk(const float *__restrict__ q, const BlockQ4KV *__restrict__
             float dot = 0.f;
             for (int b = 0; b < bph; b++) {
                 float dk = __half2float(sKd[tt * bph + b]);
-                const uint8_t *qb = sKq + ((long)tt * bph + b) * 16;
+                const unsigned *kw = sKq + ((long)tt * bph + b) * 4;
                 const float *qf = qq + b * 32;
-                for (int v = 0; v < 32; v++) {
-                    int by = qb[v & 15];
-                    int nib = (v < 16) ? (by & 15) : (by >> 4);
-                    dot += qf[v] * ((float)(nib - 8) * dk);
+                for (int w = 0; w < 4; w++) {
+                    unsigned u = kw[w];
+                    const float *qlo = qf + w * 4;
+                    const float *qhi = qf + 16 + w * 4;
+                    unsigned b0 = (u      ) & 0xFF, b1 = (u >>  8) & 0xFF;
+                    unsigned b2 = (u >> 16) & 0xFF, b3 = (u >> 24) & 0xFF;
+                    dot += qlo[0] * ((float)((int)(b0 & 0xF) - 8) * dk)
+                         + qlo[1] * ((float)((int)(b1 & 0xF) - 8) * dk)
+                         + qlo[2] * ((float)((int)(b2 & 0xF) - 8) * dk)
+                         + qlo[3] * ((float)((int)(b3 & 0xF) - 8) * dk)
+                         + qhi[0] * ((float)((int)(b0 >> 4) - 8) * dk)
+                         + qhi[1] * ((float)((int)(b1 >> 4) - 8) * dk)
+                         + qhi[2] * ((float)((int)(b2 >> 4) - 8) * dk)
+                         + qhi[3] * ((float)((int)(b3 >> 4) - 8) * dk);
                 }
             }
             scores[((long)(kv * G + g)) * n + t0 + tt] = dot * scale;
@@ -83,13 +99,16 @@ __global__ void k4_pv(const float *__restrict__ scores, const BlockQ4KV *__restr
     int HD2 = HD / 2, d0 = cc * HD2;
     int GD2 = G * HD2;
     __shared__ half sVd[TT2 * 4];
-    __shared__ uint8_t sVq[TT2 * 4 * 16];
+    __shared__ unsigned sVq[TT2 * 4 * 4];
     __shared__ float sP[8 * 256];
     float acc = 0.f;
     int gd = tid;
     int g = (gd < GD2) ? gd / HD2 : 0;
     int d = (gd < GD2) ? d0 + gd % HD2 : 0;
     int b_of_d = d / 32, v_in_b = d % 32;
+    int word = (v_in_b & 15) >> 2;
+    int bsh = (v_in_b & 3) << 3;
+    int high = (v_in_b >= 16);
     for (int t0 = 0; t0 < n; t0 += TT2) {
         int tact = min(TT2, n - t0);
         for (int i = tid; i < tact * bph; i += NT) {
@@ -97,8 +116,9 @@ __global__ void k4_pv(const float *__restrict__ scores, const BlockQ4KV *__restr
             long gi = ((long)(t0 + tt) * KV + kv) * bph + b;
             BlockQ4KV blk = Vn[gi];
             sVd[tt * bph + b] = __ushort_as_half(blk.d);
-            uint8_t *dst = sVq + ((long)tt * bph + b) * 16;
-            for (int j = 0; j < 16; j++) dst[j] = blk.qs[j];
+            const unsigned *src = (const unsigned *)&blk.qs[0];
+            unsigned *dst = sVq + ((long)tt * bph + b) * 4;
+            dst[0]=src[0]; dst[1]=src[1]; dst[2]=src[2]; dst[3]=src[3];
         }
         __syncthreads();
         for (int i = tid; i < G * tact; i += NT)
@@ -108,8 +128,8 @@ __global__ void k4_pv(const float *__restrict__ scores, const BlockQ4KV *__restr
         if (gd < GD2) {
             for (int tt = 0; tt < tact; tt++) {
                 float dv = __half2float(sVd[tt * bph + b_of_d]);
-                int by = sVq[((long)tt * bph + b_of_d) * 16 + (v_in_b & 15)];
-                int nib = (v_in_b < 16) ? (by & 15) : (by >> 4);
+                unsigned by = (sVq[((long)tt * bph + b_of_d) * 4 + word] >> bsh) & 0xFFu;
+                int nib = high ? (by >> 4) : (by & 15);
                 acc += sP[(long)g * TT2 + tt] * ((float)(nib - 8) * dv);
             }
         }
