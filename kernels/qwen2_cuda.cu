@@ -3601,6 +3601,11 @@ struct LayerW {
 
 static int c_kvdim_for(const TTConfig *c) { return c->n_kv_heads * c->head_dim; }
 
+/* Dual-graph hybrid: max lazily-captured decode-step graphs per engine.
+ * Regimes per run are few (FP32 serial/tiled/old-split S values + Q8
+ * unfused/split S values across the thresh), 16 is ample headroom. */
+#define TT_GRAPH_SLOTS 16
+
 struct Qwen2Engine {
     TTConfig cfg;
     GGUFModel *gguf;
@@ -3630,9 +3635,15 @@ struct Qwen2Engine {
     int *d_pos;
     /* argmax scratch */
     float *d_bvals; int *d_bidxs, *d_out;
-    /* cudaGraph replay of the decode step (M6.3) */
-    cudaGraphExec_t graph_exec;   /* instantiated decode-step graph */
-    int graph_ready;              /* nonzero once capture+instantiate succeeded */
+    /* cudaGraph replay of the decode step (M6.3, dual-graph hybrid):
+     * one lazily-captured graph_exec per dispatch slot. The slot key
+     * hashes the host-side dispatch predicates at capture pos (Q-path
+     * from thresh, per-layer attn branch/S). Replay runs on key hit
+     * only, so baked launch params always match the eager choice. */
+    cudaGraphExec_t graph_slot_exec[TT_GRAPH_SLOTS];
+    uint64_t graph_slot_hash[TT_GRAPH_SLOTS];
+    int graph_slot_used;
+    int graph_ready;              /* mirror: nonzero while any slot live */
     int no_graph;                 /* TT_NO_GRAPH=1: eager path forever */
     int *d_next_tok;              /* device token fed by the next replay */
     int *h_sampled;               /* pinned staging for async D2H argmax result */
@@ -3746,6 +3757,69 @@ static inline int split_S_fp32(int ctx, int smax) {
     if (S > 32) S = 32;
     if (S > smax) S = smax;
     return S;
+}
+
+/* Dual-graph slot key: FNV-1a over the host-side dispatch predicates at
+ * pos, mirroring forward_layers exactly. Replay on hit only, so baked
+ * launch params (scatter path, attn branch/S) always equal the eager
+ * choice at replay pos. All other dispatches (QKV fuse, GEMM flavor,
+ * embed branch, softcap, sampling launches) are static per engine or
+ * handled by drop-all (sampling flips), hence excluded by design. */
+static uint64_t graph_slot_key_at(const Qwen2Engine *e, int pos) {
+    const TTConfig *c = &e->cfg;
+    const int HD = c->head_dim;
+    uint64_t h = 1469598103934665603ULL;
+#define TT_KEY_MIX(v) do { h ^= (uint64_t)(v); h *= 1099511628211ULL; } while (0)
+    TT_KEY_MIX(kv_use_q4_eff_at(e, pos));
+    TT_KEY_MIX(kv_use_q8_eff_at(e, pos));
+    const int no_unf = getenv("TT_NO_UNFUSED") ? 1 : 0;
+    TT_KEY_MIX(no_unf);
+    const int ctx = pos;
+    for (int l = 0; l < c->n_layers; l++) {
+        const int H_l = e->pl_heads[l] > 0 ? e->pl_heads[l] : c->n_heads;
+        const int KV_l = e->pl_kv[l] > 0 ? e->pl_kv[l] : c->n_kv_heads;
+        const int HDl = e->pl_hd[l] > 0 ? e->pl_hd[l] : HD;
+        const int swa_l = e->has_pl_embd ? e->pl_swa[l] : c->tr.swa_size;
+        TT_KEY_MIX(H_l); TT_KEY_MIX(KV_l); TT_KEY_MIX(HDl); TT_KEY_MIX(swa_l);
+        int branch, S;
+        if (kv_use_q4_eff_at(e, pos)) {
+            branch = 1; S = split_S_q(ctx, e->d_split_S_max);
+        } else if (kv_use_q8_eff_at(e, pos)) {
+            const int G_l = H_l / KV_l;
+            if (swa_l == 0 && G_l <= 8 && HDl <= 128 && G_l * HDl <= 512 && !no_unf) {
+                branch = 2; S = 0; /* unfused: no S baked */
+            } else { branch = 3; S = split_S_q(ctx, e->d_split_S_max); }
+        } else {
+            if (ctx > 32 && HDl <= 128) { branch = 4; S = split_S_fp32(ctx, e->d_split_S_max); }
+            else if (ctx > 64) {
+                branch = 5;
+                S = ctx / 256; if (S < 2) S = 2; if (S > 32) S = 32;
+                if (S > e->d_split_S_max) S = e->d_split_S_max;
+            } else { branch = 6; S = 0; } /* serial */
+        }
+        TT_KEY_MIX(branch); TT_KEY_MIX(S);
+    }
+#undef TT_KEY_MIX
+    return h ? h : 1;
+}
+static int graph_slot_find(Qwen2Engine *e, uint64_t key) {
+    for (int i = 0; i < e->graph_slot_used; i++)
+        if (e->graph_slot_hash[i] == key) return i;
+    return -1;
+}
+static int graph_embed_supported(const Qwen2Engine *e) {
+    const int edt = e->d_embd.dtype;
+    return (edt == GGUF_TYPE_Q4_0 || edt == GGUF_TYPE_Q8_0 || edt == GGUF_TYPE_Q2_K ||
+            edt == GGUF_TYPE_Q3_K || edt == GGUF_TYPE_Q6_K);
+}
+static void graph_slots_drop_all(Qwen2Engine *e) {
+    for (int i = 0; i < e->graph_slot_used; i++) {
+        if (e->graph_slot_exec[i]) cudaGraphExecDestroy(e->graph_slot_exec[i]);
+        e->graph_slot_exec[i] = NULL;
+        e->graph_slot_hash[i] = 0;
+    }
+    e->graph_slot_used = 0;
+    e->graph_ready = 0;
 }
 
 static float *upload_f32(GGUFModel *m, const char *name, WArena *a) {
@@ -4212,8 +4286,12 @@ Qwen2Engine *qwen2_engine_create(const TTConfig *cfg, GGUFModel *m) {
         CK_CREATE(cudaMemcpy(e->d_sampling_on, &zero, sizeof(int), cudaMemcpyHostToDevice), "cudaMemcpy fail d_sampling_on");
     }
     cudaMalloc(&e->d_out, sizeof(int));
-    /* graph replay state */
-    e->graph_exec = NULL;
+    /* graph replay state: dual-graph slots (lazy per-dispatch capture) */
+    for (int gi = 0; gi < TT_GRAPH_SLOTS; gi++) {
+        e->graph_slot_exec[gi] = NULL;
+        e->graph_slot_hash[gi] = 0;
+    }
+    e->graph_slot_used = 0;
     e->graph_ready = 0;
     /* TT_PROFILE forces eager mode: event records inside the captured region
      * are illegal, so per-stage profiling always runs graph-free. Hybrid
@@ -4247,17 +4325,9 @@ Qwen2Engine *qwen2_engine_create(const TTConfig *cfg, GGUFModel *m) {
             qwen2_engine_enable_q8_kvcache(e, 1);
         }
     }
-    /* Hybrid Fix1: quantized KV with threshold>0 requires per-token dispatch.
-     * Graph capture locks the flash/scatter path at capture pos (short ctx),
-     * so it cannot switch to Q* at long ctx. Disable graph when hybrid is
-     * active to allow threshold dispatch; short ctx stays FP32 for parity,
-     * long ctx switches to Q* for speed. */
-    if ((e->use_q4_kvcache || e->use_q8_kvcache) && kv_thresh_value() > 0) {
-        if (!e->no_graph) {
-            fprintf(stderr, "[qwen2-engine] hybrid KV (thresh %d): graph disabled for per-ctx dispatch\n", kv_thresh_value());
-        }
-        e->no_graph = 1;
-    }
+    /* Hybrid Fix1 (superseded by dual-graph slots): per-token Q-path/S
+     * dispatch is keyed per slot, so graph stays ON under hybrid thresh.
+     * Replay runs only when the live key matches the captured key. */
     if (e->n_gpu_layers < cfg->n_layers) {
         e->h_x_buf = (float *)malloc(D * sizeof(float));
         e->h_xn_buf = (float *)malloc(D * sizeof(float));
@@ -4425,7 +4495,15 @@ void qwen2_engine_free(Qwen2Engine *e) {
     if (e->h_v_stage) free(e->h_v_stage);
     if (e->h_kc) free(e->h_kc);
     if (e->h_vc) free(e->h_vc);
-     * Tracked as known limitation in PLAN_M6 M6.1. */
+    * Tracked as known limitation in PLAN_M6 M6.1. */
+    for (int gi = 0; gi < TT_GRAPH_SLOTS; gi++) {
+        if (e->graph_slot_exec[gi]) {
+            cudaGraphExecDestroy(e->graph_slot_exec[gi]);
+            e->graph_slot_exec[gi] = NULL;
+        }
+    }
+    e->graph_slot_used = 0;
+    e->graph_ready = 0;
     if (e->stream) cudaStreamDestroy(e->stream);
     free(e);
 }
@@ -4903,10 +4981,10 @@ static int forward_layers(Qwen2Engine *e) {
          * authoritative for this step (decode flash reads Q4/Q8 only).
          * Prefill (batched path below) still dual-writes: prefill flash
          * always reads FP32. Gated on the same effective predicates as
-         * the attn dispatch (thresh + TT_NO_BACKFILL aware) plus ptrs,
-         * so TT_NO_BACKFILL / missing-slab configs keep FP32. Under
-         * graph capture the host branch bakes the capture-ctx path;
-         * hybrid thresh>0 disables graph, so baked == correct. */
+        * the attn dispatch (thresh + TT_NO_BACKFILL aware) plus ptrs,
+        * so TT_NO_BACKFILL / missing-slab configs keep FP32. Under
+         * graph capture the host branch bakes the capture-key path; replay
+         * runs only on key hit, so baked == live dispatch. */
         {
         int q_eff = (kv_use_q8_eff(e) && Kl_q8 && Vl_q8)
                  || (kv_use_q4_eff(e) && Kl_q4 && Vl_q4);
@@ -4938,10 +5016,9 @@ static int forward_layers(Qwen2Engine *e) {
          * underutilizes the GPU (8-16 blocks on 20+ SMs), so dispatch to
          * S = clamp(ctx/256, 2, 16) split-K + combine when ctx > 128.
          * Short ctx keeps the serial path (lower launch overhead). The
-         * dispatch is host-side and runs once per forward_layers invocation;
-         * under graph capture the chosen path is fixed for the recorded
-         * graph's lifetime — safe because the serial path is functionally
-         * correct at every ctx and the test gates use short ctx. */
+        * dispatch is host-side and runs once per forward_layers invocation;
+         * under graph capture the chosen path is keyed per slot — replay
+         * runs only when the live predicates reproduce the baked path. */
         if (tt_profiling()) tt_prof_begin(TT_P_ATTN, e->stream);
         {
             const int ctx_l = e->pos;            /* host mirror of *d_pos */
@@ -6766,20 +6843,24 @@ static int sample_eager(Qwen2Engine *e) {
     return id;
 }
 
-/* Capture the whole decode step into a single-launch graph:
+/* Capture the whole decode step into one graph slot:
  *   embed(d_next_tok) -> forward_layers -> rmsnorm -> logits -> argmax -> pos_inc
  * All nodes on e->stream. The captured embed reads whatever token sits in
  * d_next_tok at REPLAY time (set per-call via async H2D before the launch).
- * On success sets graph_ready and returns 0; leaves graph_ready=0 otherwise. */
-static int qwen2_engine_graph_capture(Qwen2Engine *e) {
+ * Capture records without executing, so capturing at pos P and replaying
+ * at P/P+1/... is exact while the slot key matches the live dispatch.
+ * Caller passes the key computed at the current pos; stored alongside.
+ * Returns 0 on success, -1 soft (table full: eager this step, keep slots),
+ * -2 hard (anything else: caller drops to eager permanently). */
+static int qwen2_engine_graph_capture(Qwen2Engine *e, uint64_t key) {
     const TTConfig *c = &e->cfg;
 
     /* M9.5: dynamic-token embed kernel is now provided for q4_0 AND q6_k.
      * Other dtypes (q8_0, f16, q4_k/q5_k, etc.) still lack an in-graph
      * variant; fall back to eager for those. Captured graph works for
      * qwen2.5 (q4_0), llama-3.2 (q6_k despite filename), gemma2 (q6_k). */
+    if (!graph_embed_supported(e)) return -2;
     const int edt = e->d_embd.dtype;
-    if (edt != GGUF_TYPE_Q4_0 && edt != GGUF_TYPE_Q8_0 && edt != GGUF_TYPE_Q2_K && edt != GGUF_TYPE_Q3_K && edt != GGUF_TYPE_Q6_K) return -1;
     const int dummy = e->pending_tok >= 0 ? e->pending_tok : 0;
     cudaMemcpy(e->d_next_tok, &dummy, sizeof(int), cudaMemcpyHostToDevice);
     cudaStreamSynchronize(e->stream);
@@ -6927,14 +7008,20 @@ static int qwen2_engine_graph_capture(Qwen2Engine *e) {
     /* CUDA 12 signature: flags as unsigned long long (cuda_runtime_api.h).
      * The legacy 5-arg form is an inline wrapper in cuda_runtime.h that
      * delegates to this same 3-arg entry. */
-    const cudaError_t ie = cudaGraphInstantiate(&e->graph_exec, graph, 0);
+    cudaGraphExec_t exec = NULL;
+    const cudaError_t ie = cudaGraphInstantiate(&exec, graph, 0);
     cudaGraphDestroy(graph);
-    if (ie != cudaSuccess || !e->graph_exec) {
-        e->graph_exec = NULL;
+    if (ie != cudaSuccess || !exec) return -2;
+    if (e->graph_slot_used >= TT_GRAPH_SLOTS) {
+        cudaGraphExecDestroy(exec);
         return -1;
     }
+    e->graph_slot_hash[e->graph_slot_used] = key;
+    e->graph_slot_exec[e->graph_slot_used] = exec;
+    e->graph_slot_used++;
     e->graph_ready = 1;
-    fprintf(stderr, "[qwen2-engine] decode-step graph captured (cudaGraph replay ON)\n");
+    fprintf(stderr, "[qwen2-engine] decode-step graph captured slot %d (cudaGraph replay ON)\n",
+            e->graph_slot_used - 1);
     return 0;
 }
 
@@ -6943,22 +7030,8 @@ int qwen2_engine_next(Qwen2Engine *e) {
     if (!e || e->pos >= c->max_ctx - 1) return -2;
 
     /* TT_NO_GRAPH=1: legacy eager path forever (sample AND advance). */
-    if (!e->graph_ready && !e->no_graph) {
-        /* First call after prefill: eager sample WITHOUT advancing — x still
-         * holds the hidden state of the last fed token, exactly like the eager
-         * path's sampling stage. Also warms up norm/logits/argmax kernels. */
-        const int id = sample_eager(e);
-        if (id < 0 || id >= c->vocab) return id < 0 ? id : -3;
-        e->pending_tok = id;
-        if (qwen2_engine_graph_capture(e) == 0)
-            return id;               /* graph will feed `id` on next call */
-        fprintf(stderr, "[qwen2-engine] graph capture failed — falling back to eager permanently\n");
-        e->no_graph = 1;
-        e->pending_tok = -1;
-        if (advance(e, id)) return -4;   /* exact legacy behavior */
-        return id;
-    }
-
+    /* TT_NO_GRAPH=1 (or TT_PROFILE / CPU offload): legacy eager path
+     * forever (sample AND advance). */
     if (e->no_graph) {
         const int id = sample_eager(e);
         if (id < 0 || id >= c->vocab) return id < 0 ? id : -3;
@@ -6966,35 +7039,54 @@ int qwen2_engine_next(Qwen2Engine *e) {
         return id;
     }
 
-    if (e->pending_tok < 0) {
-        /* Freshly after a prefill that flushed the old pending: x holds the
-         * hidden state of the last fed token — eager sample WITHOUT advancing,
-         * stash result as the token the next replay will feed. */
-        const int id = sample_eager(e);
-        if (id < 0 || id >= c->vocab) return id < 0 ? id : -3;
-        e->pending_tok = id;
-        return id;
+    /* Slot hit: replay feeds pending_tok through the step baked at this
+     * key. Miss with pending: feed it eagerly at the live dispatch (the
+     * exact reference), then sample + lazily capture below. */
+    if (e->pending_tok >= 0) {
+        const uint64_t k0 = graph_slot_key_at(e, e->pos);
+        const int s0 = graph_slot_find(e, k0);
+        if (s0 >= 0 && e->graph_slot_exec[s0])
+            return qwen2_debug_replay_step(e, e->pending_tok);
+        if (advance(e, e->pending_tok)) return -4;
+        e->pending_tok = -1;
     }
 
-    /* Graph replay: feed pending_tok through the full step, sample the NEXT
-     * token, advance d_pos exactly once inside the graph. Returned sequence
-     * is identical to eager: s1 (first call above), then s2, s3, ... */
-    return qwen2_debug_replay_step(e, e->pending_tok);
+    /* pending < 0: x holds the hidden state of the last fed token. Sample
+     * WITHOUT advancing and stash as the token the next replay feeds. */
+    const int nid = sample_eager(e);
+    if (nid < 0 || nid >= c->vocab) return nid < 0 ? nid : -3;
+    e->pending_tok = nid;
+    const uint64_t k1 = graph_slot_key_at(e, e->pos);
+    if (graph_slot_find(e, k1) < 0) {
+        const int crc = qwen2_engine_graph_capture(e, k1);
+        if (crc == -2) {
+            fprintf(stderr, "[qwen2-engine] graph capture failed, eager permanently\n");
+            graph_slots_drop_all(e);
+            e->no_graph = 1;
+            e->pending_tok = -1;
+            if (advance(e, nid)) return -4;
+        }
+    }
+    return nid;
 }
 
 /* One graph-replayed decode step: H2D token -> graph launch -> D2H sample
  * -> sync, plus pos/pending bookkeeping. Shared by qwen2_engine_next and
  * tools/profile_step.cu (single code path, no duplication). Returns the
- * sampled id, or -1 when the graph path is unavailable (eager unsupported
- * for profiling). */
+ * sampled id. Looks up the slot for the live key, so cross-slot staleness
+ * is impossible by construction. Returns -1 when no slot matches (eager
+ * unsupported for profiling). */
 int qwen2_debug_replay_step(Qwen2Engine *e, int next_tok) {
-    if (!e || !e->graph_ready || next_tok < 0) return -1;
+    if (!e || next_tok < 0) return -1;
+    const uint64_t key = graph_slot_key_at(e, e->pos);
+    const int slot = graph_slot_find(e, key);
+    if (slot < 0 || !e->graph_slot_exec[slot]) return -1;
     const int vocab = e->cfg.vocab;
 
     /* SYNC copy: source is a stack parameter; an async copy could execute
      * after this function returns, reading reused stack memory. */
     cudaMemcpy(e->d_next_tok, &next_tok, sizeof(int), cudaMemcpyHostToDevice);
-    cudaGraphLaunch(e->graph_exec, e->stream);
+    cudaGraphLaunch(e->graph_slot_exec[slot], e->stream);
     cudaMemcpyAsync(e->h_sampled, e->d_out, sizeof(int),
                     cudaMemcpyDeviceToHost, e->stream);
     cudaStreamSynchronize(e->stream);                     /* read h_sampled only after sync */
@@ -7071,11 +7163,9 @@ extern "C" void qwen2_engine_enable_q8_kvcache(Qwen2Engine *e, int enable) {
     e->use_q8_kvcache = enable;
     /* Late flag flip vs graph capture: replay bakes the flash/scatter path
      * chosen at capture, so a post-capture flip is silently ignored by
-     * replay (stale path). Invalidate -> eager forever (always coherent). */
-    if (e->graph_exec) {
-        cudaGraphExecDestroy(e->graph_exec);
-        e->graph_exec = NULL;
-        e->graph_ready = 0;
+    * replay (stale path). Invalidate -> eager forever (always coherent). */
+    if (e->graph_slot_used > 0) {
+        graph_slots_drop_all(e);
         e->no_graph = 1;
         e->pending_tok = -1;
         fprintf(stderr, "[qwen2-engine] Q8 flag flipped post-capture: graph dropped, eager mode\n");
@@ -7137,10 +7227,8 @@ extern "C" void qwen2_engine_enable_q4_kvcache(Qwen2Engine *e, int enable) {
     }
     e->use_q4_kvcache = enable;
     /* Late flag flip vs graph capture: see Q8 path above. */
-    if (e->graph_exec) {
-        cudaGraphExecDestroy(e->graph_exec);
-        e->graph_exec = NULL;
-        e->graph_ready = 0;
+    if (e->graph_slot_used > 0) {
+        graph_slots_drop_all(e);
         e->no_graph = 1;
         e->pending_tok = -1;
         fprintf(stderr, "[qwen2-engine] Q4 flag flipped post-capture: graph dropped, eager mode\n");
@@ -7153,13 +7241,11 @@ void qwen2_engine_set_sampling(Qwen2Engine *e, float temp, int topk,
     (void)topk; /* Gumbel-max samples full softmax; topk reserved */
     /* Launch-set flip vs graph capture: replay bakes whether the
      * penalty/gumbel launches exist, so a post-capture flip is silently
-     * ignored by replay. Invalidate -> eager forever (always coherent). */
-    if (e->graph_exec &&
+    * ignored by replay. Invalidate -> eager forever (always coherent). */
+    if (e->graph_slot_used > 0 &&
         (((temp > 0.0f) ? 1 : 0) != ((e->sampling_temp > 0.0f) ? 1 : 0) ||
-         ((penalty > 1.0f) ? 1 : 0) != ((e->repeat_penalty > 1.0f) ? 1 : 0))) {
-        cudaGraphExecDestroy(e->graph_exec);
-        e->graph_exec = NULL;
-        e->graph_ready = 0;
+        ((penalty > 1.0f) ? 1 : 0) != ((e->repeat_penalty > 1.0f) ? 1 : 0))) {
+        graph_slots_drop_all(e);
         e->no_graph = 1;
         e->pending_tok = -1;
     }
@@ -7214,11 +7300,9 @@ extern "C" void qwen2_engine_rollback(Qwen2Engine *e, int target_pos) {
     e->pending_tok = -1;
     /* Rollback vs graph capture: replay bakes capture-time S/path and its
      * pos_inc assumes uninterrupted forward progress; a rewind leaves
-     * graph_exec stale. Destroy -> eager forever (always coherent). */
-    if (e->graph_exec) {
-        cudaGraphExecDestroy(e->graph_exec);
-        e->graph_exec = NULL;
-        e->graph_ready = 0;
+    * graph_exec stale. Destroy -> eager forever (always coherent). */
+    if (e->graph_slot_used > 0) {
+        graph_slots_drop_all(e);
         e->no_graph = 1;
         fprintf(stderr, "[qwen2-engine] rollback to %d: graph dropped, eager mode\n", target_pos);
     }
