@@ -3758,6 +3758,15 @@ static inline int split_S_fp32(int ctx, int smax) {
     if (S > smax) S = smax;
     return S;
 }
+static int unf_part(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        cached = 2;
+        const char *s = getenv("TT_UNF_PART");
+        if (s && atoi(s) >= 1 && atoi(s) <= 32) cached = atoi(s);
+    }
+    return cached;
+}
 
 /* Dual-graph slot key: FNV-1a over the host-side dispatch predicates at
  * pos, mirroring forward_layers exactly. Replay on hit only, so baked
@@ -3786,8 +3795,9 @@ static uint64_t graph_slot_key_at(const Qwen2Engine *e, int pos) {
             branch = 1; S = split_S_q(ctx, e->d_split_S_max);
         } else if (kv_use_q8_eff_at(e, pos)) {
             const int G_l = H_l / KV_l;
-            if (swa_l == 0 && G_l <= 8 && HDl <= 128 && G_l * HDl <= 512 && !no_unf) {
-                branch = 2; S = 0; /* unfused: no S baked */
+            if (swa_l == 0 && G_l <= 8 && HDl <= 128 && G_l * HDl <= 512 && !no_unf &&
+                (KV_l * unf_part() >= 16 || ctx <= 256)) {
+                branch = 2; S = unf_part(); /* unfused: PART in key, grid baked */
             } else { branch = 3; S = split_S_q(ctx, e->d_split_S_max); }
         } else {
             if (ctx > 32 && HDl <= 128) { branch = 4; S = split_S_fp32(ctx, e->d_split_S_max); }
@@ -5050,13 +5060,14 @@ static int forward_layers(Qwen2Engine *e) {
             } else if (kv_use_q8_eff(e)) {
                 const int G_l = H_l / KV_l;
                 if (swa_l == 0 && G_l <= 8 && HDl <= 128 && G_l * HDl <= 512 &&
-                    !getenv("TT_NO_UNFUSED")) {
+                    !getenv("TT_NO_UNFUSED") &&
+                    (KV_l * unf_part() >= 16 || ctx_l <= 256)) {
                     /* slice-2 unfused: bit-exact vs split, 1.4-2.0x in duel */
                     /* n comes from d_pos device-side: launch args are baked
                      * at graph capture, so a host n would go stale on replay */
-                    k_unf_qk<<<KV_l * 2, 256, 0, e->stream>>>(
+                    k_unf_qk<<<KV_l * unf_part(), 256, 0, e->stream>>>(
                         e->d_q, Kl_q8, e->d_unf_scores, e->d_pos, c->max_ctx,
-                        G_l, HDl, scale_l, 2);
+                        G_l, HDl, scale_l, unf_part());
                     k_unf_softmax<<<H_l, 256, 0, e->stream>>>(
                         e->d_unf_scores, e->d_pos, H_l);
                     k_unf_pv<<<KV_l * 2, 256, 0, e->stream>>>(
