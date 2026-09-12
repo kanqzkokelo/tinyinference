@@ -1539,6 +1539,133 @@ __global__ void k_unf_pv(const float *__restrict__ scores, const BlockQ8KV *__re
     if (gd < GD2) out[((long)(kv * G + g)) * HD + d] = acc;
 }
 
+/* Fused unfused-attn (from tools/micro_unf_fused.cu): QK + online-softmax +
+ * PV in one kernel per (kv, part), PARTials merged by k_unf_combine.
+ * Kills the ~1MB/layer global score traffic and the H-block softmax
+ * launch (3 launches -> 2, grid 16 -> 16+KV). Bit-exact vs the 3-kernel
+ * unfused path (duel maxdiff 0.00000). Gate: GD=G*HD<=256 (one (g,d)
+ * per thread, 256 threads cover GD<=256, 512 cover GD<=512); wider
+ * layers keep the unfused path.
+ * Partials reuse the d_split_* workspace (needs PART*H*(HD+2) floats,
+ * far below the S_MAX=64 worst-case sizing). Duel: 1.33x @ctx510,
+ * 1.03x @ctx2048, 1.06x qwen3-2k. */
+#define UNF_FTT 128
+__global__ void k_unf_fused(const float *__restrict__ q,
+                      const BlockQ8KV *__restrict__ Kn,
+                      const BlockQ8KV *__restrict__ Vn,
+                      float *__restrict__ p_m, float *__restrict__ p_l,
+                      float *__restrict__ p_acc,
+                      const int *__restrict__ d_pos, int cap,
+                      int G, int HD, float scale, int PART) {
+    const int n = *d_pos + 1;
+    int kv = blockIdx.x / PART;
+    int pp = blockIdx.x % PART;
+    int tid = threadIdx.x, NT = blockDim.x;
+    int bph = HD / 32;
+    int GD = G * HD;
+    int chunk = (n + PART - 1) / PART;
+    int r0 = min(n, pp * chunk), r1 = min(n, r0 + chunk);
+    __shared__ float sq[8 * 128];
+    for (int i = tid; i < G * HD; i += NT)
+        sq[i] = q[(long)(kv * G + i / HD) * HD + i % HD];
+    __shared__ half sKd[UNF_FTT * 4];
+    __shared__ unsigned sKq[UNF_FTT * 32];
+    __shared__ half sVd[UNF_FTT * 4];
+    __shared__ unsigned sVq[UNF_FTT * 32];
+    __shared__ float sP[8 * UNF_FTT];
+    int gd = tid;
+    int g = (gd < GD) ? gd / HD : 0;
+    int d = (gd < GD) ? gd % HD : 0;
+    int b_of_d = d / 32, w_of_d = (d % 32) / 4, sh = (d % 4) * 8;
+    float m = -1e30f, l = 0.f, acc = 0.f;
+    for (int t0 = r0; t0 < r1; t0 += UNF_FTT) {
+        int tact = min(UNF_FTT, r1 - t0);
+        for (int i = tid; i < tact * bph; i += NT) {
+            int tt = i / bph, b = i % bph;
+            long gi = ((long)kv * cap + t0 + tt) * bph + b;
+            sKd[tt * bph + b] = Kn[gi].d;
+            const unsigned *sk = (const unsigned *)&Kn[gi].qs[0];
+            unsigned *dk2 = sKq + ((long)tt * bph + b) * 8;
+            dk2[0]=sk[0]; dk2[1]=sk[1]; dk2[2]=sk[2]; dk2[3]=sk[3];
+            dk2[4]=sk[4]; dk2[5]=sk[5]; dk2[6]=sk[6]; dk2[7]=sk[7];
+            sVd[tt * bph + b] = Vn[gi].d;
+            const unsigned *sv = (const unsigned *)&Vn[gi].qs[0];
+            unsigned *dv2 = sVq + ((long)tt * bph + b) * 8;
+            dv2[0]=sv[0]; dv2[1]=sv[1]; dv2[2]=sv[2]; dv2[3]=sv[3];
+            dv2[4]=sv[4]; dv2[5]=sv[5]; dv2[6]=sv[6]; dv2[7]=sv[7];
+        }
+        __syncthreads();
+        for (int gt = tid; gt < G * tact; gt += NT) {
+            int gg = gt / tact, tt = gt % tact;
+            const float *qq = sq + (long)gg * HD;
+            float dot = 0.f;
+            for (int b = 0; b < bph; b++) {
+                float dk = __half2float(sKd[tt * bph + b]);
+                const unsigned *kw = sKq + ((long)tt * bph + b) * 8;
+                const float *qb = qq + b * 32;
+                for (int w = 0; w < 8; w++) {
+                    unsigned u = kw[w];
+                    const float *q4 = qb + w * 4;
+                    dot += q4[0] * ((float)((signed char)(u      )) * dk)
+                         + q4[1] * ((float)((signed char)(u >>  8)) * dk)
+                         + q4[2] * ((float)((signed char)(u >> 16)) * dk)
+                         + q4[3] * ((float)((signed char)(u >> 24)) * dk);
+                }
+            }
+            sP[(long)gg * UNF_FTT + tt] = dot * scale;
+        }
+        __syncthreads();
+        if (gd < GD) {
+            float tm = -1e30f;
+            for (int tt = 0; tt < tact; tt++) tm = fmaxf(tm, sP[(long)g * UNF_FTT + tt]);
+            float nm = fmaxf(m, tm);
+            float rs = expf(m - nm);
+            float a = acc * rs, lt = 0.f;
+            for (int tt = 0; tt < tact; tt++) {
+                float e = expf(sP[(long)g * UNF_FTT + tt] - nm);
+                float dv = __half2float(sVd[tt * bph + b_of_d]);
+                unsigned u = sVq[((long)tt * bph + b_of_d) * 8 + w_of_d];
+                a += e * ((float)((signed char)(u >> sh)) * dv);
+                lt += e;
+            }
+            acc = a; l = l * rs + lt; m = nm;
+        }
+        __syncthreads();
+    }
+    if (gd < GD) {
+        p_acc[((long)(kv * PART + pp) * G + g) * HD + d] = acc;
+        if (d == 0) {
+            p_m[(kv * PART + pp) * G + g] = m;
+            p_l[(kv * PART + pp) * G + g] = l;
+        }
+    }
+}
+// Combine PARTials: rescale by global max then normalize. One block/kv.
+__global__ void k_unf_combine(const float *__restrict__ p_m,
+                      const float *__restrict__ p_l,
+                      const float *__restrict__ p_acc,
+                      float *__restrict__ out,
+                      int G, int HD, int KV, int PART) {
+    int kv = blockIdx.x;
+    int tid = threadIdx.x;
+    int GD = G * HD;
+    int gd = tid;
+    int g = (gd < GD) ? gd / HD : 0;
+    int d = (gd < GD) ? gd % HD : 0;
+    if (gd >= GD) return;
+    float mall = -1e30f;
+    for (int pp = 0; pp < PART; pp++)
+        mall = fmaxf(mall, p_m[(kv * PART + pp) * G + g]);
+    float num = 0.f, den = 0.f;
+    for (int pp = 0; pp < PART; pp++) {
+        long hb = (kv * PART + pp) * G + g;
+        float a = expf(p_m[hb] - mall);
+        num += p_acc[hb * HD + d] * a;
+        den += p_l[hb] * a;
+    }
+    out[((long)(kv * G + g)) * HD + d] = num / den;
+}
+
 __global__ void k_fa2_q8_split(
     const float     *__restrict__ q,
     const BlockQ8KV *__restrict__ Kc_q8,
@@ -3783,6 +3910,8 @@ static uint64_t graph_slot_key_at(const Qwen2Engine *e, int pos) {
     TT_KEY_MIX(kv_use_q8_eff_at(e, pos));
     const int no_unf = getenv("TT_NO_UNFUSED") ? 1 : 0;
     TT_KEY_MIX(no_unf);
+    const int no_fus = getenv("TT_NO_FUSED_ATTN") ? 1 : 0;
+    TT_KEY_MIX(no_fus);
     const int ctx = pos;
     for (int l = 0; l < c->n_layers; l++) {
         const int H_l = e->pl_heads[l] > 0 ? e->pl_heads[l] : c->n_heads;
@@ -3797,7 +3926,10 @@ static uint64_t graph_slot_key_at(const Qwen2Engine *e, int pos) {
             const int G_l = H_l / KV_l;
             if (swa_l == 0 && G_l <= 8 && HDl <= 128 && G_l * HDl <= 512 && !no_unf &&
                 (KV_l * unf_part() >= 16 || ctx <= 256)) {
-                branch = 2; S = unf_part(); /* unfused: PART in key, grid baked */
+                /* fused (branch 7) vs 3-kernel unfused (branch 2): launch
+                 * sequences differ, so they need distinct replay slots */
+                branch = (G_l * HDl <= 512 && !no_fus) ? 7 : 2;
+                S = unf_part(); /* unfused: PART in key, grid baked */
             } else { branch = 3; S = split_S_q(ctx, e->d_split_S_max); }
         } else {
             if (ctx > 32 && HDl <= 128) { branch = 4; S = split_S_fp32(ctx, e->d_split_S_max); }
@@ -5062,9 +5194,23 @@ static int forward_layers(Qwen2Engine *e) {
                 if (swa_l == 0 && G_l <= 8 && HDl <= 128 && G_l * HDl <= 512 &&
                     !getenv("TT_NO_UNFUSED") &&
                     (KV_l * unf_part() >= 16 || ctx_l <= 256)) {
+                    /* fused online-softmax: bit-exact vs unfused, 1.33x @ctx510
+                     * in duel. n comes from d_pos device-side: launch args
+                     * are baked at graph capture, so a host n would go stale
+                     * on replay. One (g,d) per thread: 256 threads cover
+                     * GD<=256, 512 threads cover GD<=512 (qwen3-0.6b GD=448).
+                     * Static smem (~42KB) is GD-independent, under 48KB. */
+                    if (G_l * HDl <= 512 && !getenv("TT_NO_FUSED_ATTN")) {
+                        int fused_nt = (G_l * HDl <= 256) ? 256 : 512;
+                        k_unf_fused<<<KV_l * unf_part(), fused_nt, 0, e->stream>>>(
+                            e->d_q, Kl_q8, Vl_q8,
+                            e->d_split_pm, e->d_split_pl, e->d_split_pacc,
+                            e->d_pos, c->max_ctx, G_l, HDl, scale_l, unf_part());
+                        k_unf_combine<<<KV_l, G_l * HDl, 0, e->stream>>>(
+                            e->d_split_pm, e->d_split_pl, e->d_split_pacc,
+                            e->d_att, G_l, HDl, KV_l, unf_part());
+                    } else {
                     /* slice-2 unfused: bit-exact vs split, 1.4-2.0x in duel */
-                    /* n comes from d_pos device-side: launch args are baked
-                     * at graph capture, so a host n would go stale on replay */
                     k_unf_qk<<<KV_l * unf_part(), 256, 0, e->stream>>>(
                         e->d_q, Kl_q8, e->d_unf_scores, e->d_pos, c->max_ctx,
                         G_l, HDl, scale_l, unf_part());
@@ -5073,6 +5219,7 @@ static int forward_layers(Qwen2Engine *e) {
                     k_unf_pv<<<KV_l * 2, 256, 0, e->stream>>>(
                         e->d_unf_scores, Vl_q8, e->d_att, e->d_pos, c->max_ctx,
                         G_l, HDl);
+                    }
                 } else {
                     /* capture bakes eager S at capture ctx (see split_S_q) */
                     int S = split_S_q(ctx_l, e->d_split_S_max);
