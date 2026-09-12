@@ -1837,6 +1837,96 @@ __global__ void k_fa2_q8_split(
     }
 }
 
+/* Fused Q4 attn (from tools/micro_q4_fused.cu): QK + online-softmax + PV
+ * in one kernel per (kv, part), PARTials merged by k_unf_combine.
+ * Duel on llama shapes exact maxdiff 0.000000: 1.12x at ctx510,
+ * 1.28x at ctx2048 vs k_fa2_q4_split. Gate: swa==0, GD<=256.
+ * Q4 cache is t-major direct-indexed, same as the split kernel. */
+#define UNF_Q4_FTT 128
+__global__ void k_q4_fused(const float *__restrict__ q,
+                      const BlockQ4_0 *__restrict__ Kn,
+                      const BlockQ4_0 *__restrict__ Vn,
+                      float *__restrict__ p_m, float *__restrict__ p_l,
+                      float *__restrict__ p_acc,
+                      const int *__restrict__ d_pos,
+                      int H, int KV, int HD, float scale, int PART) {
+    const int n = *d_pos + 1;
+    int kv = blockIdx.x / PART;
+    int pp = blockIdx.x % PART;
+    int tid = threadIdx.x, NT = blockDim.x;
+    int G = H / KV, bph = HD / 32, GD = G * HD;
+    int chunk = (n + PART - 1) / PART;
+    int r0 = min(n, pp * chunk), r1 = min(n, r0 + chunk);
+    __shared__ float sq[8 * 128];
+    for (int i = tid; i < G * HD; i += NT)
+        sq[i] = q[(long)(kv * G + i / HD) * HD + i % HD];
+    __shared__ half sKd[UNF_Q4_FTT * 4];
+    __shared__ uint8_t sKq[UNF_Q4_FTT * 64];
+    __shared__ half sVd[UNF_Q4_FTT * 4];
+    __shared__ uint8_t sVq[UNF_Q4_FTT * 64];
+    __shared__ float sP[8 * UNF_Q4_FTT];
+    int gd = tid;
+    int g = (gd < GD) ? gd / HD : 0;
+    int d = (gd < GD) ? gd % HD : 0;
+    int b_of_d = d / 32, bd_q4 = d % 32, vbyte_q4 = bd_q4 & 15, vhi_q4 = bd_q4 >> 4;
+    float m = -1e30f, l = 0.f, acc = 0.f;
+    for (int t0 = r0; t0 < r1; t0 += UNF_Q4_FTT) {
+        int tact = min(UNF_Q4_FTT, r1 - t0);
+        for (int i = tid; i < tact * bph; i += NT) {
+            int tt = i / bph, b = i % bph;
+            long gi = ((long)(t0 + tt) * KV + kv) * bph + b;
+            const BlockQ4_0 bk = Kn[gi], bv = Vn[gi];
+            sKd[tt * bph + b] = __ushort_as_half(bk.d);
+            sVd[tt * bph + b] = __ushort_as_half(bv.d);
+            uint8_t *dk2 = sKq + ((long)tt * bph + b) * 16;
+            uint8_t *dv2 = sVq + ((long)tt * bph + b) * 16;
+            for (int j = 0; j < 16; j++) { dk2[j] = bk.qs[j]; dv2[j] = bv.qs[j]; }
+        }
+        __syncthreads();
+        for (int gt = tid; gt < G * tact; gt += NT) {
+            int gg = gt / tact, tt = gt % tact;
+            const float *qq = sq + (long)gg * HD;
+            float dot = 0.f;
+            for (int b = 0; b < bph; b++) {
+                float dk = __half2float(sKd[tt * bph + b]);
+                const uint8_t *kb = sKq + ((long)tt * bph + b) * 16;
+                const float *qb = qq + b * 32;
+                for (int j = 0; j < 16; j++) {
+                    uint8_t u = kb[j];
+                    dot += qb[j] * ((float)(u & 15) - 8.f) * dk
+                         + qb[j+16] * ((float)(u >> 4) - 8.f) * dk;
+                }
+            }
+            sP[(long)gg * UNF_Q4_FTT + tt] = dot * scale;
+        }
+        __syncthreads();
+        if (gd < GD) {
+            float tm = -1e30f;
+            for (int tt = 0; tt < tact; tt++) tm = fmaxf(tm, sP[(long)g * UNF_Q4_FTT + tt]);
+            float nm = fmaxf(m, tm);
+            float rs = expf(m - nm);
+            float a = acc * rs, lt = 0.f;
+            for (int tt = 0; tt < tact; tt++) {
+                float e = expf(sP[(long)g * UNF_Q4_FTT + tt] - nm);
+                float dv = __half2float(sVd[tt * bph + b_of_d]);
+                uint8_t u = sVq[((long)tt * bph + b_of_d) * 16 + vbyte_q4];
+                float vv = ((float)((u >> (vhi_q4 * 4)) & 15) - 8.f) * dv;
+                a += e * vv;
+                lt += e;
+            }
+            acc = a; l = l * rs + lt; m = nm;
+        }
+        __syncthreads();
+    }
+    if (gd < GD) {
+        p_acc[((long)(kv * PART + pp) * G + g) * HD + d] = acc;
+        if (d == 0) {
+            p_m[(kv * PART + pp) * G + g] = m;
+            p_l[(kv * PART + pp) * G + g] = l;
+        }
+    }
+}
+
 __global__ void k_fa2_q4_split(
     const float     *__restrict__ q,
     const BlockQ4_0 *__restrict__ Kc_q4,
@@ -3912,6 +4002,8 @@ static uint64_t graph_slot_key_at(const Qwen2Engine *e, int pos) {
     TT_KEY_MIX(no_unf);
     const int no_fus = getenv("TT_NO_FUSED_ATTN") ? 1 : 0;
     TT_KEY_MIX(no_fus);
+    const int no_fq4 = getenv("TT_NO_FUSED_Q4") ? 1 : 0;
+    TT_KEY_MIX(no_fq4);
     const int ctx = pos;
     for (int l = 0; l < c->n_layers; l++) {
         const int H_l = e->pl_heads[l] > 0 ? e->pl_heads[l] : c->n_heads;
@@ -3921,7 +4013,10 @@ static uint64_t graph_slot_key_at(const Qwen2Engine *e, int pos) {
         TT_KEY_MIX(H_l); TT_KEY_MIX(KV_l); TT_KEY_MIX(HDl); TT_KEY_MIX(swa_l);
         int branch, S;
         if (kv_use_q4_eff_at(e, pos)) {
-            branch = 1; S = split_S_q(ctx, e->d_split_S_max);
+            /* fused Q4 (branch 8) vs Q4 split (branch 1): distinct slots */
+            const int Gk = (KV_l > 0) ? H_l / KV_l : 0;
+            if (swa_l == 0 && Gk * HDl <= 256 && !no_fq4) { branch = 8; S = unf_part(); }
+            else { branch = 1; S = split_S_q(ctx, e->d_split_S_max); }
         } else if (kv_use_q8_eff_at(e, pos)) {
             const int G_l = H_l / KV_l;
             if (swa_l == 0 && G_l <= 8 && HDl <= 128 && G_l * HDl <= 512 && !no_unf &&
@@ -5173,6 +5268,18 @@ static int forward_layers(Qwen2Engine *e) {
                               : 1.0f / sqrtf((float)HDl);   /* match prior kernel arg */
             const int swa_l = e->has_pl_embd ? e->pl_swa[l] : c->tr.swa_size;
             if (kv_use_q4_eff(e)) {
+                /* fused Q4 online-softmax: exact vs split in duel, 1.12x
+                 * at ctx510 1.28x at ctx2048 on llama shapes. Narrow
+                 * layers (GD<=256, no SWA) only; others keep split. */
+                if (swa_l == 0 && (H_l / KV_l) * HDl <= 256 && !getenv("TT_NO_FUSED_Q4")) {
+                    k_q4_fused<<<KV_l * unf_part(), 256, 0, e->stream>>>(
+                        e->d_q, Kl_q4, Vl_q4,
+                        e->d_split_pm, e->d_split_pl, e->d_split_pacc,
+                        e->d_pos, H_l, KV_l, HDl, scale_l, unf_part());
+                    k_unf_combine<<<KV_l, (H_l / KV_l) * HDl, 0, e->stream>>>(
+                        e->d_split_pm, e->d_split_pl, e->d_split_pacc,
+                        e->d_att, H_l / KV_l, HDl, KV_l, unf_part());
+                } else {
                 /* capture bakes eager S at capture ctx (see split_S_q) */
                 int S = split_S_q(ctx_l, e->d_split_S_max);
                 dim3 grid_split(S, KV_l);
@@ -5189,6 +5296,7 @@ static int forward_layers(Qwen2Engine *e) {
                 k_fa2_combine<<<H_l, 32, 0, e->stream>>>(
                     e->d_split_pacc, e->d_split_pm, e->d_split_pl,
                     e->d_att, H_l, HDl, S);
+                }
             } else if (kv_use_q8_eff(e)) {
                 const int G_l = H_l / KV_l;
                 if (swa_l == 0 && G_l <= 8 && HDl <= 128 && G_l * HDl <= 512 &&
