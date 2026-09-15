@@ -54,6 +54,9 @@ and smol-2048 0.72x are the known gaps. Full table and method in
 `docs/BENCHMARKS.md`. Supported families and quant tiers are in
 `docs/SUPPORTED_FAMILIES.md`.
 
+![Decode throughput vs llama.cpp CUDA](docs/assets/decode_geomean.png)
+![Per-cell decode parity in graph mode](docs/assets/decode_parity_cells.png)
+
 ## Layout
 
 `src/` engine (loader, arch_registry, tokenizer, samplers, kvcache,
