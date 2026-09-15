@@ -99,6 +99,21 @@ $(BUILD)/spec_llm_gpu: examples/spec_llm_gpu.c src/loader_gguf.c src/arch_regist
 spec_llm_gpu: $(BUILD)/spec_llm_gpu
 
 .PHONY: spec_llm_gpu
+$(BUILD)/spec_expA_ab: tools/spec_expA_ab.c src/loader_gguf.c src/arch_registry.c src/dequant_ref.c src/cpu_backend.c src/tokenizer_bpe.c kernels/gemv_q4_cuda.cu kernels/gemv_typed.cu kernels/qwen2_cuda.cu | $(BUILD)
+	$(NVCC) -O3 $(NVCC_GENCODE) \
+	  -I$(CUDA_INC) -Iinclude -Isrc -Xcompiler "-fPIC -fopenmp" \
+	  -Xlinker -rpath=$(CURDIR)/build:$(HOME)/mmcuda/lib \
+	  -o $@ \
+	  tools/spec_expA_ab.c src/loader_gguf.c src/arch_registry.c src/dequant_ref.c src/cpu_backend.c src/tokenizer_bpe.c kernels/gemv_q4_cuda.cu kernels/gemv_typed.cu kernels/qwen2_cuda.cu \
+	  -L$(HOME)/mmcuda/lib -lcudart -lpthread -lgomp
+
+$(BUILD)/spec_expA_e2e: tools/spec_expA_e2e.c src/loader_gguf.c src/arch_registry.c src/dequant_ref.c src/cpu_backend.c src/tokenizer_bpe.c src/ngram_lookup.c kernels/gemv_q4_cuda.cu kernels/gemv_typed.cu kernels/qwen2_cuda.cu | $(BUILD)
+	$(NVCC) -O3 $(NVCC_GENCODE) \
+	  -I$(CUDA_INC) -Iinclude -Isrc -Xcompiler "-fPIC -fopenmp" \
+	  -Xlinker -rpath=$(CURDIR)/build:$(HOME)/mmcuda/lib \
+	  -o $@ \
+	  tools/spec_expA_e2e.c src/loader_gguf.c src/arch_registry.c src/dequant_ref.c src/cpu_backend.c src/tokenizer_bpe.c src/ngram_lookup.c kernels/gemv_q4_cuda.cu kernels/gemv_typed.cu kernels/qwen2_cuda.cu \
+	  -L$(HOME)/mmcuda/lib -lcudart -lpthread -lgomp
 
 # Oracle logits tool against the vendored llama.cpp build (parity fixtures).
 $(BUILD)/oracle_logits: tools/oracle_logits.c | $(BUILD)
