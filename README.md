@@ -46,9 +46,13 @@ python3 real_chat.py # ctypes live chat app (uses build/libtinytorch.so)
 
 ## Numbers
 
-Decode throughput tracks 0.55-0.82x llama.cpp CUDA on RTX 3050 4GB for
-qwen2.5-0.5b-q4_0; see `docs/BENCHMARKS.md`. Supported families and
-quant tiers: `docs/SUPPORTED_FAMILIES.md`.
+Decode throughput tracks 0.98x llama.cpp CUDA geomean in graph mode
+(0.93x eager, 26 cells) on RTX 3050 Laptop 4GB. Fleet: qwen2.5-0.5b,
+qwen3-0.6b, llama-3.2-1b, smollm2-135m, gemma-4-E2B at ctx 32/512/2048.
+Short ctx beats oracle up to 1.3x. Long ctx trails: llama-2048 0.85x
+and smol-2048 0.72x are the known gaps. Full table and method in
+`docs/BENCHMARKS.md`. Supported families and quant tiers are in
+`docs/SUPPORTED_FAMILIES.md`.
 
 ## Layout
 
