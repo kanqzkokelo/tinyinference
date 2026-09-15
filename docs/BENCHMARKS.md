@@ -6,6 +6,10 @@ graph 0.980 over 13 cells, eager 0.931 over 13 cells, overall 0.955.
 Short ctx beats oracle up to 1.3x. Known gaps: llama-2048 0.85x and
 smol-2048 0.72x. Raw per-cell jsonl lives gitignored in `data/bench/`.
 
+![Decode throughput vs llama.cpp CUDA](assets/decode_geomean.png)
+![Per-cell decode parity in graph mode](assets/decode_parity_cells.png)
+![Decode tok/s ours vs oracle](assets/decode_tps.png)
+
 | Model | Quant | Mode | Ctx | Ours tok/s | Oracle tok/s | Ratio |
 |---|---|---|---|---|---|---|
 | qwen2.5-0.5b-instruct | q4_0 | graph | 32 | 300.0 | 253.7 | 1.18 |
