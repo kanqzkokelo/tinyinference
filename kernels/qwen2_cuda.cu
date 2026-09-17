@@ -142,10 +142,14 @@ typedef struct { void *ptr; int dtype; } TTensor;
 typedef struct { char *base; size_t cap; size_t off; } WArena;
 static inline size_t w_align16(size_t n) { return (n + 15) & ~(size_t)15; }
 static size_t w_arena_claim(WArena *a, size_t n) {
-    size_t off = w_align16(a->off);
-    if (n == 0 || off + n > a->cap) return (size_t)-1;
-    a->off = off + n;
-    return off;
+    size_t aligned_off = w_align16(a->off);
+    /* Check for overflow in alignment and addition */
+    if (n == 0) return (size_t)-1;
+    if (aligned_off < a->off) return (size_t)-1; /* overflow in align */
+    if (n > SIZE_MAX - aligned_off) return (size_t)-1; /* overflow in off+n */
+    if (aligned_off + n > a->cap) return (size_t)-1;
+    a->off = aligned_off + n;
+    return aligned_off;
 }
 static size_t w_bytes_for(GGUFModel *m, const char *name) {
     GGUFTensor *t = gguf_get_tensor(m, name);
@@ -4110,8 +4114,13 @@ TTConfig tt_config_from_gguf(const GGUFModel *m, int max_ctx) {
                 c.n_kv_heads = (int)(kr / c.head_dim);
             } else {
                 /* meta present: verify against tensors, fall back to gcd */
+                /* P0 fix #1: validate n_heads <= dim before deriving head_dim */
+                if (c.n_heads > c.dim || c.n_heads <= 0) {
+                    c.dim = 0;  /* signal invalid config */
+                    return c;
+                }
                 int hd = c.dim / c.n_heads;
-                if (qr % hd != 0 || kr % hd != 0 || c.n_heads * hd != qr)
+                if (hd <= 0 || qr % hd != 0 || kr % hd != 0 || c.n_heads * hd != qr)
                     hd = (m->head_dim > 0 && qr % m->head_dim == 0 && kr % m->head_dim == 0)
                          ? m->head_dim : hd_gcd;
                 c.head_dim = hd;
@@ -4190,7 +4199,11 @@ Qwen2Engine *qwen2_engine_create(const TTConfig *cfg, GGUFModel *m) {
     /* FIRST pass: total weight bytes, 16B-aligned each. Mirrors the upload
      * pass below (same is_gpu/optional conditions) so the bump never overruns. */
     size_t w_total = 0;
-#define W_ADD_BYTES(n) do { w_total += w_align16(n); } while (0)
+#define W_ADD_BYTES(n) do { \
+    size_t _aln = w_align16(n); \
+    if (_aln > SIZE_MAX - w_total) { ABORT_CREATE(\"weight arena overflow\"); } \
+    w_total += _aln; \
+} while (0)
 #define W_ADD_TENSOR(nm) do { size_t _b = w_bytes_for(m, nm); if (_b) W_ADD_BYTES(_b); } while (0)
     W_ADD_TENSOR("token_embd.weight");
     W_ADD_TENSOR("output.weight");
@@ -4254,9 +4267,19 @@ Qwen2Engine *qwen2_engine_create(const TTConfig *cfg, GGUFModel *m) {
             e->d_out_w.ptr = NULL; e->d_out_w.dtype = -1;
         }
     }
-    if (!e->d_out_w.ptr || getenv("TT_FORCE_TIED")) {         /* tied embeddings fallback */
-        e->d_out_w = e->d_embd;
-        fprintf(stderr, "[qwen2-engine] using TIED embedding as lm head (dtype %d)\n", e->d_out_w.dtype);
+    /* P0 fix #3: only use tied embeddings if the architecture requires it */
+    if (!e->d_out_w.ptr) {
+        if (getenv("TT_FORCE_TIED")) {
+            e->d_out_w = e->d_embd;
+            fprintf(stderr, "[qwen2-engine] TT_FORCE_TIED: using TIED embedding as lm head (dtype %d)\n", e->d_out_w.dtype);
+        } else if (e->cfg.tr.tied_embeddings) {
+            e->d_out_w = e->d_embd;
+            fprintf(stderr, "[qwen2-engine] arch requires tied embeddings (dtype %d)\n", e->d_out_w.dtype);
+        } else {
+            fail("missing output.weight for untied architecture");
+            qwen2_engine_free(e);
+            return NULL;
+        }
     }
     fprintf(stderr, "[qwen2-engine] lm head dtype: %d (%s)\n", e->d_out_w.dtype,
             e->d_out_w.dtype == GGUF_TYPE_Q8_0 ? "q8_0" :
@@ -4628,6 +4651,8 @@ Qwen2Engine *qwen2_engine_create(const TTConfig *cfg, GGUFModel *m) {
         if (!e->d_pf_X || !e->d_pf_Xn || !e->d_pf_Q || !e->d_pf_K || !e->d_pf_V ||
             !e->d_pf_Att || !e->d_pf_H || !e->d_pf_G || !e->d_pf_U || !e->d_pf_pos_batch) {
             fprintf(stderr, "[qwen2-engine] pf arena alloc failed (pf_max_n=%zu)\n", pf_max_n);
+            qwen2_engine_free(e);
+            return NULL;
         }
     }
     /* If FP32 prefill flash shared memory exceeds default 48KB, opt in to dynamic shmem */
@@ -4721,10 +4746,8 @@ void qwen2_engine_free(Qwen2Engine *e) {
     if (e->d_pf_G) cudaFree(e->d_pf_G);
     if (e->d_pf_U) cudaFree(e->d_pf_U);
     if (e->d_pf_pos_batch) cudaFree(e->d_pf_pos_batch);
-    if (e->d_split_pl)   cudaFree(e->d_split_pl);
-    if (e->d_x_batch)    cudaFree(e->d_x_batch);
-    /* NOTE: individual weight ptrs point into w_arena (freed once above);
-     * freeing them here would double-free.
+    /* NOTE: d_split_pl and d_x_batch were already freed above at lines 4695/4697 */
+    /* Hybrid CPU-offload host buffers (freed only when allocated during hybrid creation) */
     if (e->h_x_buf) free(e->h_x_buf);
     if (e->h_xn_buf) free(e->h_xn_buf);
     if (e->h_q_buf) free(e->h_q_buf);
@@ -4737,7 +4760,6 @@ void qwen2_engine_free(Qwen2Engine *e) {
     if (e->h_v_stage) free(e->h_v_stage);
     if (e->h_kc) free(e->h_kc);
     if (e->h_vc) free(e->h_vc);
-    * Tracked as known limitation in PLAN_M6 M6.1. */
     for (int gi = 0; gi < TT_GRAPH_SLOTS; gi++) {
         if (e->graph_slot_exec[gi]) {
             cudaGraphExecDestroy(e->graph_slot_exec[gi]);

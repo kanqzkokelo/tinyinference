@@ -6,8 +6,16 @@
 #include <unistd.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
+#include <stdint.h>
 
 #define GGUF_MAGIC 0x46554747 // "GGUF"
+
+/* P0 fix #2: overflow-safe multiplication helper for byte-size calculations */
+static int mul_size(size_t a, size_t b, size_t *out) {
+    if (b != 0 && a > SIZE_MAX / b) return 0;
+    *out = a * b;
+    return 1;
+}
 
 static const GGUFTensor *g_dup_sort_tensors;
 static int cmp_tensor_ord(const void *a, const void *b) {
@@ -321,6 +329,15 @@ GGUFModel *gguf_load(const char *filepath) {
             numel *= t->shape[d];
         }
 
+        /* P1 fix #8: legacy quantized tensors must have numel % 32 == 0 */
+        if ((t->type == GGUF_TYPE_Q4_0 || t->type == GGUF_TYPE_Q4_1 ||
+             t->type == GGUF_TYPE_Q5_0 || t->type == GGUF_TYPE_Q5_1 ||
+             t->type == GGUF_TYPE_Q8_0) && (numel % 32 != 0)) {
+            fprintf(stderr, "[GGUF] Tensor '%s': legacy quant numel %lld not multiple of 32\n",
+                    t->name, (long long)numel);
+            goto fail;
+        }
+
         /* Block sizes per ggml-common.h (verified vs gguf-py GGML_QUANT_SIZES):
          *   q4_0: fp16 d + 16 nibble bytes            = 18 B / 32 values
          *   q4_1: fp16 d, m + 16 nibble bytes          = 20 B / 32
@@ -333,15 +350,27 @@ GGUFModel *gguf_load(const char *filepath) {
          *   q5_K/q5_K_S: ... + qh[32]                        = 176 B / 256
          *   q6_K: ql[128] + qh[64] + int8 scales[16] + fp16 d = 210 B / 256
          */
-        if (t->type == GGUF_TYPE_F32) t->size_bytes = (size_t)numel * 4;
-        else if (t->type == GGUF_TYPE_F16 || t->type == GGUF_TYPE_BF16)
-            t->size_bytes = (size_t)numel * 2;
-        else if (t->type == GGUF_TYPE_Q4_0) t->size_bytes = (size_t)(numel / 32) * 18;
-        else if (t->type == GGUF_TYPE_Q4_1) t->size_bytes = (size_t)(numel / 32) * 20;
-        else if (t->type == GGUF_TYPE_Q5_0) t->size_bytes = (size_t)(numel / 32) * 22;
-        else if (t->type == GGUF_TYPE_Q5_1) t->size_bytes = (size_t)(numel / 32) * 24;
-        else if (t->type == GGUF_TYPE_Q8_0) t->size_bytes = (size_t)(numel / 32) * 34; /* fp16 d + 32 i8 */
-        else if (t->type == GGUF_TYPE_Q2_K || t->type == GGUF_TYPE_Q3_K ||
+        /* P0 fix #2: use overflow-safe mul_size for all byte-size calculations */
+        if (t->type == GGUF_TYPE_F32) {
+            if (!mul_size((size_t)numel, 4, &t->size_bytes)) goto fail;
+        } else if (t->type == GGUF_TYPE_F16 || t->type == GGUF_TYPE_BF16) {
+            if (!mul_size((size_t)numel, 2, &t->size_bytes)) goto fail;
+        } else if (t->type == GGUF_TYPE_Q4_0) {
+            size_t nb = (size_t)(numel / 32);
+            if (!mul_size(nb, 18, &t->size_bytes)) goto fail;
+        } else if (t->type == GGUF_TYPE_Q4_1) {
+            size_t nb = (size_t)(numel / 32);
+            if (!mul_size(nb, 20, &t->size_bytes)) goto fail;
+        } else if (t->type == GGUF_TYPE_Q5_0) {
+            size_t nb = (size_t)(numel / 32);
+            if (!mul_size(nb, 22, &t->size_bytes)) goto fail;
+        } else if (t->type == GGUF_TYPE_Q5_1) {
+            size_t nb = (size_t)(numel / 32);
+            if (!mul_size(nb, 24, &t->size_bytes)) goto fail;
+        } else if (t->type == GGUF_TYPE_Q8_0) {
+            size_t nb = (size_t)(numel / 32);
+            if (!mul_size(nb, 34, &t->size_bytes)) goto fail;
+        } else if (t->type == GGUF_TYPE_Q2_K || t->type == GGUF_TYPE_Q3_K ||
                  t->type == GGUF_TYPE_Q4_K || t->type == GGUF_TYPE_Q5_K ||
                  t->type == GGUF_TYPE_Q6_K) {
             if (numel % 256 != 0) {
@@ -350,11 +379,13 @@ GGUFModel *gguf_load(const char *filepath) {
                 goto fail;
             }
             long long blocks = numel / 256;
-            if (t->type == GGUF_TYPE_Q2_K)      t->size_bytes = (size_t)(blocks * 84);
-            else if (t->type == GGUF_TYPE_Q3_K) t->size_bytes = (size_t)(blocks * 110);
-            else if (t->type == GGUF_TYPE_Q4_K) t->size_bytes = (size_t)(blocks * 144);
-            else if (t->type == GGUF_TYPE_Q5_K) t->size_bytes = (size_t)(blocks * 176);
-            else                                 t->size_bytes = (size_t)(blocks * 210);
+            size_t bsz = 0;
+            if (t->type == GGUF_TYPE_Q2_K)      bsz = 84;
+            else if (t->type == GGUF_TYPE_Q3_K) bsz = 110;
+            else if (t->type == GGUF_TYPE_Q4_K) bsz = 144;
+            else if (t->type == GGUF_TYPE_Q5_K) bsz = 176;
+            else                                bsz = 210;
+            if (!mul_size((size_t)blocks, bsz, &t->size_bytes)) goto fail;
         }
         else { // unknown dtype: hard failure, never a bogus numel fallback (audit finding 8)
             fprintf(stderr, "[GGUF] Unsupported dtype %d for tensor '%s'\n", (int)t->type, t->name);

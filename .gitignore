@@ -1,19 +1,39 @@
-build/
+```
+# Compiled and build artifacts
 *.o
+*.obj
 *.so
-__pycache__/
+*.dll
+*.exe
+*.a
 *.pyc
-.pytest_cache/
-data/
-!data/bench/
-*.gguf
-*.part
-*.incomplete
-bench/*.csv
-!bench/scoreboard_decode.csv
-oracle/
+__pycache__/
+
+# Dependencies
+node_modules/
+.venv/
+venv/
+.env
+.env.local
+.env.*
+
+# Editors
 .vscode/
 .idea/
 *.swp
 *.swo
-.DS_Store
+
+# Logs and temp files
+*.log
+*.tmp
+
+# Build directories
+build/
+dist/
+target/
+.gradle/
+.mypy_cache/
+.pytest_cache/
+coverage/
+htmlcov/
+```
