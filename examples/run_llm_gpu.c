@@ -121,6 +121,20 @@ int main(int argc, char **argv) {
             rep_penalty = (float)atof(argv[++i]);
         } else if ((strcmp(argv[i], "-m") == 0 || strcmp(argv[i], "--model") == 0) && i + 1 < argc) {
             model_path_arg = argv[++i];
+        } else if ((strcmp(argv[i], "-f") == 0 || strcmp(argv[i], "--file") == 0) && i + 1 < argc) {
+            const char *fpath = argv[++i];
+            FILE *fp = fopen(fpath, "rb");
+            if (fp) {
+                fseek(fp, 0, SEEK_END);
+                long sz = ftell(fp);
+                fseek(fp, 0, SEEK_SET);
+                char *buf = (char *)malloc(sz + 1);
+                if (buf && fread(buf, 1, sz, fp) == (size_t)sz) {
+                    buf[sz] = 0;
+                    prompt = buf; pos_arg = 1;
+                }
+                fclose(fp);
+            }
         } else if (argv[i][0] != '-') {
             if (pos_arg == 0) prompt = argv[i];
             else if (pos_arg == 1) target_tokens = atoi(argv[i]);
@@ -187,10 +201,10 @@ int main(int argc, char **argv) {
     } else {
         snprintf(formatted, sizeof(formatted), "%s", prompt);
     }
-    int prompt_tokens[16384];
+    int prompt_tokens[65536];
     int n_prompt;
     if (tok) {
-        n_prompt = bpe_encode(tok, formatted, prompt_tokens, 16384);
+        n_prompt = bpe_encode(tok, formatted, prompt_tokens, 65536);
     } else {
         /* placeholder prefill: valid ids within any vocab */
         const int smoke_ids[5] = {1, 2, 3, 4, 5};

@@ -214,9 +214,10 @@ static void fmt_gemma(abuf *b, const tt_msg *msgs, int n,
         ab_puts(b, turn_close);
         ab_puts(b, "\n");
     }
-    if (o->add_generation_prompt)
+    if (o->add_generation_prompt) {
         ab_puts(b, turn_open);
         ab_puts(b, "model\n");
+    }
 }
 
 static void fmt_llama3(abuf *b, const tt_msg *msgs, int n,

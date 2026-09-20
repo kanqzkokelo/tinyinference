@@ -38,7 +38,7 @@ static void *async_printer_worker(void *arg) {
                     memcpy(io_buf + buf_len, str, len);
                     buf_len += len;
                 } else {
-                    write(STDOUT_FILENO, io_buf, buf_len);
+                    if (write(STDOUT_FILENO, io_buf, buf_len) < 0) {}
                     buf_len = 0;
                     memcpy(io_buf + buf_len, str, len);
                     buf_len += len;
@@ -46,7 +46,7 @@ static void *async_printer_worker(void *arg) {
             }
         } else {
             if (buf_len > 0) {
-                write(STDOUT_FILENO, io_buf, buf_len);
+                if (write(STDOUT_FILENO, io_buf, buf_len) < 0) {}
                 buf_len = 0;
             }
             struct timespec req = {0, 100000}; // 0.1 ms sleep
@@ -55,7 +55,7 @@ static void *async_printer_worker(void *arg) {
     }
 
     if (buf_len > 0) {
-        write(STDOUT_FILENO, io_buf, buf_len);
+        if (write(STDOUT_FILENO, io_buf, buf_len) < 0) {}
     }
     return NULL;
 }

@@ -1616,13 +1616,16 @@ __global__ void k_unf_fused(const float *__restrict__ q,
         }
         __syncthreads();
         if (gd < GD) {
+            const float *sp_g = sP + (long)g * UNF_FTT;
             float tm = -1e30f;
-            for (int tt = 0; tt < tact; tt++) tm = fmaxf(tm, sP[(long)g * UNF_FTT + tt]);
+            #pragma unroll 4
+            for (int tt = 0; tt < tact; tt++) tm = fmaxf(tm, sp_g[tt]);
             float nm = fmaxf(m, tm);
-            float rs = expf(m - nm);
+            float rs = __expf(m - nm);
             float a = acc * rs, lt = 0.f;
+            #pragma unroll 4
             for (int tt = 0; tt < tact; tt++) {
-                float e = expf(sP[(long)g * UNF_FTT + tt] - nm);
+                float e = __expf(sp_g[tt] - nm);
                 float dv = __half2float(sVd[tt * bph + b_of_d]);
                 unsigned u = sVq[((long)tt * bph + b_of_d) * 8 + w_of_d];
                 a += e * ((float)((signed char)(u >> sh)) * dv);
@@ -1640,30 +1643,34 @@ __global__ void k_unf_fused(const float *__restrict__ q,
         }
     }
 }
-// Combine PARTials: rescale by global max then normalize. One block/kv.
+// Combine PARTials: rescale by global max then normalize. One block per head (G, KV), coalesced HD threads.
 __global__ void k_unf_combine(const float *__restrict__ p_m,
                       const float *__restrict__ p_l,
                       const float *__restrict__ p_acc,
                       float *__restrict__ out,
                       int G, int HD, int KV, int PART) {
-    int kv = blockIdx.x;
-    int tid = threadIdx.x;
-    int GD = G * HD;
-    int gd = tid;
-    int g = (gd < GD) ? gd / HD : 0;
-    int d = (gd < GD) ? gd % HD : 0;
-    if (gd >= GD) return;
+    const int g = blockIdx.x;
+    const int kv = blockIdx.y;
+    const int d = threadIdx.x;
+    if (d >= HD) return;
+
     float mall = -1e30f;
-    for (int pp = 0; pp < PART; pp++)
-        mall = fmaxf(mall, p_m[(kv * PART + pp) * G + g]);
-    float num = 0.f, den = 0.f;
     for (int pp = 0; pp < PART; pp++) {
-        long hb = (kv * PART + pp) * G + g;
-        float a = expf(p_m[hb] - mall);
+        long hb = (long)(kv * PART + pp) * G + g;
+        float mv = p_m[hb];
+        if (mv > mall) mall = mv;
+    }
+
+    float num = 0.0f, den = 0.0f;
+    #pragma unroll 4
+    for (int pp = 0; pp < PART; pp++) {
+        long hb = (long)(kv * PART + pp) * G + g;
+        float a = __expf(p_m[hb] - mall);
         num += p_acc[hb * HD + d] * a;
         den += p_l[hb] * a;
     }
-    out[((long)(kv * G + g)) * HD + d] = num / den;
+    const long out_idx = (long)(kv * G + g) * HD + d;
+    out[out_idx] = num / den;
 }
 
 __global__ void k_fa2_q8_split(
@@ -3327,7 +3334,10 @@ __global__ __launch_bounds__(256) void k_fa2_gqa64(
 /* TT_FA2_PRE dispatch: flag off or uncommon HD keeps legacy path. */
 static inline int tt_fa2_pre_on(void) {
     static int v = -1;
-    if (v < 0) v = getenv("TT_FA2_PRE") ? 1 : 0;
+    if (v < 0) {
+        const char *s = getenv("TT_FA2_PRE");
+        v = (s && !strcmp(s, "0")) ? 0 : 1;
+    }
     return v;
 }
 /* TT_FLASH_FP16 dispatch: flag off or uncommon HD keeps legacy fp32 kernel. */
@@ -3871,6 +3881,8 @@ struct Qwen2Engine {
     int   *d_n_recent;            /* valid count in ring */
     int   *d_sampling_on;         /* 0/1 flag read by kernels inside graph */
     int pending_tok;              /* sampled token not yet fed through layers */
+    int   *cached_toks;           /* Automatic prefix caching: evaluated prompt tokens */
+    int    cached_toks_len;
     /* M9 split-K flash attention workspace (long-ctx decode). Sized to
      * S=16 * max_heads * (max_hd + 2) floats in qwen2_engine_create; freed
      * in qwen2_engine_free. S=clamp(ctx/256,2,16) at launch. */
@@ -3984,6 +3996,18 @@ static int unf_part(void) {
     }
     return cached;
 }
+static inline int unf_part_for(int kv, int ctx) {
+    int part = unf_part();
+    int p_ctx = (ctx + 255) / 256;
+    if (p_ctx > part) part = p_ctx;
+    if (kv > 0 && kv * part < 16) {
+        int p = (16 + kv - 1) / kv;
+        if (p > part) part = p;
+    }
+    if (part > 32) part = 32;
+    if (part < 2) part = 2;
+    return part;
+}
 
 /* Dual-graph slot key: FNV-1a over the host-side dispatch predicates at
  * pos, mirroring forward_layers exactly. Replay on hit only, so baked
@@ -4019,12 +4043,12 @@ static uint64_t graph_slot_key_at(const Qwen2Engine *e, int pos) {
             else { branch = 1; S = split_S_q(ctx, e->d_split_S_max); }
         } else if (kv_use_q8_eff_at(e, pos)) {
             const int G_l = H_l / KV_l;
-            if (swa_l == 0 && G_l <= 8 && HDl <= 128 && G_l * HDl <= 512 && !no_unf &&
-                (KV_l * unf_part() >= 16 || ctx <= 256)) {
+            const int part = unf_part_for(KV_l, ctx);
+            if (swa_l == 0 && G_l <= 8 && HDl <= 128 && G_l * HDl <= 512 && !no_unf) {
                 /* fused (branch 7) vs 3-kernel unfused (branch 2): launch
                  * sequences differ, so they need distinct replay slots */
                 branch = (G_l * HDl <= 512 && !no_fus) ? 7 : 2;
-                S = unf_part(); /* unfused: PART in key, grid baked */
+                S = part; /* unfused: PART in key, grid baked */
             } else { branch = 3; S = split_S_q(ctx, e->d_split_S_max); }
         } else {
             if (ctx > 32 && HDl <= 128) { branch = 4; S = split_S_fp32(ctx, e->d_split_S_max); }
@@ -4528,6 +4552,8 @@ Qwen2Engine *qwen2_engine_create(const TTConfig *cfg, GGUFModel *m) {
         CK_CREATE(cudaMemcpy(e->d_sampling_on, &zero, sizeof(int), cudaMemcpyHostToDevice), "cudaMemcpy fail d_sampling_on");
     }
     cudaMalloc(&e->d_out, sizeof(int));
+    e->cached_toks = (int *)calloc((size_t)cfg->max_ctx + 1, sizeof(int));
+    e->cached_toks_len = 0;
     /* graph replay state: dual-graph slots (lazy per-dispatch capture) */
     for (int gi = 0; gi < TT_GRAPH_SLOTS; gi++) {
         e->graph_slot_exec[gi] = NULL;
@@ -4682,6 +4708,7 @@ void qwen2_engine_free(Qwen2Engine *e) {
     if (e->d_x_batch) cudaFree(e->d_x_batch);
     if (e->d_xn_batch) cudaFree(e->d_xn_batch);
     if (e->d_logits_batch) cudaFree(e->d_logits_batch);
+    if (e->cached_toks) free(e->cached_toks);
     if (e->d_recent) cudaFree(e->d_recent);
     if (e->d_n_recent) cudaFree(e->d_n_recent);
     if (e->h_sampled) cudaFreeHost(e->h_sampled);
@@ -5276,7 +5303,8 @@ static int forward_layers(Qwen2Engine *e) {
                         e->d_q, Kl_q4, Vl_q4,
                         e->d_split_pm, e->d_split_pl, e->d_split_pacc,
                         e->d_pos, H_l, KV_l, HDl, scale_l, unf_part());
-                    k_unf_combine<<<KV_l, (H_l / KV_l) * HDl, 0, e->stream>>>(
+                    dim3 grd_comb_q4(H_l / KV_l, KV_l);
+                    k_unf_combine<<<grd_comb_q4, HDl, 0, e->stream>>>(
                         e->d_split_pm, e->d_split_pl, e->d_split_pacc,
                         e->d_att, H_l / KV_l, HDl, KV_l, unf_part());
                 } else {
@@ -5299,9 +5327,9 @@ static int forward_layers(Qwen2Engine *e) {
                 }
             } else if (kv_use_q8_eff(e)) {
                 const int G_l = H_l / KV_l;
+                const int part = unf_part_for(KV_l, ctx_l);
                 if (swa_l == 0 && G_l <= 8 && HDl <= 128 && G_l * HDl <= 512 &&
-                    !getenv("TT_NO_UNFUSED") &&
-                    (KV_l * unf_part() >= 16 || ctx_l <= 256)) {
+                    !getenv("TT_NO_UNFUSED")) {
                     /* fused online-softmax: bit-exact vs unfused, 1.33x @ctx510
                      * in duel. n comes from d_pos device-side: launch args
                      * are baked at graph capture, so a host n would go stale
@@ -5310,18 +5338,19 @@ static int forward_layers(Qwen2Engine *e) {
                      * Static smem (~42KB) is GD-independent, under 48KB. */
                     if (G_l * HDl <= 512 && !getenv("TT_NO_FUSED_ATTN")) {
                         int fused_nt = (G_l * HDl <= 256) ? 256 : 512;
-                        k_unf_fused<<<KV_l * unf_part(), fused_nt, 0, e->stream>>>(
+                        k_unf_fused<<<KV_l * part, fused_nt, 0, e->stream>>>(
                             e->d_q, Kl_q8, Vl_q8,
                             e->d_split_pm, e->d_split_pl, e->d_split_pacc,
-                            e->d_pos, c->max_ctx, G_l, HDl, scale_l, unf_part());
-                        k_unf_combine<<<KV_l, G_l * HDl, 0, e->stream>>>(
+                            e->d_pos, c->max_ctx, G_l, HDl, scale_l, part);
+                        dim3 grd_comb_q8(G_l, KV_l);
+                        k_unf_combine<<<grd_comb_q8, HDl, 0, e->stream>>>(
                             e->d_split_pm, e->d_split_pl, e->d_split_pacc,
-                            e->d_att, G_l, HDl, KV_l, unf_part());
+                            e->d_att, G_l, HDl, KV_l, part);
                     } else {
                     /* slice-2 unfused: bit-exact vs split, 1.4-2.0x in duel */
-                    k_unf_qk<<<KV_l * unf_part(), 256, 0, e->stream>>>(
+                    k_unf_qk<<<KV_l * part, 256, 0, e->stream>>>(
                         e->d_q, Kl_q8, e->d_unf_scores, e->d_pos, c->max_ctx,
-                        G_l, HDl, scale_l, unf_part());
+                        G_l, HDl, scale_l, part);
                     k_unf_softmax<<<H_l, 256, 0, e->stream>>>(
                         e->d_unf_scores, e->d_pos, H_l);
                     k_unf_pv<<<KV_l * 2, 256, 0, e->stream>>>(
@@ -5437,7 +5466,7 @@ static int forward_layers(Qwen2Engine *e) {
         if (tt_profiling()) tt_prof_begin(TT_P_FFGATEUP, e->stream);
         const int act_gelu = (c->tr.act == ACT_GELU) ? 1 : 0;
         if (w->gate.dtype == GGUF_TYPE_Q4_0 && w->up.dtype == GGUF_TYPE_Q4_0
-            && !e->has_pl_embd) {   /* gemma4: force typed path until fused-GELU is validated */
+            && !e->has_pl_embd && !tt_gemv_q4_0_v4_ok(FF_l, c->dim)) {   /* gemma4: force typed path until fused-GELU is validated */
             tt_ffn_q4_0(w->gate.ptr, w->up.ptr, e->d_xn, e->d_h,
                         FF_l, c->dim, act_gelu, e->stream);
         } else {
@@ -5854,6 +5883,18 @@ static int advance(Qwen2Engine *e, int tok) {
 void qwen2_engine_reset(Qwen2Engine *e) {
     if (!e) return;
     e->pos = 0;
+    e->cached_toks_len = 0;
+    e->pending_tok = -1;
+    cudaMemcpy(e->d_pos, &e->pos, sizeof(int), cudaMemcpyHostToDevice);
+}
+
+void qwen2_engine_rewind(Qwen2Engine *e, int new_pos) {
+    if (!e) return;
+    if (new_pos < 0) new_pos = 0;
+    if (new_pos > e->pos) new_pos = e->pos;
+    e->pos = new_pos;
+    if (e->cached_toks_len > new_pos) e->cached_toks_len = new_pos;
+    e->pending_tok = -1;
     cudaMemcpy(e->d_pos, &e->pos, sizeof(int), cudaMemcpyHostToDevice);
 }
 
@@ -6144,6 +6185,39 @@ static void cublas_fp16_build(Qwen2Engine *e, GGUFModel *m) {
 
 typedef int (*tt_prefill_gemm_fn)(const void *, const float *, float *, int, int, int, cudaStream_t);
 extern "C" int tt_gemm_q8_0_prefill(const void *, const float *, float *, int, int, int, cudaStream_t);
+extern "C" int tt_gemv_q4_0_batchn(const void *, const float *, float *, int, int, int, cudaStream_t);
+
+/* P1 (2026-09-20): small-n batched GEMV.
+ * Measured (bench/micro_batchn.txt, tools/micro_batchn.cu) vs the prefill GEMM:
+ *   8-14x at n=1, 6.5-9.6x at n=2, 3.7-5.5x at n=4, 1.8-3.1x at n=8,
+ *   parity at n=16, worse at n=32 (the GEMM amortizes its weight loads over the
+ *   whole N-tile, so it wins from ~16 up). Bit-exact vs n sequential
+ *   tt_gemv_q4_0_v4 launches on all 5 shape classes tested.
+ * Threshold: TT_PF_BATCHN_N (default 12, 0 disables). */
+static int pf_batchn_maxn(void) {
+    static int v = -2;
+    if (v == -2) {
+        const char *s = getenv("TT_PF_BATCHN_N");
+        v = s ? atoi(s) : 12;
+        if (v < 0) v = 0;
+    }
+    return v;
+}
+
+/* Prefill GEMM engagement threshold. The kernel is n-independent for n<=32
+ * (cost = weight streaming), so batching beats the per-token advance() path
+ * from n=2 up (measured crossover ~12: bench/p1_ttft_ab.txt --pf-minn 2);
+ * default 2. TT_PF_MINN overrides (2..32 sensible). */
+static int pf_minn(void) {
+    static int v = -2;
+    if (v == -2) {
+        const char *s = getenv("TT_PF_MINN");
+        v = s ? atoi(s) : 2;
+        if (v < 2) v = 2;
+        if (v > 32) v = 32;
+    }
+    return v;
+}
 
 /* Route one prefill matmul by weight dtype: Q4_0 keeps the cuBLAS/Q4-GEMM
  * path, Q8_0 uses the batched Q8 GEMM, anything else keeps the per-row
@@ -6153,6 +6227,13 @@ static void prefill_gemm_dtype(Qwen2Engine *e, int l, int kind, int dtype,
         const void *w, const float *x, float *y,
         int M, int K, int n, long xrow, long yrow) {
     if (dtype == TTQ_Q4_0) {
+        /* Small-n batched GEMV first: it beats both cuBLAS (fixed-cost at
+         * small n) and the Q4 GEMM by up to 14x. Requires contiguous
+         * row-major x/y, which every call site satisfies. */
+        const int bmax = pf_batchn_maxn();
+        if (bmax > 0 && n >= 1 && n <= bmax && xrow == (long)K && yrow == (long)M &&
+            tt_gemv_q4_0_batchn(w, x, y, M, K, n, e->stream) == 0)
+            return;
         if (cublas_prefill_try(e, l, kind, x, y, M, K, n, e->stream) != 0)
             q4fn(w, x, y, M, K, n, e->stream);
     } else if (dtype == TTQ_Q8_0) {
@@ -6384,7 +6465,7 @@ int prefill_batched_gemm(Qwen2Engine *e, const int *toks, int n, float *h_x_out)
                     const long total_blocks = (long)n * blocks_per_slot;
                     k_kv_scatter_q4_0_batched<<<(total_blocks + 255)/256, 256, 0, e->stream>>>(
                         d_K, d_V, Kl_q4, Vl_q4, d_pos_batch, KV_l, HDl, c->max_ctx, n);
-                } else if (e->use_q8_kvcache && Kl_q8 && Vl_q8) {
+                } else if (e->use_q8_kvcache && Kl_q8 && Vl_q8 && kv_use_q8_eff_at(e, e->pos + n) && getenv("TT_Q8_PREFILL_FLASH")) {
                     /* Dual-write FP32 + Q8 (mirror Q4 path): hybrid decode
                      * below thresh reads FP32, so it must be populated. */
                     k_kv_scatter_batched<<<(n*kvdim_l+255)/256, 256, 0, e->stream>>>(
@@ -6421,7 +6502,7 @@ int prefill_batched_gemm(Qwen2Engine *e, const int *toks, int n, float *h_x_out)
         } else if (e->use_q4_kvcache && Kl_q4 && Vl_q4) {
             launch_prefill_flash(d_Q, Kl_f, Vl_f, d_Att,
                 n, e->pos + n, e->pos, H_l, KV_l, HDl, scale_l, swa_l, e->stream);
-        } else if (e->use_q8_kvcache && Kl_q8 && Vl_q8) {
+        } else if (e->use_q8_kvcache && Kl_q8 && Vl_q8 && kv_use_q8_eff_at(e, e->pos + n) && getenv("TT_Q8_PREFILL_FLASH")) {
             int num_q_tiles = (n + BR_PREFILL - 1) / BR_PREFILL;
             dim3 grid_pf(num_q_tiles, KV_l);
             int threads_pf = (H_l / KV_l) * 32;
@@ -6721,7 +6802,7 @@ int prefill_batched_gemm_dx(Qwen2Engine *e, const int *toks, int n, float *d_x_o
                     const long total_blocks = (long)n * blocks_per_slot;
                     k_kv_scatter_q4_0_batched<<<(total_blocks + 255)/256, 256, 0, e->stream>>>(
                         d_K, d_V, Kl_q4, Vl_q4, d_pos_batch, KV_l, HDl, c->max_ctx, n);
-                } else if (e->use_q8_kvcache && Kl_q8 && Vl_q8) {
+                } else if (e->use_q8_kvcache && Kl_q8 && Vl_q8 && kv_use_q8_eff_at(e, e->pos + n) && getenv("TT_Q8_PREFILL_FLASH")) {
                     /* Dual-write FP32 + Q8 (mirror Q4 path): hybrid decode
                      * below thresh reads FP32, so it must be populated. */
                     k_kv_scatter_batched<<<(n*kvdim_l+255)/256, 256, 0, e->stream>>>(
@@ -6757,7 +6838,7 @@ int prefill_batched_gemm_dx(Qwen2Engine *e, const int *toks, int n, float *d_x_o
         } else if (e->use_q4_kvcache && Kl_q4 && Vl_q4) {
             launch_prefill_flash(d_Q, Kl_f, Vl_f, d_Att,
                 n, e->pos + n, e->pos, H_l, KV_l, HDl, scale_l, swa_l, e->stream);
-        } else if (e->use_q8_kvcache && Kl_q8 && Vl_q8) {
+        } else if (e->use_q8_kvcache && Kl_q8 && Vl_q8 && kv_use_q8_eff_at(e, e->pos + n) && getenv("TT_Q8_PREFILL_FLASH")) {
             int num_q_tiles = (n + BR_PREFILL - 1) / BR_PREFILL;
             dim3 grid_pf(num_q_tiles, KV_l);
             int threads_pf = (H_l / KV_l) * 32;
@@ -6818,7 +6899,30 @@ int prefill_batched_gemm_dx(Qwen2Engine *e, const int *toks, int n, float *d_x_o
 
 int qwen2_engine_prefill(Qwen2Engine *e, const int *toks, int n) {
     if (!e || !toks || n <= 0) return -1;
-    if (e->pos + n > e->cfg.max_ctx) return -2;          /* context overflow */
+    if (e->pos + n > e->cfg.max_ctx) return -2;
+
+    /* Automatic Prompt Prefix Caching:
+     * When caller passes full history starting at token 0, match against cached tokens. */
+    int prefix_match = 0;
+    if (getenv("TT_PREFIX_CACHE") && e->cached_toks && e->cached_toks_len > 0 && e->pos > 0) {
+        while (prefix_match < n && prefix_match < e->cached_toks_len &&
+               toks[prefix_match] == e->cached_toks[prefix_match]) {
+            prefix_match++;
+        }
+    }
+
+    if (prefix_match > 0 && e->pos >= prefix_match) {
+        e->pos = prefix_match;
+        e->pending_tok = -1;
+        cudaMemcpy(e->d_pos, &e->pos, sizeof(int), cudaMemcpyHostToDevice);
+    } else {
+        prefix_match = 0;
+    }
+
+    if (prefix_match == n) {
+        return 0; /* Full prompt prefix already in KV cache */
+    }
+
     /* Graph replay leaves the most recently SAMPLED token unfed (the caller
      * stopped asking). Flush it through the layers so the KV cache matches
      * the eager state machine before the new prompt lands. */
@@ -6826,22 +6930,24 @@ int qwen2_engine_prefill(Qwen2Engine *e, const int *toks, int n) {
         if (advance(e, e->pending_tok)) return -3;
         e->pending_tok = -1;
     }
-    /* resync device position scalar before any forward work (sync: see advance()) */
     cudaMemcpy(e->d_pos, &e->pos, sizeof(int), cudaMemcpyHostToDevice);
-    if (n >= 32 && !e->has_pl_embd && e->cfg.tr.softcap_value == 0.0f) {
-        /* TT_CUBLAS_FP16: single large chunk (N=759 in one GEMM) for tensor
-         * occupancy; default path keeps 512-chunk behavior. */
+
+    const int rem_n = n - prefix_match;
+    const int *rem_toks = toks + prefix_match;
+    const int cur_pos = e->pos;
+
+    if (rem_n >= pf_minn() && !e->has_pl_embd && e->cfg.tr.softcap_value == 0.0f) {
         const int CHUNK_SIZE = cublas_fp16_wanted() ? 2048 : 512;
         int offset = 0;
         int failed = 0;
-        while (offset < n) {
-            int chunk_len = (offset + CHUNK_SIZE <= n) ? CHUNK_SIZE : (n - offset);
-            if (chunk_len >= 32) {
-                int rc = prefill_batched_gemm(e, toks + offset, chunk_len, NULL);
+        while (offset < rem_n) {
+            int chunk_len = (offset + CHUNK_SIZE <= rem_n) ? CHUNK_SIZE : (rem_n - offset);
+            if (chunk_len >= pf_minn()) {
+                int rc = prefill_batched_gemm(e, rem_toks + offset, chunk_len, NULL);
                 if (rc != 0) { failed = 1; break; }
             } else {
                 for (int i = 0; i < chunk_len; i++) {
-                    int rc = advance(e, toks[offset + i]);
+                    int rc = advance(e, rem_toks[offset + i]);
                     if (rc) { failed = 1; break; }
                 }
                 if (failed) break;
@@ -6850,16 +6956,24 @@ int qwen2_engine_prefill(Qwen2Engine *e, const int *toks, int n) {
         }
         if (!failed) {
             cudaStreamSynchronize(e->stream);
+            if (e->cached_toks && cur_pos + rem_n <= e->cfg.max_ctx) {
+                memcpy(e->cached_toks + cur_pos, rem_toks, (size_t)rem_n * sizeof(int));
+                e->cached_toks_len = e->pos;
+            }
             return 0;
         }
     }
-    if (tt_dispatch_log_on() && (n < 32 || e->has_pl_embd || e->cfg.tr.softcap_value != 0.0f))
-        fprintf(stderr, "[prefill] dispatch=eager N=%d\n", n);
-    for (int i = 0; i < n; i++) {
-        int rc = advance(e, toks[i]);
+    if (tt_dispatch_log_on() && (rem_n < pf_minn() || e->has_pl_embd || e->cfg.tr.softcap_value != 0.0f))
+        fprintf(stderr, "[prefill] dispatch=eager N=%d (skip=%d)\n", rem_n, prefix_match);
+    for (int i = 0; i < rem_n; i++) {
+        int rc = advance(e, rem_toks[i]);
         if (rc) return rc;
     }
     cudaStreamSynchronize(e->stream);
+    if (e->cached_toks && cur_pos + rem_n <= e->cfg.max_ctx) {
+        memcpy(e->cached_toks + cur_pos, rem_toks, (size_t)rem_n * sizeof(int));
+        e->cached_toks_len = e->pos;
+    }
     return 0;
 }
 
@@ -7350,8 +7464,16 @@ int qwen2_engine_next(Qwen2Engine *e) {
 int qwen2_debug_replay_step(Qwen2Engine *e, int next_tok) {
     if (!e || next_tok < 0) return -1;
     const uint64_t key = graph_slot_key_at(e, e->pos);
-    const int slot = graph_slot_find(e, key);
-    if (slot < 0 || !e->graph_slot_exec[slot]) return -1;
+    int slot = graph_slot_find(e, key);
+    if (slot < 0) {
+        if (qwen2_engine_graph_capture(e, key) == 0) {
+            slot = graph_slot_find(e, key);
+        }
+    }
+    if (slot < 0 || !e->graph_slot_exec[slot]) {
+        if (advance(e, next_tok)) return -4;
+        return sample_eager(e);
+    }
     const int vocab = e->cfg.vocab;
 
     /* SYNC copy: source is a stack parameter; an async copy could execute

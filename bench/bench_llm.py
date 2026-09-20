@@ -284,13 +284,26 @@ def run_engine_once(
     else:
         env.pop("TT_NO_GRAPH", None)
 
-    cmd = [
-        str(ROOT / "build" / "run_llm_gpu"),
-        "-m",
-        str(model_path),
-        prompt,
-        str(gen_tokens),
-    ]
+    if len(prompt) > 8192:
+        pfile = "/tmp/prompt_bench.txt"
+        with open(pfile, "w") as f:
+            f.write(prompt)
+        cmd = [
+            str(ROOT / "build" / "run_llm_gpu"),
+            "-m",
+            str(model_path),
+            "-f",
+            pfile,
+            str(gen_tokens),
+        ]
+    else:
+        cmd = [
+            str(ROOT / "build" / "run_llm_gpu"),
+            "-m",
+            str(model_path),
+            prompt,
+            str(gen_tokens),
+        ]
 
     r = subprocess.run(
         cmd,
@@ -369,16 +382,28 @@ def run_oracle_once(
     if not prompt or not prompt.strip():
         raise ValueError("Refusing to invoke oracle llama-cli with empty prompt (known hang)")
 
+    if len(prompt) > 8192:
+        pfile = "/tmp/prompt_bench_oracle.txt"
+        with open(pfile, "w") as f:
+            f.write(prompt)
+        prompt_args = ["-f", pfile]
+    else:
+        prompt_args = ["-p", prompt]
+
+    kv_type = "q8_0" if "q8_0" in str(model_path).lower() else "q4_0"
     cmd = [
         oracle_bin,
         "-m",
         str(model_path),
-        "-p",
-        prompt,
+        *prompt_args,
         "-n",
         str(gen_tokens),
         "-c",
         str(ctx_cap),
+        "-ctk",
+        kv_type,
+        "-ctv",
+        kv_type,
         "-st",
         "--no-warmup",
         "--temp",
@@ -491,7 +516,7 @@ def benchmark_case(
     raw_prompt: bool = False,
 ) -> Dict[str, Any]:
     prompt = make_prompt_for_ctx(target_ctx, custom_prompt)
-    ctx_cap = max(1024, target_ctx + gen_tokens + 256)
+    ctx_cap = max(1024, int(target_ctx * 1.25) + gen_tokens + 512)
     row_start = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     power = get_power_info()
 
@@ -622,7 +647,7 @@ def write_markdown(results: List[Dict[str, Any]], out_path: Path, meta: Dict[str
             orc_dec = r["oracle"]["decode_tok_s"]["median"]
             orc_pf = r["oracle"]["prefill_tok_s"]["median"]
             ratio = r["ratio_decode_tok_s"]
-            ratio_str = f"**{ratio:.3f}x**"
+            ratio_str = f"**{ratio:.3f}x**" if ratio is not None else "—"
             all_ratios.append(ratio)
             if mode == "graph":
                 ratios_graph.append(ratio)

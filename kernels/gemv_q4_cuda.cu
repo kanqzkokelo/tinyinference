@@ -347,16 +347,16 @@ __global__ void k_logits_q4_0_v4(const BlockQ4_0 *__restrict__ W,
         const float4 *x4 = (const float4 *)(x + b * 32);
 #pragma unroll
         for (int k = 0; k < 4; k++) {
-            const uint32_t la = rw0[a0 + k];
-            const uint32_t lb = rw1[a0 + k];
-            const uint32_t lc = rw2[a0 + k];
-            const uint32_t ld = rw3[a0 + k];
-            const uint32_t va = sh ? __byte_perm(la, rw0[a0 + k + 1], 0x5432) : la;
-            const uint32_t vb = sh ? __byte_perm(lb, rw1[a0 + k + 1], 0x5432) : lb;
-            const uint32_t vc = sh ? __byte_perm(lc, rw2[a0 + k + 1], 0x5432) : lc;
-            const uint32_t vd = sh ? __byte_perm(ld, rw3[a0 + k + 1], 0x5432) : ld;
-            const float4 xa = x4[k];
-            const float4 xb = x4[k + 4];
+            const uint32_t la = __ldg(rw0 + a0 + k);
+            const uint32_t lb = __ldg(rw1 + a0 + k);
+            const uint32_t lc = __ldg(rw2 + a0 + k);
+            const uint32_t ld = __ldg(rw3 + a0 + k);
+            const uint32_t va = sh ? __byte_perm(la, __ldg(rw0 + a0 + k + 1), 0x5432) : la;
+            const uint32_t vb = sh ? __byte_perm(lb, __ldg(rw1 + a0 + k + 1), 0x5432) : lb;
+            const uint32_t vc = sh ? __byte_perm(lc, __ldg(rw2 + a0 + k + 1), 0x5432) : lc;
+            const uint32_t vd = sh ? __byte_perm(ld, __ldg(rw3 + a0 + k + 1), 0x5432) : ld;
+            const float4 xa = __ldg(&x4[k]);
+            const float4 xb = __ldg(&x4[k + 4]);
             // row0
             s0 += (float)((int)(va         & 0xFu) - 8) * da * xa.x;
             s0 += (float)((int)((va >>  4) & 0xFu) - 8) * da * xb.x;
@@ -679,16 +679,16 @@ __global__ void k_gemv_q4_0_v4(const BlockQ4_0 *__restrict__ W,
         const float4 *x4 = (const float4 *)(x + b * 32);
 #pragma unroll
         for (int k = 0; k < 4; k++) {
-            const uint32_t la = rw0[a0 + k];
-            const uint32_t lb = rw1[a0 + k];
-            const uint32_t lc = rw2[a0 + k];
-            const uint32_t ld = rw3[a0 + k];
-            const uint32_t va = sh ? __byte_perm(la, rw0[a0 + k + 1], 0x5432) : la;
-            const uint32_t vb = sh ? __byte_perm(lb, rw1[a0 + k + 1], 0x5432) : lb;
-            const uint32_t vc = sh ? __byte_perm(lc, rw2[a0 + k + 1], 0x5432) : lc;
-            const uint32_t vd = sh ? __byte_perm(ld, rw3[a0 + k + 1], 0x5432) : ld;
-            const float4 xa = x4[k];
-            const float4 xb = x4[k + 4];
+            const uint32_t la = __ldg(rw0 + a0 + k);
+            const uint32_t lb = __ldg(rw1 + a0 + k);
+            const uint32_t lc = __ldg(rw2 + a0 + k);
+            const uint32_t ld = __ldg(rw3 + a0 + k);
+            const uint32_t va = sh ? __byte_perm(la, __ldg(rw0 + a0 + k + 1), 0x5432) : la;
+            const uint32_t vb = sh ? __byte_perm(lb, __ldg(rw1 + a0 + k + 1), 0x5432) : lb;
+            const uint32_t vc = sh ? __byte_perm(lc, __ldg(rw2 + a0 + k + 1), 0x5432) : lc;
+            const uint32_t vd = sh ? __byte_perm(ld, __ldg(rw3 + a0 + k + 1), 0x5432) : ld;
+            const float4 xa = __ldg(&x4[k]);
+            const float4 xb = __ldg(&x4[k + 4]);
             s0 += (float)((int)(va         & 0xFu) - 8) * da * xa.x;
             s0 += (float)((int)((va >>  4) & 0xFu) - 8) * da * xb.x;
             s0 += (float)((int)((va >>  8) & 0xFu) - 8) * da * xa.y;
@@ -2193,16 +2193,16 @@ __global__ void k_gemv_q4_0_qkv(const BlockQ4_0 *__restrict__ Wq,
         const float4 *x4 = (const float4 *)(x + b * 32);
 #pragma unroll
         for (int k = 0; k < 4; k++) {
-            const uint32_t la = rw0[a0 + k];
-            const uint32_t lb = rw1[a0 + k];
-            const uint32_t lc = rw2[a0 + k];
-            const uint32_t ld = rw3[a0 + k];
-            const uint32_t va = sh ? __byte_perm(la, rw0[a0 + k + 1], 0x5432) : la;
-            const uint32_t vb = sh ? __byte_perm(lb, rw1[a0 + k + 1], 0x5432) : lb;
-            const uint32_t vc = sh ? __byte_perm(lc, rw2[a0 + k + 1], 0x5432) : lc;
-            const uint32_t vd = sh ? __byte_perm(ld, rw3[a0 + k + 1], 0x5432) : ld;
-            const float4 xa = x4[k];
-            const float4 xb = x4[k + 4];
+            const uint32_t la = __ldg(rw0 + a0 + k);
+            const uint32_t lb = __ldg(rw1 + a0 + k);
+            const uint32_t lc = __ldg(rw2 + a0 + k);
+            const uint32_t ld = __ldg(rw3 + a0 + k);
+            const uint32_t va = sh ? __byte_perm(la, __ldg(rw0 + a0 + k + 1), 0x5432) : la;
+            const uint32_t vb = sh ? __byte_perm(lb, __ldg(rw1 + a0 + k + 1), 0x5432) : lb;
+            const uint32_t vc = sh ? __byte_perm(lc, __ldg(rw2 + a0 + k + 1), 0x5432) : lc;
+            const uint32_t vd = sh ? __byte_perm(ld, __ldg(rw3 + a0 + k + 1), 0x5432) : ld;
+            const float4 xa = __ldg(&x4[k]);
+            const float4 xb = __ldg(&x4[k + 4]);
             s0 += (float)((int)(va         & 0xFu) - 8) * da * xa.x;
             s0 += (float)((int)((va >>  4) & 0xFu) - 8) * da * xb.x;
             s0 += (float)((int)((va >>  8) & 0xFu) - 8) * da * xa.y;
@@ -2976,3 +2976,157 @@ int tt_gemv_q4_1_v4_res(const void *dW, const float *dx, const float *res,
     return (int)cudaGetLastError();
 }
 } /* extern C q4_1_v4 */
+
+/* ===================================================================
+ * P1 (2026-09-20): batch-N q4_0 GEMV — weights streamed ONCE for N tokens.
+ *
+ * Why this exists (measured, bench/prefill_smalln.txt):
+ *   - k_gemv_q4_0_batch4 runs at 32 GB/s (M=2048 K=2048: 73.7us for 4 tokens)
+ *     while single-token V4 hits ~102 GB/s (23us). Root cause: batch4 stages
+ *     all 4 X vectors in shared memory and reads them as sx4_t[x_off + k] with
+ *     x_off = b*8, b = lane + 32*i -> every lane in the warp touches the same
+ *     banks (128 B apart) => 32-way smem bank conflict per X access.
+ *   - The batched prefill GEMM (k_gemm_q4_0_prefill / wmma) runs at 9.4-12.5
+ *     GB/s effective weight bandwidth (M=8192 K=2048: 9.44 MB in 1002us). Its
+ *     cost is N-independent for N<=32, so batching is free, but the loader
+ *     (`if (tid < 64)`, one scattered 18-byte row per thread at 1152 B stride)
+ *     is uncoalesced.
+ *
+ * This kernel keeps V4's coalesced weight streaming (lane b with b += 32 covers
+ * 32 consecutive 18-byte blocks = 576 contiguous bytes of ONE row) and adds a
+ * register-resident token dimension; X is read per (block, token) with __ldg,
+ * so there is no shared memory and no bank conflicts.
+ *
+ * Contract (same as V4): K % 32 == 0, (K/32) even, M % 4 == 0, M > 0.
+ * Bit-exact vs N sequential tt_gemv_q4_0_v4 launches: identical per-term
+ * expression order and identical per-accumulator addition order.
+ * =================================================================== */
+
+/* Add the 8 q4_0 terms of one 32-element block to accumulator `s`, exactly as
+ * k_gemv_q4_0_v4 does (same terms, same order, same rounding). */
+__device__ __forceinline__ void q4_acc8(float &s, uint32_t v, float d,
+                                        float4 xa, float4 xb) {
+    s += (float)((int)( v         & 0xFu) - 8) * d * xa.x;
+    s += (float)((int)((v >>  4)  & 0xFu) - 8) * d * xb.x;
+    s += (float)((int)((v >>  8)  & 0xFu) - 8) * d * xa.y;
+    s += (float)((int)((v >> 12)  & 0xFu) - 8) * d * xb.y;
+    s += (float)((int)((v >> 16)  & 0xFu) - 8) * d * xa.z;
+    s += (float)((int)((v >> 20)  & 0xFu) - 8) * d * xb.z;
+    s += (float)((int)((v >> 24)  & 0xFu) - 8) * d * xa.w;
+    s += (float)((int)( v >>  28)        - 8) * d * xb.w;
+}
+
+template <int NR>
+__global__ void k_gemv_q4_0_batchn(const BlockQ4_0 *__restrict__ W,
+                                   const float *__restrict__ X,   /* [NR,K] */
+                                   float *__restrict__ Y,         /* [NR,M] */
+                                   int M, int K) {
+    const int row0 = (blockIdx.x * blockDim.y + threadIdx.y) * 4;
+    if (row0 >= M) return;
+    const int row1 = row0 + 1, row2 = row0 + 2, row3 = row0 + 3;
+    const int lane = threadIdx.x;
+    const int nb = K / 32;
+
+    const uint32_t *rw0 = (const uint32_t *)((const char *)W + (long)row0 * nb * 18);
+    const uint32_t *rw1 = (const uint32_t *)((const char *)W + (long)row1 * nb * 18);
+    const uint32_t *rw2 = (const uint32_t *)((const char *)W + (long)row2 * nb * 18);
+    const uint32_t *rw3 = (const uint32_t *)((const char *)W + (long)row3 * nb * 18);
+
+    float s[4][NR];
+    #pragma unroll
+    for (int r = 0; r < 4; r++)
+        #pragma unroll
+        for (int t = 0; t < NR; t++) s[r][t] = 0.0f;
+
+    for (int b = lane; b < nb; b += 32) {
+        const int wsc = (18 * b) >> 2;
+        const unsigned short d16a = (unsigned short)
+            (((18 * b) & 2) ? (rw0[wsc] >> 16) : (rw0[wsc] & 0xFFFFu));
+        const unsigned short d16b = (unsigned short)
+            (((18 * b) & 2) ? (rw1[wsc] >> 16) : (rw1[wsc] & 0xFFFFu));
+        const unsigned short d16c = (unsigned short)
+            (((18 * b) & 2) ? (rw2[wsc] >> 16) : (rw2[wsc] & 0xFFFFu));
+        const unsigned short d16d = (unsigned short)
+            (((18 * b) & 2) ? (rw3[wsc] >> 16) : (rw3[wsc] & 0xFFFFu));
+        const float da = __half2float(__ushort_as_half(d16a));
+        const float db = __half2float(__ushort_as_half(d16b));
+        const float dc = __half2float(__ushort_as_half(d16c));
+        const float dd = __half2float(__ushort_as_half(d16d));
+        const int a0 = (18 * b + 2) >> 2;
+        const int sh = (18 * b + 2) & 2;
+
+        #pragma unroll
+        for (int k = 0; k < 4; k++) {
+            const uint32_t la = __ldg(rw0 + a0 + k);
+            const uint32_t lb = __ldg(rw1 + a0 + k);
+            const uint32_t lc = __ldg(rw2 + a0 + k);
+            const uint32_t ld = __ldg(rw3 + a0 + k);
+            const uint32_t va = sh ? __byte_perm(la, __ldg(rw0 + a0 + k + 1), 0x5432) : la;
+            const uint32_t vb = sh ? __byte_perm(lb, __ldg(rw1 + a0 + k + 1), 0x5432) : lb;
+            const uint32_t vc = sh ? __byte_perm(lc, __ldg(rw2 + a0 + k + 1), 0x5432) : lc;
+            const uint32_t vd = sh ? __byte_perm(ld, __ldg(rw3 + a0 + k + 1), 0x5432) : ld;
+
+            #pragma unroll
+            for (int t = 0; t < NR; t++) {
+                /* X row t, block b: 32 floats = 8 float4, contiguous. */
+                const float4 *x4 = (const float4 *)(X + (size_t)t * K + (size_t)b * 32);
+                const float4 xa = __ldg(&x4[k]);
+                const float4 xb = __ldg(&x4[k + 4]);
+                q4_acc8(s[0][t], va, da, xa, xb);
+                q4_acc8(s[1][t], vb, db, xa, xb);
+                q4_acc8(s[2][t], vc, dc, xa, xb);
+                q4_acc8(s[3][t], vd, dd, xa, xb);
+            }
+        }
+    }
+
+    #pragma unroll
+    for (int t = 0; t < NR; t++) {
+        const float r0 = warp_reduce_sum(s[0][t]);
+        const float r1 = warp_reduce_sum(s[1][t]);
+        const float r2 = warp_reduce_sum(s[2][t]);
+        const float r3 = warp_reduce_sum(s[3][t]);
+        if (lane == 0) {
+            float *yt = Y + (size_t)t * M;
+            yt[row0] = r0;
+            if (row1 < M) yt[row1] = r1;
+            if (row2 < M) yt[row2] = r2;
+            if (row3 < M) yt[row3] = r3;
+        }
+    }
+}
+
+extern "C" {
+
+/* Batch-N q4_0 GEMV: Y[N,M] = X[N,K] * W[M,K]^T.
+ * Chunks N into 4/2/1 so any N >= 1 works (no padding, so a prefill caller
+ * never writes duplicate tokens into KV slots).
+ * Returns 0 on success, -1 on contract violation. */
+int tt_gemv_q4_0_batchn(const void *dW, const float *dX, float *dY,
+                        int M, int K, int N, cudaStream_t stream) {
+    if (!dW || !dX || !dY || N <= 0) return -1;
+    const int nb = K / 32;
+    if ((K & 31) != 0 || (nb & 1) != 0 || (M & 3) != 0 || M <= 0) return -1;
+    const BlockQ4_0 *W = (const BlockQ4_0 *)dW;
+    dim3 blk(32, 8, 1);                  /* 8 warps x 4 rows = 32 rows/CTA */
+    dim3 grd((M + 31) / 32, 1, 1);
+    int done = 0;
+    while (done < N) {
+        /* Valid NR instantiations are only 4/2/1, so decompose greedily:
+         * take 4s, then a 2 if the remainder allows it, else 1s. A naive
+         * "rem>=4 ? 4 : rem" is WRONG here: for rem==3 it launches <1>,
+         * advances only 1, and silently leaves 2 output rows stale/zero.
+         * (caught by gate m61, 2026-09-20: N=3,5,6,7,...). */
+        const int rem = N - done;
+        const int nr = (rem >= 4) ? 4 : (rem == 3 ? 2 : rem);
+        const float *Xp = dX + (size_t)done * K;
+        float *Yp = dY + (size_t)done * M;
+        if (nr == 4)      k_gemv_q4_0_batchn<4><<<grd, blk, 0, stream>>>(W, Xp, Yp, M, K);
+        else if (nr == 2) k_gemv_q4_0_batchn<2><<<grd, blk, 0, stream>>>(W, Xp, Yp, M, K);
+        else              k_gemv_q4_0_batchn<1><<<grd, blk, 0, stream>>>(W, Xp, Yp, M, K);
+        done += nr;
+    }
+    return (int)cudaGetLastError();
+}
+
+} /* extern C batchn */

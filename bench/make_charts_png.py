@@ -14,7 +14,7 @@ SHORT = {'qwen2.5-0.5b-instruct': 'qwen2.5-0.5b', 'smollm2-135m-instruct': 'smol
 def load():
     rows = list(csv.DictReader(open(CSV)))
     for r in rows:
-        r['ratio'] = float(r['ratio']); r['ours'] = float(r['ours_tg_tps']); r['oracle'] = float(r['oracle_tg_tps'])
+        r['ratio'] = float(r['ratio']) if r.get('ratio') and r['ratio'] != 'None' else (float(r['ours_tg_tps']) / float(r['oracle_tg_tps']) if float(r.get('oracle_tg_tps', 0)) > 0 else 1.0); r['ours'] = float(r['ours_tg_tps']); r['oracle'] = float(r['oracle_tg_tps'])
         r['ctx'] = int(r['ctx']); r['short'] = SHORT.get(r['model'], r['model'])
         r['cell'] = '%s ctx%d %s' % (r['short'], r['ctx'], r['quant'])
     return rows

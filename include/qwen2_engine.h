@@ -148,6 +148,7 @@ int prefill_batched_gemm(Qwen2Engine *e, const int *toks, int n, float *h_x_out)
 int prefill_batched_gemm_dx(Qwen2Engine *e, const int *toks, int n, float *d_x_out);
 
 void qwen2_engine_reset(Qwen2Engine *e);
+void qwen2_engine_rewind(Qwen2Engine *e, int new_pos);
 void qwen2_engine_free(Qwen2Engine *e);
 
 /* Qwen2Engine batched buffers (device) - must match kernels/qwen2_cuda.cu struct */

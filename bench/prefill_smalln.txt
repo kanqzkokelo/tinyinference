@@ -1,0 +1,52 @@
+# Small-N prefill micro — measured 2026-09-20 (P0)
+# tool: tools/micro_prefill_smalln.cu (ns extended to 1,2,4,8,16,32)
+# build: nvcc -O3 -gencode arch=compute_86,code=sm_86 -I$CUDA_INC -Iinclude \
+#          -Xcompiler -fPIC -o build/micro_prefill_smalln \
+#          tools/micro_prefill_smalln.cu kernels/gemv_q4_cuda.cu kernels/gemv_typed.cu \
+#          -L$HOME/mmcuda/lib -lcudart -lpthread -lm
+# gpu: RTX 3050 Laptop 4GB (sm_86), idle (40C, 15MiB used, ninja host build running)
+# method: 10 warmup + 30 timed iters, best-of, per-iter CUDA events.
+# weights: Q4_0, all-ones fabric (cudaMemset 0x11)
+#
+# M=8192 K=2048 N=1 cudacore_us=868.4 wmma_us=724.0
+# M=8192 K=2048 N=2 cudacore_us=1000.4 wmma_us=725.0
+# M=8192 K=2048 N=4 cudacore_us=1012.7 wmma_us=744.4
+# M=8192 K=2048 N=8 cudacore_us=1015.7 wmma_us=730.0
+# M=8192 K=2048 N=16 cudacore_us=1001.5 wmma_us=755.7
+# M=8192 K=2048 N=32 cudacore_us=1002.5 wmma_us=757.8
+# M=2048 K=8192 N=1 cudacore_us=1152.9 wmma_us=777.3
+# M=2048 K=8192 N=2 cudacore_us=1098.7 wmma_us=769.3
+# M=2048 K=8192 N=4 cudacore_us=1085.3 wmma_us=768.0
+# M=2048 K=8192 N=8 cudacore_us=1118.2 wmma_us=809.1
+# M=2048 K=8192 N=16 cudacore_us=1063.8 wmma_us=820.2
+# M=2048 K=8192 N=32 cudacore_us=1071.1 wmma_us=900.1
+# B4 M=8192 K=2048 seq4_us=292.9 b4_us=286.7 rc=0 gbps=32.9 speedup=1.02
+# B4 M=2048 K=2048 seq4_us=92.2 b4_us=73.7 rc=0 gbps=32.0 speedup=1.25
+# B4 M=2048 K=8192 seq4_us=292.9 b4_us=-1.0 rc=1 gbps=-1.0 speedup=-1.00
+#
+# --- findings ---
+# 1. Prefill GEMM cost is N-INDEPENDENT from N=1 to N=32 (8182x2048: 868us at
+#    N=1 vs 1002us at N=32). Batching itself is free; the fixed cost is
+#    streaming the weight tile, and that streaming is slow.
+# 2. Effective weight bandwidth: M=8192 K=2048 Q4_0 = 8192*(2048/32)*18 = 9.44MB
+#    -> 9.44MB/1002us = 9.4 GB/s (cudacore), 12.5 GB/s (wmma).
+#    Compare our own GEMV V4 at similar shapes: 99.75 GB/s FFN M=4864 K=896,
+#    174 GB/s LM-head (bench/micro_gemv_rows.txt). The prefill GEMM path runs at
+#    ~10% of the bandwidth our GEMV kernels already achieve.
+#    => This, not the n<32 threshold, is the prefill defect, and it also caps
+#       long-ctx prefill (engine 893 tok/s at ctx2048 vs oracle 11808).
+# 3. batch4 GEMV is NOT bandwidth-bound either: M=2048 K=2048 single-token V4
+#    costs ~23us = ~100 GB/s, while batch4 does 4 tokens in 73.7us = 32 GB/s.
+#    Ideal batch4 (weights streamed once) would be ~23us for 4 tokens.
+# 4. batch4 FAILS (rc=1) at M=2048 K=8192 — the llama/qwen FFN down-projection
+#    shape class. The K=8192 case needs the K-tiled variant (see the kt2 comment
+#    at kernels/gemv_q4_cuda.cu:2664-2670); the plain batch4 does not fit sm_86
+#    shared memory. So the spec-verify path cannot currently serve K>=8192 ops.
+#
+# --- consequence for the plan ---
+# P1 becomes "make a batch-N GEMV that streams weights once at GEMV bandwidth",
+# not "lower the n<32 threshold". Lowering the threshold to 2 is a strict
+# improvement (cost is N-independent, so N=8..31 batched beats the sequential
+# per-token path) but only ~1.5-1.9x. Fixing batch4 to ~100 GB/s is worth ~3x
+# on verify and unlocks a batch-N prefill at ~1800 tok/s for small N
+# (vs 430 tok/s measured at N=16 sequential, 1322 at N=32 GEMM).

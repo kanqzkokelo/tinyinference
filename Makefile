@@ -118,10 +118,10 @@ $(BUILD)/spec_expA_e2e: tools/spec_expA_e2e.c src/loader_gguf.c src/arch_registr
 # Oracle logits tool against the vendored llama.cpp build (parity fixtures).
 $(BUILD)/oracle_logits: tools/oracle_logits.c | $(BUILD)
 	gcc -O2 -Wno-deprecated-declarations \
-	  -I oracle/llama.cpp/include -I oracle/llama.cpp/ggml/include \
+	  -I /home/mitesh/Storage/llama.cpp/include -I /home/mitesh/Storage/llama.cpp/ggml/include \
 	  -o $@ tools/oracle_logits.c \
-	  -L oracle/llama.cpp/build/bin -lllama \
-	  -Wl,-rpath=$(CURDIR)/oracle/llama.cpp/build/bin
+	  -L /home/mitesh/Storage/llama.cpp/build_cuda/bin -lllama \
+	  -Wl,-rpath=/home/mitesh/Storage/llama.cpp/build_cuda/bin
 
 oracle_logits: $(BUILD)/oracle_logits
 
