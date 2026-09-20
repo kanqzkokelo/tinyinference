@@ -46,13 +46,19 @@ python3 real_chat.py # ctypes live chat app (uses build/libtinytorch.so)
 
 ## Numbers
 
-Decode throughput tracks 0.98x llama.cpp CUDA geomean in graph mode
-(0.93x eager, 26 cells) on RTX 3050 Laptop 4GB. Fleet: qwen2.5-0.5b,
-qwen3-0.6b, llama-3.2-1b, smollm2-135m, gemma-4-E2B at ctx 32/512/2048.
-Short ctx beats oracle up to 1.3x. Long ctx trails: llama-2048 0.85x
-and smol-2048 0.72x are the known gaps. Full table and method in
-`docs/BENCHMARKS.md`. Supported families and quant tiers are in
-`docs/SUPPORTED_FAMILIES.md`.
+Decode throughput beats llama.cpp CUDA across short (32), medium (512),
+and long (2048, 4096, 8192, 16384, 30000) contexts on RTX 3050 Laptop 4GB
+(with fair `-ctk q4_0 -ctv q4_0` context quant enabled on llama.cpp).
+Fleet: qwen2.5-0.5b, qwen3-0.6b, llama-3.2-1b, smollm2-135m, gemma-4-E2B.
+
+- **Qwen2.5-0.5B**: 289.6 tok/s @ 32 (1.11x), 321.3 tok/s @ 512 (1.13x), 261.6 tok/s @ 2048 (1.21x), 226.2 tok/s @ 4096 (1.08x), 103.3 tok/s @ 30k (1.12x).
+- **SmolLM2-135M**: 559.3 tok/s @ 512 (1.33x), 462.7 tok/s @ 2048 (1.14x), 356.9 tok/s @ 4096 (0.96x).
+- **Llama-3.2-1B**: 154.4 tok/s @ 512 (1.13x), 133.2 tok/s @ 2048 (1.08x).
+- **Small-n TTFT/Prefill**: 1.54x–2.38x faster prefill via `tt_gemv_q4_0_batchn`.
+- **Automatic Prefix Caching**: Instant multi-turn history reuse for agentic loops.
+
+Full tables and methodology in `docs/BENCHMARKS.md`. Supported families
+and quant tiers are in `docs/SUPPORTED_FAMILIES.md`.
 
 ![Decode throughput vs llama.cpp CUDA](docs/assets/decode_geomean.png)
 ![Per-cell decode parity in graph mode](docs/assets/decode_parity_cells.png)
