@@ -237,6 +237,16 @@ def make_prompt_for_ctx(target_ctx: int, custom_prompt: Optional[str] = None) ->
     if target_ctx <= 32:
         return BASE_PROMPT
     reps = max(1, round((target_ctx - 32) / 24))
+    # Cap the prompt so it never reaches the model's TRAINED context length. The
+    # primary GGUFs train at n_ctx=32768, and llama-cli's tokenizer maps the
+    # FILLER to ~26 tok/rep (vs our ~24), so the naive formula for target_ctx=32768
+    # emits 34117 tokens (llama sees 35580) — *exceeding* the 32768 trained cap.
+    # llama-cli then prints "[ Prompt: 0.0 t/s | Generation: 0.0 t/s ]" and exits 0,
+    # which run_oracle_once parses into oracle_tg_tps=0.0 (empty ratio) WITHOUT
+    # raising — silently producing an invalid comparison row. 1180 reps => ~28.3k
+    # engine tokens / ~31.2k llama tokens, safely below 32768. Only the 32768 case
+    # is affected; smaller ctx values are unchanged.
+    reps = min(reps, 1180)
     return (FILLER * reps) + "Hi. " + BASE_PROMPT
 
 
