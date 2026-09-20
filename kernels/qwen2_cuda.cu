@@ -6251,10 +6251,12 @@ int prefill_batched_gemm(Qwen2Engine *e, const int *toks, int n, float *h_x_out)
 
     int (*prefill_gemm_fn)(const void *, const float *, float *, int, int, int, cudaStream_t) =
         tt_gemm_q4_0_prefill;
-    /* TT_USE_WMMA_PRE=1 routes prefill GEMMs with n>=64 to the WMMA
-     * tensor-core kernel; smaller chunks keep the CUDA-core kernel. */
+    /* Default to WMMA tensor-core kernel for prefill GEMMs with n>=64 (opt-out via TT_USE_WMMA_PRE=0) */
     { static int wmma_pre = -1;
-      if (wmma_pre < 0) wmma_pre = getenv("TT_USE_WMMA_PRE") ? 1 : 0;
+      if (wmma_pre < 0) {
+          const char *s = getenv("TT_USE_WMMA_PRE");
+          wmma_pre = (s && !strcmp(s, "0")) ? 0 : 1;
+      }
       if (wmma_pre && n >= 64) prefill_gemm_fn = tt_gemm_wmma_q4_0_prefill; }
     if (tt_dispatch_log_on())
         fprintf(stderr, "[prefill] dispatch=%s N=%d\n",
