@@ -50,6 +50,39 @@ uint32_t  tt_ngram_len(const tt_ngram *g);
 uint32_t  tt_ngram_draft(const tt_ngram *g, uint32_t *out);
 
 /* ------------------------------------------------------------------ */
+/* tt_ngram_map -- hashed multi-window map drafter (ngram-map-k class) */
+/* ------------------------------------------------------------------ */
+/*
+ * Upgrade over tt_ngram ("ngram-simple") for beating llama.cpp's
+ * --spec-type ngram-map-k: instead of one last-occurrence scan at a fixed
+ * window, maintain a hash map over ALL n-gram contexts seen in history for
+ * several window lengths (12/8/4/2), mapping each context to its top-4
+ * continuations with frequency counts, and draft by greedily CHAINING the
+ * most frequent continuations, preferring longer (more specific) contexts
+ * and falling back to shorter ones when the chain breaks.
+ *
+ * Determinism: counts are insertion-order independent; the proposed chain
+ * is fully deterministic (count desc, then token id asc as tie-break).
+ * Collision risk is 64-bit per (window-length, context) key.
+ */
+typedef struct tt_ngram_map tt_ngram_map;
+
+/* history_cap == 0 selects default (8192 tokens). max_draft == 0 -> NULL.
+ * max_draft is clamped to TT_MAP_MAX_DRAFT (8). */
+#define TT_MAP_MAX_DRAFT 8
+tt_ngram_map *tt_ngram_map_create(uint32_t history_cap, uint32_t max_draft);
+void          tt_ngram_map_free(tt_ngram_map *m);
+
+/* Append tokens to history and update the map incrementally. Returns 0,
+ * or -1 on bad args. */
+int      tt_ngram_map_feed(tt_ngram_map *m, const uint32_t *toks, uint32_t count);
+uint32_t tt_ngram_map_len(const tt_ngram_map *m);
+
+/* Draft up to max_draft tokens into out[] by chained top-1 continuation,
+ * longest window first. Returns count written (0 = no usable context). */
+uint32_t tt_ngram_map_draft(const tt_ngram_map *m, uint32_t *out);
+
+/* ------------------------------------------------------------------ */
 /* FUTURE ENGINE INTERFACE (sketch only -- implement later, when       */
 /* qwen2_cuda.cu frees up). Reference: roadmap M10 build order 1.      */
 /*                                                                     */

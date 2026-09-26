@@ -850,7 +850,9 @@ static int pretok_split(const Tok *t, const uint32_t *cp, int n, int *ends, int 
 static int encode_bpe_segment(Tok *t, const char *s, int slen,
                               uint32_t *cps, int *bofs, int *ends,
                               char *mapped, int *beg, int *sln,
-                              int *out, int cap) {
+                              int *out, int cap, int *otr) {
+    /* *otr is set to 1 when tokens are DROPPED because out[] filled (C2:
+     * callers must be able to distinguish truncation from success). */
     /* decode UTF-8 -> codepoints (+ byte offsets); invalid sequences become
      * U+FFFD, matching oracle unicode_cpts_from_utf8 */
     int nc = 0;
@@ -892,7 +894,7 @@ static int encode_bpe_segment(Tok *t, const char *s, int slen,
         if (t->ignore_merges && nsym > 1) {
             const int wid = hm_get(&t->tok2id, mapped, mlen);
             if (wid >= 0) {
-                if (n_out >= cap) return n_out;
+                if (n_out >= cap) { if (otr) *otr = 1; return n_out; }
                 out[n_out++] = wid;
                 p0 = p1;
                 continue;
@@ -917,7 +919,7 @@ static int encode_bpe_segment(Tok *t, const char *s, int slen,
         for (int j = 0; j < nsym; j++) {
             const int id = hm_get(&t->tok2id, mapped + beg[j], sln[j]);
             if (id >= 0) {
-                if (n_out >= cap) return n_out;
+                if (n_out >= cap) { if (otr) *otr = 1; return n_out; }
                 out[n_out++] = id;
                 continue;
             }
@@ -933,7 +935,7 @@ static int encode_bpe_segment(Tok *t, const char *s, int slen,
                                         rb >= 0 ? (unsigned)rb : (unsigned char)mapped[i]);
                 const int fid = hm_get(&t->tok2id, fb, fl);
                 if (fid >= 0) {
-                    if (n_out >= cap) return n_out;
+                    if (n_out >= cap) { if (otr) *otr = 1; return n_out; }
                     out[n_out++] = fid;
                 }
                 i += n;
@@ -968,7 +970,8 @@ static int utf8_len_from_byte(unsigned char c) {
     return 1; /* invalid -> 1 */
 }
 static int encode_sp_segment(Tok *t, const char *s, int slen, int with_dummy_prefix,
-                             int *out, int cap) {
+                             int *out, int cap, int *otr) {
+    /* *otr set when rev[] tokens do not fit in out[] (C2 truncation flag). */
     if (t->max_piece <= 0 || cap <= 0) return 0;
     if (slen < 0) slen = 0;
     char *mapped = (char *)malloc((size_t)slen * 3 + 4);
@@ -1104,16 +1107,19 @@ static int encode_sp_segment(Tok *t, const char *s, int slen, int with_dummy_pre
         is_prev_unk = is_unk;
         cur = prev;
     }
-    /* reverse into out */
+    /* reverse into out; anything left in rev[] is truncation (C2) */
     int n_out = 0;
     for (int i = rev_n - 1; i >= 0 && n_out < cap; i--) out[n_out++] = rev[i];
+    if (rev_n > n_out && otr) *otr = 1;
     free(rev);
     free(best_score); free(best_prev); free(best_id); free(mapped);
     return n_out;
 }
 
-int bpe_encode(const BPETokenizer *tok_, const char *text, int *out_tokens, int max_tokens) {
+int bpe_encode_ex(const BPETokenizer *tok_, const char *text, int *out_tokens,
+                  int max_tokens, int *out_trunc) {
     Tok *t = (Tok *)tok_;
+    if (out_trunc) *out_trunc = 0;
     if (!tok_ || !t->base.tokens || !text || !out_tokens || max_tokens <= 0) return 0;
     const int len = (int)strlen(text);
     int n_out = 0;
@@ -1185,18 +1191,31 @@ int bpe_encode(const BPETokenizer *tok_, const char *text, int *out_tokens, int 
             const int is_first = (pos == 0);
             if (is_first && n_out == 0 && t->base.bos_id >= 0)
                 out_tokens[n_out++] = t->base.bos_id;
+            int seg_trunc = 0;
             n_out += encode_sp_segment(t, text + pos, seg_end - pos, is_first,
-                                       out_tokens + n_out, max_tokens - n_out);
+                                       out_tokens + n_out, max_tokens - n_out,
+                                       &seg_trunc);
+            if (seg_trunc && out_trunc) *out_trunc = 1;
         } else {
+            int seg_trunc = 0;
             n_out += encode_bpe_segment(t, text + pos, seg_end - pos,
                                         cps, bofs, ends, mapped, beg, sln,
-                                        out_tokens + n_out, max_tokens - n_out);
+                                        out_tokens + n_out, max_tokens - n_out,
+                                        &seg_trunc);
+            if (seg_trunc && out_trunc) *out_trunc = 1;
         }
         pos = seg_end;
     }
 
     free(cps); free(bofs); free(ends); free(mapped); free(beg); free(sln);
+    /* whole input segments never consumed => truncation (C2) */
+    if (out_trunc && pos < len) *out_trunc = 1;
     return n_out;
+}
+
+int bpe_encode(const BPETokenizer *tok_, const char *text, int *out_tokens,
+               int max_tokens) {
+    return bpe_encode_ex(tok_, text, out_tokens, max_tokens, NULL);
 }
 
 void bpe_tokenizer_free(BPETokenizer *tok_) {

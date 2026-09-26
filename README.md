@@ -8,7 +8,7 @@ in `tinytorch`.
 What works: GGUF loader, arch registry (qwen2/llama/qwen3/gemma/gemma4/
 tinyllama/granite/smollm2/mistral/internlm2/xverse/exaone/ernie4_5),
 BPE tokenizer, chat templates, top-k/top-p/min-p samplers, paged KV-cache
-with Q8 backfill, MoE router, N-gram speculative decode, threaded CPU
+with Q8 backfill, MoE router, N-gram speculative decode (hashed multi-window map drafter), threaded CPU
 GEMV backend (Q4_0/Q8_0/Q4_K/Q5_K/Q6_K), CUDA GEMV/GEMM/flash kernels.
 
 ## Build
@@ -32,6 +32,13 @@ make run_llm_gpu         # needs nvcc + RTX-class GPU
 python3 chat.py      # terminal client (template + sampling knobs)
 python3 real_chat.py # ctypes live chat app (uses build/libtinytorch.so)
 ```
+
+## Performance defaults (kill switches)
+
+- Tensor-core prefill (fp16 cuBLAS shadows): **ON** by default; `TT_CUBLAS_FP16=0` disables.
+- Automatic prompt prefix caching: **ON** by default; `TT_NO_PREFIX_CACHE=1` disables.
+- Speculative CLI (`build/spec_llm_gpu`) uses the hashed multi-window map
+  drafter (`src/specdec.c`, ngram-map-k class).
 
 ## Gates
 

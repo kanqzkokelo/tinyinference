@@ -262,6 +262,107 @@ def report(corpus_name, tokens):
     return rows
 
 
+# ---------------------------------------------------------------------------
+# Map drafter mirror (src/specdec.c tt_ngram_map): multi-scale window ladder
+# {16,12,8,6,5,4,3,2} longest-first, Space-Saving top-4 continuations per
+# context key with (count desc, token id asc) ranking, greedy chained draft.
+# Python uses exact context tuples where the C uses 64-bit hashes.
+# ---------------------------------------------------------------------------
+MAP_WINDOWS = [16, 12, 8, 6, 5, 4, 3, 2]
+MAP_K = 4
+
+
+class NgramMap:
+    def __init__(self):
+        self.hist = []
+        self.tab = {}      # (n, ctx tuple) -> list of [count, tok] (<= MAP_K)
+
+    def feed(self, toks):
+        for t in toks:
+            self.hist.append(t)
+        p_end = len(self.hist)
+        for p in range(p_end - len(toks), p_end):
+            for n in MAP_WINDOWS:
+                if p - n < 0:
+                    continue
+                key = (n, tuple(self.hist[p - n:p]))
+                nxt = self.hist[p]
+                slots = self.tab.setdefault(key, [])
+                for ent in slots:
+                    if ent[1] == nxt:
+                        ent[0] += 1
+                        break
+                else:
+                    if len(slots) < MAP_K:
+                        slots.append([1, nxt])
+                    else:      # Space-Saving: replace min (lowest idx on tie)
+                        mn = min(range(len(slots)), key=lambda k: slots[k][0])
+                        slots[mn][1] = nxt
+                        slots[mn][0] += 1
+
+    def draft(self, max_draft):
+        chain = []
+        while len(chain) < max_draft:
+            full = self.hist + chain
+            for n in MAP_WINDOWS:
+                if n > len(full):
+                    continue
+                ctx = tuple(full[len(full) - n:])
+                slots = self.tab.get((n, ctx))
+                if slots:
+                    best = min(slots, key=lambda e: (-e[0], e[1]))
+                    chain.append(best[1])
+                    break
+            else:
+                break
+        return chain
+
+
+def simulate_map(tokens, max_draft):
+    """Same acceptance bookkeeping as simulate() for apples-to-apples."""
+    steps = 0
+    total_out = 0
+    sum_k = 0
+    sum_a = 0
+    n_tok = len(tokens)
+    i = WARMUP
+    mp = NgramMap()
+    mp.feed(tokens[:i])
+    while i < n_tok:
+        prop = mp.draft(max_draft)
+        k = min(len(prop), n_tok - i)
+        a = 0
+        while a < k and prop[a] == tokens[i + a]:
+            a += 1
+        sum_a += a
+        steps += 1
+        total_out += 1 + k
+        sum_k += k
+        i += 1 + k
+        if i > len(mp.hist):
+            mp.feed(tokens[len(mp.hist):i])
+    return steps, total_out, sum_k, sum_a
+
+
+def report_map(corpus_name, tokens, simple_rows):
+    print(f"\n=== map drafter vs simple: {corpus_name} ===")
+    print(f"{'m':>2} | {'acc%':>6} {'avgK':>5} {'avgA':>5} | "
+          f"{'lin-x':>6} {'flat-x':>7} | best simple flat-x")
+    best_simple_flat = max(r[6] for r in simple_rows)
+    map_flat_all = []
+    for m in DRAFT_LENS:
+        steps, out, sum_k, sum_a = simulate_map(tokens, m)
+        avg_k = sum_k / steps
+        avg_a = sum_a / steps
+        acc_rate = (sum_a / sum_k) * 100 if sum_k else 0.0
+        lin_mult = (1 + avg_a) / (avg_k + 1)
+        flat_mult = (1 + avg_a) / 1.0
+        map_flat_all.append(flat_mult)
+        print(f"{m:>2} | {acc_rate:>6.1f} {avg_k:>5.2f} {avg_a:>5.2f} | "
+              f"{lin_mult:>6.3f} {flat_mult:>7.3f} | {best_simple_flat:>7.3f}")
+    return map_flat_all
+
+
 def main():
     print(__doc__.split("Assumptions")[0])
     print("""Assumptions:
@@ -285,6 +386,11 @@ def main():
     for name, toks in corpora:
         all_rows[name] = report(name, toks)
 
+    print("\n=== map drafter (ngram-map-k class) comparison ===")
+    map_flat = {}
+    for name, toks in corpora:
+        map_flat[name] = report_map(name, toks, all_rows[name])
+
     print("\n=== headline envelope ===")
     best_flat = max(r[6] for rows in all_rows.values() for r in rows)
     best_cfg = [(c, r[0], r[1]) for c, rows in all_rows.items() for r in rows
@@ -296,6 +402,19 @@ def main():
     print(f"WORST case: linear-model mult {worst_lin:.3f}x  (no-capture path)")
     print(f"WORST case adversarial: flat {min(r[6] for r in adv):.2f}x, "
           f"linear {adv_worst_lin:.3f}x -> fallback overhead bounded")
+    print(f"MAP drafter best flat: "
+          f"{max(v for rows in map_flat.values() for v in rows):.2f}x "
+          f"(vs simple best {best_flat:.2f}x)")
+    # Regression gate (P7 acceptance precondition): on the verbatim-copy
+    # regime — the workload spec decode exists for — the map drafter must
+    # not underperform the simple drafter it replaces.
+    copy_simple = max(r[6] for r in all_rows["verbatim-copy-RAG"])
+    copy_map = max(map_flat["verbatim-copy-RAG"])
+    if copy_map < copy_simple:
+        print(f"FAIL: map drafter underperforms simple on verbatim-copy "
+              f"({copy_map:.3f} < {copy_simple:.3f})")
+        return 1
+    print(f"PASS: map >= simple on verbatim-copy ({copy_map:.3f} >= {copy_simple:.3f})")
     return 0
 
 

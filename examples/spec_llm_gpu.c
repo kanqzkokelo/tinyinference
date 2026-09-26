@@ -39,11 +39,11 @@
 #include "loader_gguf.h"
 #include "qwen2_engine.h"
 #include "tokenizer_bpe.h"
-#include "ngram_lookup.h"
+#include "specdec.h"   /* tt_ngram_map: hashed multi-window map drafter */
 
 #define MAX_CTX         1024
 #define MAX_HISTORY     4096
-#define MAX_CANDIDATES  (MAX_DRAFT_K + 1)
+#define MAX_CANDIDATES  (TT_MAP_MAX_DRAFT + 1)
 
 #define CUDA_OK(x) do { cudaError_t e_ = (x); if (e_ != cudaSuccess) { \
     fprintf(stderr, "CUDA error: %s\n", cudaGetErrorString(e_)); exit(1); } } while(0)
@@ -94,14 +94,14 @@ int main(int argc, char **argv) {
         if (wd[0]) window = atoi(wd);
     }
 
-    /* clamp to engine-tested ranges */
+    /* clamp to engine-tested ranges (map drafter: K in 1..TT_MAP_MAX_DRAFT) */
     if (draft_k < 1)      draft_k = 1;
-    if (draft_k > MAX_DRAFT_K) draft_k = MAX_DRAFT_K;
+    if (draft_k > TT_MAP_MAX_DRAFT) draft_k = TT_MAP_MAX_DRAFT;
     if (window < 2)       window = 2;
     if (window > 3)       window = 3;
 
-    fprintf(stderr, "[spec] model=%s draft_k=%d window=%d n_predict=%d\n",
-            model_path, draft_k, window, n_predict);
+    fprintf(stderr, "[spec] model=%s draft_k=%d n_predict=%d (map drafter; --window unused)\n",
+            model_path, draft_k, n_predict);
     fprintf(stderr, "[spec] prompt: %s\n", prompt);
 
     /* ---- Load model + tokenizer + engine ---- */
@@ -148,8 +148,14 @@ int main(int argc, char **argv) {
     memcpy(history, prompt_tokens, sizeof(int) * n_prompt);
     int history_n = n_prompt;
 
-    int draft[MAX_DRAFT_K];
+    uint32_t draft[TT_MAP_MAX_DRAFT];
     int candidates[MAX_CANDIDATES];
+    /* hashed multi-window map drafter (ngram-map-k class); `fed` tracks how
+     * much of history[] has been ingested so every append site is covered. */
+    tt_ngram_map *ngmap = tt_ngram_map_create(0, (uint32_t)draft_k);
+    if (!ngmap) { fprintf(stderr, "[spec] map drafter alloc failed\n"); return 1; }
+    tt_ngram_map_feed(ngmap, (const uint32_t *)history, (uint32_t)history_n);
+    int fed = history_n;
     float *d_logits = NULL;
     float *h_logits = (float *)malloc(sizeof(float) * cfg.vocab * MAX_CANDIDATES);
     if (!h_logits) { fprintf(stderr, "[spec] OOM h_logits\n"); return 1; }
@@ -174,15 +180,20 @@ int main(int argc, char **argv) {
     clock_gettime(CLOCK_MONOTONIC, &t0);
 
     while (total_emitted < n_predict && qwen2_engine_pos(eng) < MAX_CTX - 1) {
-        /* a) Draft from history */
-        int K = ngram_lookup_draft(history, history_n, window, draft_k, draft);
+        /* a) Draft from history (map drafter; sync any appended tokens) */
+        if (fed < history_n) {
+            tt_ngram_map_feed(ngmap, (const uint32_t *)(history + fed),
+                              (uint32_t)(history_n - fed));
+            fed = history_n;
+        }
+        int K = (int)tt_ngram_map_draft(ngmap, draft);
         int accepted = 0;
 
         if (K > 0) {
             verify_steps++;
             /* b) Build candidate array: [last_history_token, draft[0..K-1]] */
             candidates[0] = history[history_n - 1];
-            for (int i = 0; i < K; i++) candidates[i + 1] = draft[i];
+            for (int i = 0; i < K; i++) candidates[i + 1] = (int)draft[i];
             const int n_total = K + 1;
 
             /* c) Batched verify */
@@ -199,7 +210,7 @@ int main(int argc, char **argv) {
 
                 for (int i = 0; i < K; i++) {
                     const int am = argmax_of_row(h_logits, i + 1, cfg.vocab);
-                    if (am == draft[i]) accepted++;
+                    if (am == (int)draft[i]) accepted++;
                     else break;
                 }
                 /* correction token: argmax at position `accepted` (or last row
@@ -214,7 +225,7 @@ int main(int argc, char **argv) {
 
                 /* e) Append accepted draft + correction to history */
                 if (history_n + accepted + 1 < MAX_HISTORY) {
-                    for (int i = 0; i < accepted; i++) history[history_n++] = draft[i];
+                    for (int i = 0; i < accepted; i++) history[history_n++] = (int)draft[i];
                     history[history_n++] = correction;
                 }
 
@@ -226,7 +237,7 @@ int main(int argc, char **argv) {
                 for (int i = 0; i < accepted; i++) {
                     if (history_n - accepted - 1 + i < 0) continue;
                     int out_len = 0;
-                    const char *txt = bpe_decode_token(tok, draft[i], &out_len);
+                    const char *txt = bpe_decode_token(tok, (int)draft[i], &out_len);
                     if (tl + (size_t)out_len + 1 < sizeof(turn_text)) {
                         memcpy(turn_text + tl, txt, (size_t)out_len);
                         tl += (size_t)out_len;

@@ -66,6 +66,15 @@
 #include "chat_template.h"
 #include "samplers.h"
 
+/* C3: family end-of-turn token ids instead of hardcoded Qwen ids. */
+static int fam_is_stop_id(tt_chat_family fam, int tok) {
+    int ids[8];
+    int n = tt_chat_stop_ids(fam, ids, 8);
+    for (int i = 0; i < n; i++)
+        if (tok == ids[i]) return 1;
+    return 0;
+}
+
 /* --------------------------- configuration ---------------------------- */
 
 #define MAX_REQ_BYTES     (1 << 20)   /* 1 MiB hard cap on a request body   */
@@ -570,7 +579,7 @@ static int run_chat_on(EngineEntry *e, tt_msg *msgs, int n_msgs,
         if (qwen2_debug_copy_logits(e->eng, logits, e->vocab) < 0) break;
         tok = tt_sample(logits, e->vocab, &sc, &rng, wb);
         if (tok < 0) break;
-        if (tok == e->tok->eos_id || tok == 151643 || tok == 151645) {
+        if (tok == e->tok->eos_id || fam_is_stop_id(e->fam, tok)) {
             if (qwen2_engine_pos(e->eng) < e->max_ctx - 1)
                 qwen2_debug_replay_step(e->eng, tok);
             out->finish_reason = 0;

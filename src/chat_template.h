@@ -48,6 +48,17 @@ typedef enum {
  * "gemma2", "gemma4", "llama") to a family. Returns -1 if unknown. */
 int tt_chat_family_from_arch(const char *arch);
 
+/* Per-family end-of-turn TOKEN IDS that must stop generation (in addition
+ * to the tokenizer's own eos_id, which callers always check). The values
+ * are the family's canonical control ids:
+ *   QWEN2/QWEN3 : 151643 (endoftext), 151645 (im_end)
+ *   GEMMA       : 107 <end_of_turn>, 106 <eos>
+ *   GEMMA4      : 107 <end_of_turn>
+ *   LLAMA3      : 128009 <|eot_id|>, 128001 <|begin_of_text|> is NOT a stop
+ * Returns the number of ids written (up to cap), or -1 on bad args.
+ * Use this instead of hardcoding Qwen ids for every family (code review C3). */
+int tt_chat_stop_ids(tt_chat_family fam, int *out, int cap);
+
 /* The string that terminates an assistant generation for this family:
  * "<|im_end|>" (qwen), "<end_of_turn>" (gemma), "<|eot_id|>" (llama3).
  * Feed these to the stop-string machinery in examples/chat_llm_gpu.c. */

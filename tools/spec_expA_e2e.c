@@ -16,7 +16,7 @@
 #include "loader_gguf.h"
 #include "qwen2_engine.h"
 #include "tokenizer_bpe.h"
-#include "ngram_lookup.h"
+#include "specdec.h"   /* tt_ngram_map drafter */
 #define MAX_CTX 1024
 #define MAX_HISTORY 4096
 #define JMAX 4
@@ -37,7 +37,7 @@ int main(int argc, char **argv) {
     int n_predict = atoi(argv[2]);
     int draft_k = atoi(argv[3]);
     int window = atoi(argv[4]);
-    if (draft_k < 1) draft_k = 1; if (draft_k > MAX_DRAFT_K) draft_k = MAX_DRAFT_K;
+    if (draft_k < 1) draft_k = 1; if (draft_k > TT_MAP_MAX_DRAFT) draft_k = TT_MAP_MAX_DRAFT;
     if (window < 2) window = 2; if (window > 3) window = 3;
     if (n_predict < 1) n_predict = 1;
     char prompt[8192] = "";
@@ -76,11 +76,20 @@ int main(int argc, char **argv) {
     long emitted = 0, verify_passes = 0, n_full = 0, n_part = 0, n_zero = 0, n_fallback = 0;
     long drafts_att = 0, drafts_acc = 0, fwd_verify = 0, fwd_step = 0;
     double verify_us = 0, correct_us = 0, fallback_us = 0;
-    int draft[MAX_DRAFT_K];
+    uint32_t draft[TT_MAP_MAX_DRAFT];
+    tt_ngram_map *ngmap = tt_ngram_map_create(0, (uint32_t)draft_k);
+    if (!ngmap) { fprintf(stderr, "map drafter alloc failed\n"); return 1; }
+    tt_ngram_map_feed(ngmap, (const uint32_t *)history, (uint32_t)history_n);
+    int fed = history_n;
     double dec0 = now_us();
     int end = 0;
     while (emitted < n_predict && qwen2_engine_pos(e) < MAX_CTX - 1) {
-        int K = ngram_lookup_draft(history, history_n, window, draft_k, draft);
+        if (fed < history_n) {
+            tt_ngram_map_feed(ngmap, (const uint32_t *)(history + fed),
+                              (uint32_t)(history_n - fed));
+            fed = history_n;
+        }
+        int K = (int)tt_ngram_map_draft(ngmap, draft);
         if (K <= 0) {
             double s0 = now_us();
             int c = argmax_row(carry, 0);
@@ -94,7 +103,7 @@ int main(int argc, char **argv) {
             continue;
         }
         int j = K < JMAX ? K : JMAX;
-        if (argmax_row(carry, 0) != draft[0]) {
+        if (argmax_row(carry, 0) != (int)draft[0]) {
             double s0 = now_us();
             int c = argmax_row(carry, 0);
             if (qwen2_engine_step_logits(e, c, carry)) break;
@@ -113,12 +122,12 @@ int main(int argc, char **argv) {
         verify_us += now_us() - v0;
         verify_passes++; fwd_verify += j; drafts_att += j;
         int m = 1;
-        while (m < j && argmax_row(h_rows, m - 1) == draft[m]) m++;
+        while (m < j && argmax_row(h_rows, m - 1) == (int)draft[m]) m++;
         drafts_acc += m;
         if (m == j) {
             int b = argmax_row(h_rows, j - 1);
             memcpy(carry, h_rows + (long)(j - 1) * V, (size_t)V * sizeof(float));
-            for (int i = 0; i < j && history_n < MAX_HISTORY; i++) history[history_n++] = draft[i];
+            for (int i = 0; i < j && history_n < MAX_HISTORY; i++) history[history_n++] = (int)draft[i];
             if (history_n < MAX_HISTORY) history[history_n++] = b;
             emitted += j + 1; n_full++;
             if (b == eos) { end = 1; break; }
@@ -130,7 +139,7 @@ int main(int argc, char **argv) {
             cudaDeviceSynchronize();
             correct_us += now_us() - s0;
             n_part++; fwd_step++;
-            for (int i = 0; i < m && history_n < MAX_HISTORY; i++) history[history_n++] = draft[i];
+            for (int i = 0; i < m && history_n < MAX_HISTORY; i++) history[history_n++] = (int)draft[i];
             if (history_n < MAX_HISTORY) history[history_n++] = c;
             emitted += m + 1;
             if (c == eos) { end = 1; break; }

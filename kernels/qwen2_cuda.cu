@@ -5904,8 +5904,19 @@ __global__ void k_f32_to_f16(const float *src, half *dst, size_t n) {
     if (i < n) dst[i] = __float2half(src[i]);
 }
 static inline int cublas_fp16_wanted(void) {
+    /* P2 (beating-llamacpp plan): default-ON with kill switch, same rollout
+     * pattern as tt_fa2_pre_on. Measured 2.7-5.5x over the Q4 GEMM
+     * (bench/prefill_crossover.txt); greedy-match vs the oracle was verified
+     * 5/5 when the path was written. TT_CUBLAS_FP16=0 restores the old
+     * behavior (Q4 GEMM / WMMA / batchn prefill only). Shadows are only
+     * built when the VRAM pre-check passes (see cublas_fp16_build), and any
+     * per-tensor GEMM failure falls back to the Q4 GEMM, so the kill switch
+     * is a belt-and-suspenders control, not the only safety net. */
     static int cached = -1;
-    if (cached < 0) cached = getenv("TT_CUBLAS_FP16") ? 1 : 0;
+    if (cached < 0) {
+        const char *s = getenv("TT_CUBLAS_FP16");
+        cached = (s && !strcmp(s, "0")) ? 0 : 1;
+    }
     return cached;
 }
 static inline half *cublas_fp16_ptr(Qwen2Engine *e, int l, int kind) {
@@ -6003,6 +6014,30 @@ static void cublas_build_shadows(Qwen2Engine *e, GGUFModel *m) {
     if (!e->cublas_nt_fn) { fprintf(stderr, "[cublas-pre] dlsym fail\n"); dlclose(e->cublas_dl); e->cublas_dl=NULL; return; }
     const char *suffix[7] = { "attn_q.weight", "attn_k.weight", "attn_v.weight", "attn_output.weight", "ffn_gate.weight", "ffn_up.weight", "ffn_down.weight" };
     size_t total_bytes = 0;
+    /* P2 VRAM pre-check (default-on safety): estimate the fp16 shadow
+     * footprint BEFORE allocating anything and refuse to engage when it
+     * would leave < 400MB free (covers fp16_x scratch up to 512*maxK*2,
+     * later prefill arenas, and fragmentation). Old behavior kept its
+     * 200MB post-check as a second net below. */
+    {
+        size_t free_b = 0, tot_b = 0, want = 0;
+        cudaMemGetInfo(&free_b, &tot_b);
+        for (int l = 0; l < e->cfg.n_layers; l++) {
+            for (int k = 0; k < 7; k++) {
+                char name[160]; snprintf(name, sizeof(name), "blk.%d.%s", l, suffix[k]);
+                GGUFTensor *t = gguf_get_tensor(m, name);
+                if (!t || !t->data || t->ndim != 2 || (int)t->type != 2) continue;
+                want += (size_t)t->shape[0] * (size_t)t->shape[1] * sizeof(half);
+            }
+        }
+        if (want > 0 && (free_b < want + (size_t)400 * 1048576)) {
+            fprintf(stderr, "[cublas-fp16] shadows need %.0fMB, free %.0fMB: "
+                    "prefill stays on Q4 GEMM/WMMA (set model smaller or free VRAM)\n",
+                    (double)want / 1048576.0, (double)free_b / 1048576.0);
+            dlclose(e->cublas_fp16_dl); e->cublas_fp16_dl = NULL; e->cublas_fp16_fn = NULL;
+            return;
+        }
+    }
     for (int l = 0; l < e->cfg.n_layers; l++) {
         for (int k = 0; k < 7; k++) {
             char name[160]; snprintf(name, sizeof(name), "blk.%d.%s", l, suffix[k]);
@@ -6906,7 +6941,14 @@ int qwen2_engine_prefill(Qwen2Engine *e, const int *toks, int n) {
     /* Automatic Prompt Prefix Caching:
      * When caller passes full history starting at token 0, match against cached tokens. */
     int prefix_match = 0;
-    if (getenv("TT_PREFIX_CACHE") && e->cached_toks && e->cached_toks_len > 0 && e->pos > 0) {
+    /* Automatic prefix caching: default-ON (P5); TT_NO_PREFIX_CACHE=1 opts
+     * out. TT_PREFIX_CACHE=1 remains accepted as a no-op for old scripts. */
+    static int no_prefix_cache = -1;
+    if (no_prefix_cache < 0) {
+        const char *npc = getenv("TT_NO_PREFIX_CACHE");
+        no_prefix_cache = (npc && *npc && strcmp(npc, "0")) ? 1 : 0;
+    }
+    if (!no_prefix_cache && e->cached_toks && e->cached_toks_len > 0 && e->pos > 0) {
         while (prefix_match < n && prefix_match < e->cached_toks_len &&
                toks[prefix_match] == e->cached_toks[prefix_match]) {
             prefix_match++;
@@ -6938,19 +6980,39 @@ int qwen2_engine_prefill(Qwen2Engine *e, const int *toks, int n) {
     const int *rem_toks = toks + prefix_match;
     const int cur_pos = e->pos;
 
+    /* C1: eager fallback resumes at `eager_from`, the first token NOT yet
+     * consumed by a successful feed. Tokens [0, eager_from) must never be
+     * re-fed (they would duplicate into the KV cache and shift positions). */
+    int eager_from = 0;
     if (rem_n >= pf_minn() && !e->has_pl_embd && e->cfg.tr.softcap_value == 0.0f) {
         const int CHUNK_SIZE = cublas_fp16_wanted() ? 2048 : 512;
         int offset = 0;
         int failed = 0;
+        /* Test hatch: TT_FAULT_INJECT_PF=<offset> forces a one-shot batched
+         * failure exactly at that chunk offset (default off; no-op unless
+         * set). Exercises the C1 resume path under verify.sh runs. */
+        static int fault_at = -2, fault_used = 0;
+        if (fault_at == -2) {
+            const char *fi = getenv("TT_FAULT_INJECT_PF");
+            fault_at = (fi && *fi) ? atoi(fi) : -1;
+        }
         while (offset < rem_n) {
             int chunk_len = (offset + CHUNK_SIZE <= rem_n) ? CHUNK_SIZE : (rem_n - offset);
             if (chunk_len >= pf_minn()) {
                 int rc = prefill_batched_gemm(e, rem_toks + offset, chunk_len, NULL);
-                if (rc != 0) { failed = 1; break; }
+                if (fault_at >= 0 && offset == fault_at && !fault_used) {
+                    fault_used = 1;
+                    fprintf(stderr, "[prefill] TT_FAULT_INJECT_PF: forced failure at offset=%d\n", offset);
+                    rc = -1;
+                }
+                if (rc != 0) { failed = 1; eager_from = offset; break; }
             } else {
-                for (int i = 0; i < chunk_len; i++) {
-                    int rc = advance(e, rem_toks[offset + i]);
-                    if (rc) { failed = 1; break; }
+                int j = 0;
+                for (; j < chunk_len; j++) {
+                    int rc = advance(e, rem_toks[offset + j]);
+                    /* advance() failed ON this token: it was not consumed,
+                     * so the retry must include it (eager_from = offset+j). */
+                    if (rc) { failed = 1; eager_from = offset + j; break; }
                 }
                 if (failed) break;
             }
@@ -6967,7 +7029,15 @@ int qwen2_engine_prefill(Qwen2Engine *e, const int *toks, int n) {
     }
     if (tt_dispatch_log_on() && (rem_n < pf_minn() || e->has_pl_embd || e->cfg.tr.softcap_value != 0.0f))
         fprintf(stderr, "[prefill] dispatch=eager N=%d (skip=%d)\n", rem_n, prefix_match);
-    for (int i = 0; i < rem_n; i++) {
+    /* C1 (code review): resume at `eager_from`, NOT at 0. When the batched
+     * path failed mid-chunk, chunks [0, eager_from) already advanced e->pos
+     * and their KV slots are correct; re-feeding from 0 would duplicate the
+     * prefix and shift every later position. Resuming is safe w.r.t. partial
+     * state from the failed chunk: forward_layers scatters the current
+     * token's K/V into its slot BEFORE attention reads 0..pos, and slots
+     * beyond pos are never read, so stale bytes are overwritten in
+     * write-before-read order as the eager loop advances. */
+    for (int i = eager_from; i < rem_n; i++) {
         int rc = advance(e, rem_toks[i]);
         if (rc) return rc;
     }

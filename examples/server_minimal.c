@@ -106,6 +106,17 @@ static ServerState g_srv = {
     .mu = PTHREAD_MUTEX_INITIALIZER
 };
 
+/* C3: family end-of-turn token ids (tt_chat_stop_ids), resolved once at
+ * startup instead of hardcoding Qwen ids for every model family. */
+static int g_stop_ids[8];
+static int g_nstop_ids = 0;
+
+static int srv_is_stop_id(int tok) {
+    for (int i = 0; i < g_nstop_ids; i++)
+        if (tok == g_stop_ids[i]) return 1;
+    return 0;
+}
+
 /* shutdown flag: set by SIGINT/SIGTERM, drained in accept() loop. */
 static volatile sig_atomic_t g_shutdown = 0;
 static int g_listen_fd = -1;
@@ -739,8 +750,7 @@ static int run_chat(tt_msg *msgs, int n_msgs, int max_tokens,
         if (qwen2_debug_copy_logits(g_srv.eng, logits, g_srv.vocab) < 0) break;
         tok = tt_sample(logits, g_srv.vocab, &sc, &rng, wb);
         if (tok < 0) break;
-        if (tok == g_srv.tok->eos_id || tok == 151643 /*<|endoftext|>*/
-            || tok == 151645 /*<|im_end|>*/) {
+        if (tok == g_srv.tok->eos_id || srv_is_stop_id(tok)) {
             /* feed the stop token so the transcript closes (parity with
              * chat_llm_gpu; also covers the eager path's advance) */
             if (qwen2_engine_pos(g_srv.eng) < g_srv.max_ctx - 1)
@@ -1030,6 +1040,8 @@ int main(int argc, char **argv) {
     if (!g_srv.model) die("failed to load model: %s", model_path);
     g_srv.fam = tt_chat_family_from_arch(g_srv.model->architecture);
     if (g_srv.fam < 0) g_srv.fam = TT_CHAT_QWEN2;
+    g_nstop_ids = tt_chat_stop_ids(g_srv.fam, g_stop_ids, 8);
+    if (g_nstop_ids < 0) g_nstop_ids = 0;
     g_srv.tok = bpe_tokenizer_init(g_srv.model);
     if (!g_srv.tok) die("failed to init tokenizer");
     g_srv.vocab = g_srv.tok->vocab_size;
