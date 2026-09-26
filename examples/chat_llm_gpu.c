@@ -26,6 +26,16 @@
 #define MAX_STOP_LEN     63
 static char g_stop[MAX_STOP_STRINGS][MAX_STOP_LEN + 1];
 static int  g_nstop = 0;
+/* C3: family-specific end-of-turn TOKEN ids (from tt_chat_stop_ids) instead
+ * of hardcoded Qwen ids checked against every family. */
+static int  g_stop_ids[8];
+static int  g_nstop_ids = 0;
+
+static int chat_is_stop_id(int tok) {
+    for (int i = 0; i < g_nstop_ids; i++)
+        if (tok == g_stop_ids[i]) return 1;
+    return 0;
+}
 
 static void chat_add_stop(const char *s, size_t n) {
     if (g_nstop >= MAX_STOP_STRINGS || n == 0 || n > MAX_STOP_LEN) return;
@@ -35,6 +45,8 @@ static void chat_add_stop(const char *s, size_t n) {
 }
 
 static void chat_init_stop_strings(tt_chat_family fam) {
+    g_nstop_ids = tt_chat_stop_ids(fam, g_stop_ids, 8);
+    if (g_nstop_ids < 0) g_nstop_ids = 0;
     const char *fs = tt_chat_stop_string(fam);
     if (fs) chat_add_stop(fs, strlen(fs));
     /* legacy hardcoded guards stay active regardless of family/env */
@@ -252,9 +264,18 @@ int main(void) {
         }
         const char *suffix = formatted + g_prev_len;
 
-        int prompt_tokens[512];
-        int n_prompt = bpe_encode(tok, suffix, prompt_tokens, 512);
-        if (n_prompt <= 0) { fprintf(stderr, "[chat] tokenization failed\n"); continue; }
+        /* C2: prompt buffer sized to the engine context (a 512-entry stack
+         * array silently cut long prompts) and truncation is now an ERROR. */
+        int *prompt_tokens = (int *)malloc((size_t)MAX_CTX * sizeof(int));
+        if (!prompt_tokens) { fprintf(stderr, "[chat] OOM (prompt buffer)\n"); break; }
+        int prompt_trunc = 0;
+        int n_prompt = bpe_encode_ex(tok, suffix, prompt_tokens, MAX_CTX, &prompt_trunc);
+        if (n_prompt <= 0 || prompt_trunc) {
+            fprintf(stderr, "[chat] prompt too long (%d tokens%s, cap %d) - shorten input\n",
+                    n_prompt, prompt_trunc ? ", TRUNCATED" : "", MAX_CTX);
+            free(prompt_tokens);
+            continue;
+        }
         if (getenv("TT_DUMP_PROMPT")) {
             fprintf(stderr, "\n[TT_DUMP_PROMPT] prompt bytes (%zu):\n----\n%s\n----\n",
                     strlen(suffix), suffix);
@@ -271,11 +292,13 @@ int main(void) {
         if (qwen2_engine_prefill(eng, prompt_tokens, n_prompt)) {
             fprintf(stderr, "\n[chat] context full — restart session or shorten input\n");
             async_printer_stop_and_flush(ap);
+            free(prompt_tokens);
             continue;
         }
         memcpy(g_prev_fmt, formatted, (size_t)need + 1);
         g_prev_len = (size_t)need;
 
+        free(prompt_tokens); prompt_tokens = NULL;
         /* seed the penalty window with the prompt tail */
         for (int i = n_prompt > PENALTY_WINDOW ? n_prompt - PENALTY_WINDOW : 0;
              i < n_prompt; i++)
@@ -306,12 +329,11 @@ int main(void) {
                 next_tok = tt_sample(logits, VOCAB, &sc, &rng_state, wb);
             }
             if (getenv("TT_DUMP_FIRST_TOK") && gen_count == 0) {
-                fprintf(stderr, "[TT_DUMP_FIRST_TOK] next_tok=%d (eos=%d, eot=151645, endoftext=151643, gemma_end_of_turn=106)\n",
-                        next_tok, tok->eos_id);
+                fprintf(stderr, "[TT_DUMP_FIRST_TOK] next_tok=%d (eos=%d, fam_stop_ids=%d)\n",
+                        next_tok, tok->eos_id, g_nstop_ids);
             }
             if (next_tok < 0 || next_tok == tok->eos_id ||
-                next_tok == 151643 /* <|endoftext|> */ ||
-                next_tok == 151645 /* <|im_end|> */) {
+                chat_is_stop_id(next_tok)) {
                 /* close the assistant turn in the KV transcript: eager path
                  * already advanced; graph path feeds the id explicitly */
                 if (!no_graph && qwen2_engine_pos(eng) < MAX_CTX - 1)

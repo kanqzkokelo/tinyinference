@@ -36,10 +36,20 @@ import time
 from typing import Any, Dict, List, Optional, Tuple
 
 ROOT = Path(__file__).resolve().parent.parent
-SCRATCH = Path("/home/mitesh/ti-scratch")
-SCRATCH.mkdir(parents=True, exist_ok=True)
+# S1 (code review): author-machine paths are env-overridable so the harness
+# runs (and imports!) on any box. TT_BENCH_SCRATCH selects the scratch dir;
+# it is created lazily on first use, never at import time.
+SCRATCH = Path(os.environ.get("TT_BENCH_SCRATCH", "/tmp/ti-scratch"))
 
-DEFAULT_ORACLE_BIN = "/home/mitesh/Storage/llama.cpp/build_cuda/bin/llama-cli"
+
+def scratch_dir() -> Path:
+    SCRATCH.mkdir(parents=True, exist_ok=True)
+    return SCRATCH
+
+
+DEFAULT_ORACLE_BIN = os.environ.get(
+    "TT_LLAMACPP_BIN", "/home/mitesh/Storage/llama.cpp/build_cuda/bin/llama-cli"
+)
 DEFAULT_LLAMACPP_COMMIT = "3f545be"
 
 PRIMARY_MODELS = [

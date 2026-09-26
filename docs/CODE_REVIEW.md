@@ -46,6 +46,17 @@ C1 (prefill failure path corrupts KV), C2 (silent prompt truncation), C3
 (hardcoded Qwen stop IDs cross-family), S1 (bench/build author-machine
 assumptions), M1/M2 (monolith + env-var sprawl), T1 (no CUDA CI).
 
+**Status update (2026-09-26, campaign drop 1):** C1 fixed (eager fallback
+resumes at `eager_from`, with `TT_FAULT_INJECT_PF` hatch), C2 fixed
+(`bpe_encode_ex` truncation flag; chat buffer sized to `MAX_CTX`), C3 fixed
+(`tt_chat_stop_ids` per family, used by chat + both servers), C7 fixed
+(`spec_llm_gpu` / `spec_expA_e2e` now wire the `tt_ngram_map` map drafter),
+S1 fixed (bench scratch/oracle paths env-overridable; `LLAMA_CPP_DIR` for the
+oracle target). P2 default-on (`TT_CUBLAS_FP16=0` opt-out + VRAM pre-check)
+and P5 prefix-cache default-on (`TT_NO_PREFIX_CACHE=1` opt-out) landed with
+the house kill-switch pattern. Remaining: M1/M2/T1/T3, C4-C6, C8-C10, P1,
+P3-P6.
+
 ---
 
 ## 2. What is excellent (keep doing this)

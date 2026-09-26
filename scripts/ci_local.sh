@@ -61,6 +61,13 @@ run test-specdec-sim   python3 tests/test_specdec_sim.py
 run test-chat-template python3 tests/test_chat_template.py
 run test-profile-decode python3 tests/test_profile_decode.py
 
+# 5a. specdec map drafter KATs (pure C, self-contained binary).
+if [ ! -x build/test_specdec_map ] || [ src/specdec.c -nt build/test_specdec_map ]; then
+  $CC_BIN -std=c99 -O2 -Wall -Wextra -Isrc -o build/test_specdec_map \
+      src/specdec.c tests/test_specdec_map.c
+fi
+run test-specdec-map build/test_specdec_map
+
 # 5. kvcache unit tests (pure C, self-contained binary).
 if [ ! -x build/test_kvcache ]; then
   $CC_BIN -std=c99 -O2 -Wall -Wextra -Isrc -o build/test_kvcache \

@@ -128,6 +128,31 @@ int tt_chat_family_from_arch(const char *arch) {
     return -1;
 }
 
+int tt_chat_stop_ids(tt_chat_family fam, int *out, int cap) {
+    if (!out || cap <= 0) return -1;
+    /* Canonical control ids per family. tok->eos_id is checked separately
+     * by every caller; these cover the family-specific end-of-turn markers
+     * that are NOT always registered as the GGUF eos (e.g. Qwen im_end on
+     * base conversions, gemma end_of_turn 107 vs eos 106). */
+    static const int qwen_ids[] = { 151643, 151645 };           /* eot| im_end */
+    static const int gemma_ids[] = { 107, 106 };                 /* end_of_turn, eos */
+    static const int gemma4_ids[] = { 107 };                     /* end_of_turn */
+    static const int llama3_ids[] = { 128009 };                  /* <|eot_id|> */
+    const int *ids = NULL;
+    int n = 0;
+    switch (fam) {
+    case TT_CHAT_QWEN2:
+    case TT_CHAT_QWEN3: ids = qwen_ids;  n = 2; break;
+    case TT_CHAT_GEMMA: ids = gemma_ids; n = 2; break;
+    case TT_CHAT_GEMMA4: ids = gemma4_ids; n = 1; break;
+    case TT_CHAT_LLAMA3: ids = llama3_ids; n = 1; break;
+    default: return 0;
+    }
+    if (n > cap) n = cap;
+    for (int i = 0; i < n; i++) out[i] = ids[i];
+    return n;
+}
+
 const char *tt_chat_stop_string(tt_chat_family fam) {
     switch (fam) {
     case TT_CHAT_QWEN2:

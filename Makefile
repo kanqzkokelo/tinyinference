@@ -87,13 +87,13 @@ server_minimal: $(BUILD)/server_minimal
 
 # Universal Speculative Engine orchestrator: N-gram drafter (host) +
 # batched verify_speculative() (CUDA). Source list mirrors run_llm_gpu
-# plus src/ngram_lookup.c.
-$(BUILD)/spec_llm_gpu: examples/spec_llm_gpu.c src/loader_gguf.c src/arch_registry.c src/dequant_ref.c src/cpu_backend.c src/tokenizer_bpe.c src/async_printer.c src/ngram_lookup.c kernels/gemv_q4_cuda.cu kernels/gemv_typed.cu kernels/qwen2_cuda.cu | $(BUILD)
+# plus src/specdec.c (hashed multi-window map drafter).
+$(BUILD)/spec_llm_gpu: examples/spec_llm_gpu.c src/loader_gguf.c src/arch_registry.c src/dequant_ref.c src/cpu_backend.c src/tokenizer_bpe.c src/async_printer.c src/specdec.c kernels/gemv_q4_cuda.cu kernels/gemv_typed.cu kernels/qwen2_cuda.cu | $(BUILD)
 	$(NVCC) -O3 $(NVCC_GENCODE) \
 	  -I$(CUDA_INC) -Iinclude -Isrc -Xcompiler "-fPIC -fopenmp" \
 	  -Xlinker -rpath=$(CURDIR)/build:$(HOME)/mmcuda/lib \
 	  -o $@ \
-	  examples/spec_llm_gpu.c src/loader_gguf.c src/arch_registry.c src/dequant_ref.c src/cpu_backend.c src/tokenizer_bpe.c src/async_printer.c src/ngram_lookup.c kernels/gemv_q4_cuda.cu kernels/gemv_typed.cu kernels/qwen2_cuda.cu \
+	  examples/spec_llm_gpu.c src/loader_gguf.c src/arch_registry.c src/dequant_ref.c src/cpu_backend.c src/tokenizer_bpe.c src/async_printer.c src/specdec.c kernels/gemv_q4_cuda.cu kernels/gemv_typed.cu kernels/qwen2_cuda.cu \
 	  -L$(HOME)/mmcuda/lib -lcudart -lpthread -lgomp
 
 spec_llm_gpu: $(BUILD)/spec_llm_gpu
@@ -107,21 +107,23 @@ $(BUILD)/spec_expA_ab: tools/spec_expA_ab.c src/loader_gguf.c src/arch_registry.
 	  tools/spec_expA_ab.c src/loader_gguf.c src/arch_registry.c src/dequant_ref.c src/cpu_backend.c src/tokenizer_bpe.c kernels/gemv_q4_cuda.cu kernels/gemv_typed.cu kernels/qwen2_cuda.cu \
 	  -L$(HOME)/mmcuda/lib -lcudart -lpthread -lgomp
 
-$(BUILD)/spec_expA_e2e: tools/spec_expA_e2e.c src/loader_gguf.c src/arch_registry.c src/dequant_ref.c src/cpu_backend.c src/tokenizer_bpe.c src/ngram_lookup.c kernels/gemv_q4_cuda.cu kernels/gemv_typed.cu kernels/qwen2_cuda.cu | $(BUILD)
+$(BUILD)/spec_expA_e2e: tools/spec_expA_e2e.c src/loader_gguf.c src/arch_registry.c src/dequant_ref.c src/cpu_backend.c src/tokenizer_bpe.c src/specdec.c kernels/gemv_q4_cuda.cu kernels/gemv_typed.cu kernels/qwen2_cuda.cu | $(BUILD)
 	$(NVCC) -O3 $(NVCC_GENCODE) \
 	  -I$(CUDA_INC) -Iinclude -Isrc -Xcompiler "-fPIC -fopenmp" \
 	  -Xlinker -rpath=$(CURDIR)/build:$(HOME)/mmcuda/lib \
 	  -o $@ \
-	  tools/spec_expA_e2e.c src/loader_gguf.c src/arch_registry.c src/dequant_ref.c src/cpu_backend.c src/tokenizer_bpe.c src/ngram_lookup.c kernels/gemv_q4_cuda.cu kernels/gemv_typed.cu kernels/qwen2_cuda.cu \
+	  tools/spec_expA_e2e.c src/loader_gguf.c src/arch_registry.c src/dequant_ref.c src/cpu_backend.c src/tokenizer_bpe.c src/specdec.c kernels/gemv_q4_cuda.cu kernels/gemv_typed.cu kernels/qwen2_cuda.cu \
 	  -L$(HOME)/mmcuda/lib -lcudart -lpthread -lgomp
 
-# Oracle logits tool against the vendored llama.cpp build (parity fixtures).
+# Oracle logits tool against a llama.cpp build (parity fixtures).
+# S1: tree location is overridable (LLAMA_CPP_DIR=/path/to/llama.cpp).
+LLAMA_CPP_DIR ?= /home/mitesh/Storage/llama.cpp
 $(BUILD)/oracle_logits: tools/oracle_logits.c | $(BUILD)
 	gcc -O2 -Wno-deprecated-declarations \
-	  -I /home/mitesh/Storage/llama.cpp/include -I /home/mitesh/Storage/llama.cpp/ggml/include \
+	  -I $(LLAMA_CPP_DIR)/include -I $(LLAMA_CPP_DIR)/ggml/include \
 	  -o $@ tools/oracle_logits.c \
-	  -L /home/mitesh/Storage/llama.cpp/build_cuda/bin -lllama \
-	  -Wl,-rpath=/home/mitesh/Storage/llama.cpp/build_cuda/bin
+	  -L $(LLAMA_CPP_DIR)/build_cuda/bin -lllama \
+	  -Wl,-rpath=$(LLAMA_CPP_DIR)/build_cuda/bin
 
 oracle_logits: $(BUILD)/oracle_logits
 
@@ -331,6 +333,14 @@ ci:
 .PHONY: ci
 
 # Q4_0 reference quantizer roundtrip gate (head-requant prerequisite).
+$(BUILD)/test_specdec_map: tests/test_specdec_map.c src/specdec.c | $(BUILD)
+	cc -std=c99 -O2 -Wall -Wextra -Isrc -o $@ tests/test_specdec_map.c src/specdec.c
+
+test_specdec_map: $(BUILD)/test_specdec_map
+	$(BUILD)/test_specdec_map
+
+.PHONY: test_specdec_map
+
 $(BUILD)/test_quant_ref: tests/test_quant_ref.c src/quant_ref.c src/dequant_ref.c src/loader_gguf.c | $(BUILD)
 	cc -O2 -Iinclude -Isrc -o $@ tests/test_quant_ref.c src/quant_ref.c src/dequant_ref.c src/loader_gguf.c -lm
 

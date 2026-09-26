@@ -52,9 +52,9 @@ gemma-4-E2B.
 |---|---|---|---|
 | Decode tok/s, batch 1, ctx 32-512 | `llama-bench -p 0 -n 64` | 1.00-1.33x (fleet, `docs/BENCHMARKS.md`) | **WON** (short ctx) |
 | Decode tok/s, batch 1, ctx 2048+ | `llama-bench -p 0 -n 64 -d N` | 1.03-1.21x qwen family; smol 0.96x @4096; llama flat-tax ~0.85x historically | MOSTLY WON, mixed |
-| Prefill / TTFT | `llama-bench -p 512,2048` | was 0.06-0.24x; batchn+FA2+WMMA landed since; ratio UNMEASURED post-landing | LIKELY STILL LOSE, closing |
+| Prefill / TTFT | `llama-bench -p 512,2048` | was 0.06-0.24x; batchn+FA2+WMMA landed; cuBLAS fp16 now default-on (2.7-5.5x measured); ratio UNMEASURED post-landing | LIKELY STILL LOSE, closing |
 | End-to-end time-to-N tokens | `llama-cli` timing | dominated by prefill; UNMEASURED post-landing | LOSE (follows prefill) |
-| Speculative decode | `llama-cli --spec-type ngram-map-k` | ours unproven in e2e; verify path bit-exact; batch4 head exists | UNMEASURED |
+| Speculative decode | `llama-cli --spec-type ngram-map-k` | map drafter landed (sim: copy-RAG 2.28x flat vs 1.88x simple, gate green); verify bit-exact; e2e vs oracle UNMEASURED | CLOSING |
 | Aggregate throughput (B>1) | `llama-batched-bench` | no continuous batching | LOSE (large project) |
 | Tensor quant types consumed | load + compute | 13 vs 43 (16 meaningful missing) | LOSE |
 | Quantizer / imatrix | `llama-quantize`, `llama-imatrix` | 1 type (`quantize_row_q4_0`), no imatrix | LOSE |
@@ -146,11 +146,12 @@ WMMA tensor-core GEMM auto at N>=64, FA2 tensor-core prefill flash
 default-ON. Still open:
 
 1. **Default-on the cuBLAS fp16/tf32 shadow GEMM (`TT_CUBLAS_FP16`) with
-   gates** (P2, 2-3 days): measured 2.7-5.5x; needs (a) per-shape engagement
-   gating, (b) KV-parity gate — FP32 KV below thresh keeps m61 green, (c) a
-   documented no-cuBLAS fallback to the Q4 GEMM/WMMA path, (d) VRAM budget
-   policy for shadows (fp16 shadows of 1B = ~1 GB; on 4 GB cards engage only
-   when KV is Q8/Q4 or model < 1B). Exit: ctx2048 prefill ratio >= 0.55x.
+   gates** (P2) — **landed 2026-09-26**: default-ON with `TT_CUBLAS_FP16=0`
+   kill switch (same rollout as FA2), VRAM pre-check (shadows must leave
+   >= 400MB free or prefill stays on Q4 GEMM/WMMA), per-tensor fallback on
+   GEMM failure, batchn keeps N<=12. GPU-box re-verification still required:
+   `verify.sh m61` green + ctx2048 prefill ratio >= 0.55x before the number
+   is citable.
 2. **Batched prefill for non-Q4_0/Q8_0 dtypes** (P1 item, `CODE_REVIEW` P1):
    K-quant/F16 models currently prefill one GEMV per row. Generalize the
    batchn single-weight-pass pattern (template nr=1/2/4) to Q8_0 and Q4_K/Q6_K,
@@ -202,13 +203,15 @@ Build order (each step gated before the next):
    (`tools/spec_expA_e2e.c`). Compare greedy argmax per candidate on device,
    return one u32 accept-count + the bonus token id. This is a small kernel
    and removes the sync tax.
-3. **A real drafter.** Ours is a 2-3 token window, last-occurrence scan
-   (`ngram_lookup.c`) — strictly weaker than `tt_ngram` (12-gram ring, already
-   in-tree and simulated in `test_specdec_sim.py`) and much weaker than
-   ngram-map-k's hashed multi-window map. Ship: hashed map with multiple
-   window lengths (2..12), frequency-based tie-break, over the KV-mirrored
-   token history. Optionally: self-speculative (early-exit draft heads) is a
-   later game.
+3. **A real drafter.** — **landed 2026-09-26**: `tt_ngram_map`
+   (`src/specdec.c`) — hashed multi-scale map (windows 16/12/8/6/5/4/3/2),
+   Space-Saving top-4 continuations per context with deterministic
+   (count desc, id asc) ranking, greedy chained draft; wired into
+   `spec_llm_gpu` and `spec_expA_e2e`. CPU KATs (`tests/test_specdec_map.c`,
+   10 cases incl. rebuild/wrap/tie-break) green; simulator shows copy-RAG
+   flat-model 2.28x vs 1.88x for the simple drafter with a regression gate
+   (`map >= simple` on verbatim-copy). Optional next: self-speculative
+   (early-exit draft heads).
 4. **Rollout order:** wire `tt_ngram`+hash map into `spec_llm_gpu` and
    `server_minimal`, keep `verify.sh m61` green (spec must be greedy-
    identical to non-spec: accept/reject must reproduce the target chain).
@@ -464,12 +467,12 @@ exact production shape.
 |---|---|---|---|
 | P0 | Build missing oracle tools (`llama-quantize`, `llama-imatrix`, `llama-perplexity`, `llama-batched-bench`, `test-backend-ops`); scorecard harness `bench/scorecard_vs_llamacpp.py` -> `docs/SCORECARD_VS_LLAMACPP.md` | **not started** | every axis has a provenance-stamped baseline from one oracle tree |
 | P1 | Small-N prefill (batchn + `pf_minn=2`) | **landed** | n<32 >=3x achieved; chat TTFT remeasure pending |
-| P2 | Tensor-core prefill default-on: cuBLAS fp16 shadows (FA2 + WMMA auto landed) | **half-landed** | ctx2048 prefill >= 0.55x, m61 green |
+| P2 | Tensor-core prefill default-on: cuBLAS fp16 shadows (FA2 + WMMA auto landed) | **default-on landed 09-26 (kill switch `TT_CUBLAS_FP16=0`)** | ctx2048 prefill >= 0.55x, m61 green |
 | P3 | KV ladder to Q4 + fused dequant-in-attn | **hybrid Q8/Q4 landed**; fused attn landed | decode geomean >= 1.05x at equal KV precision |
 | P4 | A1 P0 quant set: IQ4_XS, IQ4_NL, IQ3_XXS, IQ3_S | not started | 4 types load+compute+parity+speed; 3B runs in 4 GB |
 | P5 | `tt-quantize` + ftype mix tables | not started | byte-identical for every deterministic ftype |
 | P6 | imatrix + perplexity/KL harness | not started | ppl/KL within declared tolerance |
-| P7 | Spec decode: verify bandwidth, device accept, real drafter | verify bit-exact; batch4 weak; drafter weak | >=1.5x on 2/4 workloads AND >=1.15x vs `ngram-map-k` |
+| P7 | Spec decode: verify bandwidth, device accept, real drafter | **map drafter landed 09-26**; verify bit-exact; batch4 weak; device accept missing | >=1.5x on 2/4 workloads AND >=1.15x vs `ngram-map-k` |
 | P8 | Batching/server; KV types BF16/Q4_1/Q5_0/Q5_1/IQ4_NL; load-time work | not started | `llama-batched-bench` parity or better |
 
 P1-P3 (speed) and P4-P6 (quant) are independent; P7 depends on P1 (landed)
@@ -489,13 +492,12 @@ If two or more fire, the published position is exactly what they imply.
 
 Claims are only as good as the harness and error paths behind them
 (`docs/CODE_REVIEW.md`):
-- **C1** (prefill failure fallback corrupts KV) must land before any e2e
-  timing claim on long prompts — a silent re-feed would poison timing AND
-  parity.
-- **C2/C3** (silent prompt truncation, hardcoded Qwen stop ids) must land
-  before any chat/TTFT or "quality" claim cross-family.
-- **S1** (de-hardcode bench/build paths) must land before any external party
-  can reproduce a ratio — i.e. before the scorecard is published.
+- **C1** (prefill failure fallback corrupts KV) — **fixed 09-26**; the
+  `TT_FAULT_INJECT_PF` hatch must be exercised in the next GPU verify run.
+- **C2/C3** (silent prompt truncation, hardcoded Qwen stop ids) — **fixed
+  09-26**.
+- **S1** (de-hardcode bench/build paths) — **fixed 09-26** (`TT_BENCH_SCRATCH`,
+  `TT_LLAMACPP_BIN`, `LLAMA_CPP_DIR`).
 - **T1** (GPU nightly) should gate every scoreboard refresh.
 - **P1** (batched prefill for non-Q4/Q8) before the P4 quant types are
   benchmarked (they would otherwise lose prefill cells for free).
