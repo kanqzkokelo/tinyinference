@@ -45,7 +45,7 @@ cuda: $(BUILD)/libtinytorch_cuda.so
 # wheel; same objects as run_llm_gpu, no main().
 PYLIB_SRCS := src/loader_gguf.c src/arch_registry.c src/dequant_ref.c \
               src/cpu_backend.c src/tokenizer_bpe.c src/async_printer.c \
-              src/chat_template.c \
+              src/chat_template.c src/json_grammar.c \
               kernels/gemv_q4_cuda.cu kernels/gemv_typed.cu kernels/qwen2_cuda.cu
 
 $(BUILD)/libtinytorch_engine.so: bindings/tt_api.cu $(PYLIB_SRCS) | $(BUILD)
@@ -355,3 +355,12 @@ $(BUILD)/test_quant_ref: tests/test_quant_ref.c src/quant_ref.c src/dequant_ref.
 test_quant_ref: $(BUILD)/test_quant_ref
 
 .PHONY: test_quant_ref
+
+# JSON prefix grammar used for constrained decoding.
+$(BUILD)/test_json_grammar: tests/test_json_grammar.c src/json_grammar.c | $(BUILD)
+	cc -O2 -Iinclude -Isrc -o $@ tests/test_json_grammar.c src/json_grammar.c
+
+test_json_grammar: $(BUILD)/test_json_grammar
+	./$(BUILD)/test_json_grammar
+
+.PHONY: test_json_grammar

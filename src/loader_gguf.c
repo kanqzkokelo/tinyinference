@@ -419,7 +419,7 @@ GGUFModel *gguf_load(const char *filepath) {
         fprintf(stderr, "[GGUF] %d/%d tensor(s) truncated past EOF; load continues\n",
                 truncated_count, model->tensor_count);
 
-    printf("[GGUF] Loaded model: arch=%s dim=%d, hidden=%d, layers=%d, heads=%d, kv_heads=%d, tensors=%d (gguf v%u)\n",
+    fprintf(stderr, "[GGUF] Loaded model: arch=%s dim=%d, hidden=%d, layers=%d, heads=%d, kv_heads=%d, tensors=%d (gguf v%u)\n",
            model->architecture[0] ? model->architecture : "?",
            model->dim, model->hidden_dim, model->n_layers, model->n_heads, model->n_kv_heads,
            model->tensor_count, version);

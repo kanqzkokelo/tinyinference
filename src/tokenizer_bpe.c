@@ -547,7 +547,7 @@ BPETokenizer *bpe_tokenizer_init(const GGUFModel *model) {
     if (!t->kv_add_bos_seen)
         t->add_bos = t->sp_mode ? 1 : t->pre_add_bos;
     specials_build(t);
-    printf("[BPE] loaded: vocab=%d merges=%llu bos=%d eos=%d add_bos=%d specials=%d\n",
+    fprintf(stderr, "[BPE] loaded: vocab=%d merges=%llu bos=%d eos=%d add_bos=%d specials=%d\n",
            t->base.vocab_size, (unsigned long long)n_merges,
            t->base.bos_id, t->base.eos_id, t->add_bos, t->n_specials);
     return &t->base;

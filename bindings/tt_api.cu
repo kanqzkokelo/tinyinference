@@ -15,6 +15,8 @@ struct TTModel {
     Qwen2Engine   *eng;
     BPETokenizer  *tok;
     tt_chat_family fam;
+    int           *mask_buf;
+    int            mask_cap;
 };
 
 static int cfg_from_env_int(const char *name, int fallback) {
@@ -56,6 +58,7 @@ void tt_api_model_free(TTModel *m) {
     qwen2_engine_free(m->eng);
     bpe_tokenizer_free(m->tok);
     gguf_free(m->gguf);
+    free(m->mask_buf);
     free(m);
 }
 
@@ -118,6 +121,23 @@ const char *tt_api_stop_string(const TTModel *m) {
 
 void tt_api_set_sampling(TTModel *m, float temp, int topk, float penalty) {
     if (m) qwen2_engine_set_sampling(m->eng, temp, topk, penalty);
+}
+
+void tt_api_set_token_mask(TTModel *m, const uint8_t *mask) {
+    if (!m) return;
+    if (!mask) {
+        qwen2_engine_set_token_mask(m->eng, NULL);
+        return;
+    }
+    const int vocab = m->tok->vocab_size;
+    if (m->mask_cap < vocab) {
+        int *grown = (int *)realloc(m->mask_buf, (size_t)vocab * sizeof(int));
+        if (!grown) return;
+        m->mask_buf = grown;
+        m->mask_cap = vocab;
+    }
+    for (int i = 0; i < vocab; i++) m->mask_buf[i] = mask[i] ? 1 : 0;
+    qwen2_engine_set_token_mask(m->eng, m->mask_buf);
 }
 
 int tt_api_prefill(TTModel *m, const int *tokens, int n) {

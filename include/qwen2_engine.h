@@ -99,6 +99,7 @@ void qwen2_debug_profile_reset(void);
 void qwen2_debug_profile_report(int nsteps);
 
 /* sampling: temp>0 enables Gumbel-max sampling + repeat penalty; default greedy */
+void qwen2_engine_set_token_mask(Qwen2Engine *e, const int *mask);
 void qwen2_engine_set_sampling(Qwen2Engine *e, float temp, int topk, float penalty);
 
 /* debug/parity helpers */

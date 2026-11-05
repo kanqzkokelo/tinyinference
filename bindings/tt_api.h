@@ -57,6 +57,10 @@ TT_API const char *tt_api_stop_string(const TTModel *m);
 /* temp <= 0 keeps greedy argmax; topk <= 0 uses the engine default. */
 TT_API void tt_api_set_sampling(TTModel *m, float temp, int topk, float penalty);
 
+/* vocab-length allow mask: 1 keeps a token, 0 masks it to -inf.  Pass NULL
+ * to clear.  Enabling a mask drops captured CUDA graphs for this model. */
+TT_API void tt_api_set_token_mask(TTModel *m, const uint8_t *mask);
+
 TT_API int tt_api_prefill(TTModel *m, const int *tokens, int n);
 
 /* Sample one token from the current hidden state and feed it back through

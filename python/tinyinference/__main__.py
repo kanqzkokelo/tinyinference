@@ -28,6 +28,11 @@ def main(argv: list[str] | None = None) -> int:
     gen.add_argument("--top-k", type=int, default=0)
     gen.add_argument("--repeat-penalty", type=float, default=1.0)
     gen.add_argument("--n-ctx", type=int, default=0)
+    gen.add_argument(
+        "--json",
+        action="store_true",
+        help="constrain output to a JSON object",
+    )
 
     chat = sub.add_parser("chat", help="single-turn chat")
     chat.add_argument("model")
@@ -53,13 +58,22 @@ def main(argv: list[str] | None = None) -> int:
 
     with Model(args.model, args.n_ctx) as model:
         if args.command == "generate":
-            text = model.generate(
-                args.prompt,
-                args.max_tokens,
-                args.temperature,
-                args.top_k,
-                args.repeat_penalty,
-            )
+            if args.json:
+                text = model.generate_json(
+                    args.prompt,
+                    args.max_tokens,
+                    args.temperature,
+                    args.top_k,
+                    args.repeat_penalty,
+                )
+            else:
+                text = model.generate(
+                    args.prompt,
+                    args.max_tokens,
+                    args.temperature,
+                    args.top_k,
+                    args.repeat_penalty,
+                )
         else:
             text = model.chat(
                 [{"role": "user", "content": args.prompt}],

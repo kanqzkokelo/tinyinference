@@ -24,6 +24,8 @@ class Model:
 
     def __init__(self, path: str | os.PathLike[str], n_ctx: int = 0) -> None:
         self.path = str(path)
+        self._tok_bytes: list[bytes] | None = None
+        self._by_first: dict[int, list[int]] | None = None
         self._handle = lib.tt_api_model_load(
             os.fsencode(self.path), int(n_ctx)
         )
@@ -131,6 +133,18 @@ class Model:
     ) -> None:
         lib.tt_api_set_sampling(self._require(), float(temperature), int(top_k), float(repeat_penalty))
 
+    def set_token_mask(self, mask: "ctypes.Array | None") -> None:
+        """Restrict the next sample to tokens where mask[i] != 0.
+
+        Passing None clears the constraint.  Enabling a mask permanently
+        disables CUDA-graph replay for this model (the sampling kernels are
+        baked into the graph).
+        """
+        if mask is None:
+            lib.tt_api_set_token_mask(self._require(), None)
+            return
+        lib.tt_api_set_token_mask(self._require(), mask)
+
     def prefill(self, tokens: Iterable[int]) -> None:
         ids = [int(t) for t in tokens]
         if not ids:
@@ -211,6 +225,93 @@ class Model:
         prompt = self.chat_format(messages)
         return "".join(
             self.stream_text(self.encode(prompt), max_tokens, stop=stop)
+        )
+
+    # -- constrained decoding ------------------------------------------
+
+    def _token_table(self) -> tuple[list[bytes], dict[int, list[int]]]:
+        if self._tok_bytes is None:
+            vocab = self.vocab_size
+            data = [self.decode(i) for i in range(vocab)]
+            by_first: dict[int, list[int]] = {}
+            for tid, raw in enumerate(data):
+                if raw:
+                    by_first.setdefault(raw[0], []).append(tid)
+            self._tok_bytes = data
+            self._by_first = by_first
+        assert self._by_first is not None
+        return self._tok_bytes, self._by_first
+
+    def json_mask(self, state: "JSONState") -> "ctypes.Array":
+        """Allow-mask over the vocabulary for one JSON grammar state."""
+        from ._json import JSONState
+
+        assert isinstance(state, JSONState)
+        tokens, by_first = self._token_table()
+        mask = (ctypes.c_uint8 * self.vocab_size)()
+        for first in state.allowed_first():
+            for tid in by_first.get(first, ()):
+                if state.accept(tokens[tid]) is not None:
+                    mask[tid] = 1
+        if state.complete():
+            mask[self.eos_token_id] = 1
+        return mask
+
+    def stream_json(
+        self,
+        prompt_tokens: Iterable[int],
+        max_tokens: int = DEFAULT_MAX_TOKENS,
+        state: "JSONState | None" = None,
+    ) -> Iterator[str]:
+        """Generate text constrained to a single valid JSON value."""
+        from ._json import JSONState
+
+        self.prefill(prompt_tokens)
+        cur = state or JSONState()
+        eos = self.eos_token_id
+        limit = min(max_tokens, max(0, self.n_ctx - self.pos - 1))
+        decoder = codecs.getincrementaldecoder("utf-8")("replace")
+        try:
+            for _ in range(limit):
+                if cur.complete():
+                    break
+                self.set_token_mask(self.json_mask(cur))
+                tok = self.next_token()
+                if tok < 0 or tok == eos:
+                    break
+                raw = self.decode(tok)
+                nxt = cur.accept(raw)
+                if nxt is None:
+                    break
+                cur = nxt
+                text = decoder.decode(raw)
+                if text:
+                    yield text
+                if cur.complete():
+                    break
+        finally:
+            self.set_token_mask(None)
+
+    def generate_json(
+        self,
+        prompt: str,
+        max_tokens: int = DEFAULT_MAX_TOKENS,
+        temperature: float = 0.0,
+        top_k: int = 0,
+        repeat_penalty: float = 1.0,
+    ) -> str:
+        """Generate one JSON value and return the whole document.
+
+        A partial document at the end of *prompt* is continued rather than
+        restarted, so callers can pre-fill a schema skeleton.
+        """
+        from ._json import from_prefix
+
+        seeded = from_prefix(prompt)
+        prefix, state = seeded if seeded else ("", None)
+        self.set_sampling(temperature, top_k, repeat_penalty)
+        return prefix + "".join(
+            self.stream_json(self.encode(prompt), max_tokens, state=state)
         )
 
     # -- stop strings --------------------------------------------------

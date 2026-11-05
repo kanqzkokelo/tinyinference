@@ -19,6 +19,7 @@ from typing import Any
 
 from .model import Model
 
+
 __all__ = ["serve", "make_server"]
 
 
@@ -148,6 +149,10 @@ class _Handler(BaseHTTPRequestHandler):
             return False
         return True
 
+    def _json_mode(self, req: dict) -> bool:
+        fmt = req.get("response_format") or {}
+        return isinstance(fmt, dict) and fmt.get("type") == "json_object"
+
     def _generate(self, prompt: str, req: dict, chat: bool) -> None:
         model = self.model
         max_tokens = int(req.get("max_tokens") or req.get("max_completion_tokens") or 256)
@@ -157,6 +162,7 @@ class _Handler(BaseHTTPRequestHandler):
         stop = req.get("stop")
         stream = bool(req.get("stream", False))
         include_usage = bool((req.get("stream_options") or {}).get("include_usage"))
+        json_mode = self._json_mode(req)
 
         cid = _completion_id()
         created = _now()
@@ -170,13 +176,18 @@ class _Handler(BaseHTTPRequestHandler):
             limit = max(0, min(max_tokens, model.n_ctx - prompt_tokens - 1))
 
             model.set_sampling(temperature, top_k, repeat_penalty)
+            pieces = (
+                model.stream_json(tokens, max_tokens)
+                if json_mode
+                else model.stream_text(tokens, max_tokens, stop=stop)
+            )
 
             if stream:
                 self._start_stream()
                 self._sse(
                     self._chunk(cid, created, chat, delta={"role": "assistant", "content": ""})
                 )
-                for piece in model.stream_text(tokens, max_tokens, stop=stop):
+                for piece in pieces:
                     self._sse(self._chunk(cid, created, chat, delta={"content": piece}))
                 usage = self._usage(prompt_tokens)
                 self._sse(
@@ -189,10 +200,16 @@ class _Handler(BaseHTTPRequestHandler):
                 self._sse("[DONE]")
                 return
 
-            text = "".join(model.stream_text(tokens, max_tokens, stop=stop))
+            text = "".join(pieces)
             usage = self._usage(prompt_tokens)
         finally:
             self.lock.release()
+
+        if json_mode and text:
+            try:
+                json.loads(text)
+            except ValueError:
+                return self._error("model produced invalid JSON", status=500)
 
         finish = self._finish_reason(limit, usage)
         if chat:

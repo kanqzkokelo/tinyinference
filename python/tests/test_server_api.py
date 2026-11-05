@@ -143,6 +143,24 @@ def test_stream_with_usage(base_url):
     assert chunks[-1]["usage"]["completion_tokens"] > 0
 
 
+def test_json_object_response(base_url):
+    status, body = _post(
+        base_url + "/v1/chat/completions",
+        {
+            "model": "m",
+            "messages": [
+                {"role": "user", "content": "Give a JSON object with name and age."}
+            ],
+            "max_tokens": 48,
+            "temperature": 0,
+            "response_format": {"type": "json_object"},
+        },
+    )
+    assert status == 200
+    text = json.loads(body)["choices"][0]["message"]["content"]
+    assert isinstance(json.loads(text), dict)
+
+
 def test_rejects_n_greater_than_one(base_url):
     status, body = _post(
         base_url + "/v1/completions",

@@ -100,6 +100,9 @@ lib.tt_api_set_sampling.argtypes = [
 ]
 lib.tt_api_set_sampling.restype = None
 
+lib.tt_api_set_token_mask.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_uint8)]
+lib.tt_api_set_token_mask.restype = None
+
 lib.tt_api_prefill.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_int), ctypes.c_int]
 lib.tt_api_prefill.restype = ctypes.c_int
 lib.tt_api_next.argtypes = [ctypes.c_void_p]

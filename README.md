@@ -55,7 +55,7 @@ The wheel bundles the engine `.dll`/`.so` and the CUDA runtime, so `pip install`
 needs no compiler:
 
 ```
-pip install https://github.com/kanqzkokelo/tinyinference/releases/download/v0.9.2/tinyinference-0.9.2-py3-none-win_amd64.whl
+pip install https://github.com/kanqzkokelo/tinyinference/releases/download/v0.9.3/tinyinference-0.9.3-py3-none-win_amd64.whl
 ```
 
 Use a normal CPython (python.org or a venv), not the MSYS2 build. CUDA 12
@@ -63,6 +63,7 @@ driver or newer is required; nothing else.
 
 ```
 tinyinference chat model.gguf "Explain KV caching in one sentence"
+tinyinference generate model.gguf "List two colors" --json
 tinyinference serve model.gguf --port 8000
 ```
 
@@ -101,6 +102,7 @@ Supported request fields:
 | `stream` | SSE, terminated by `data: [DONE]` |
 | `stream_options.include_usage` | adds a final chunk with token counts |
 | `n` | only `1`; other values return 400 |
+| `response_format` | `{"type": "json_object"}` constrains decoding to valid JSON |
 
 `usage` counts are read from the engine position, so they match what was
 actually decoded.
@@ -109,7 +111,7 @@ To build the wheel from source instead:
 
 ```
 make -f Makefile.win pydll        # or `make pylib` on Linux
-bash python/build_wheel.sh        # -> python/dist/tinyinference-0.9.2-*.whl
+bash python/build_wheel.sh        # -> python/dist/tinyinference-0.9.3-*.whl
 ```
 
 ## Build

@@ -3784,6 +3784,14 @@ __device__ __forceinline__ unsigned int phil32(unsigned int seed, unsigned int i
     h ^= h >> 16; h *= 0x85EBCA6Bu; h ^= h >> 13; h *= 0xC2B2AE35u; h ^= h >> 16;
     return h;
 }
+/* Constrained decoding: forbid tokens the JSON grammar rejects. Runs after
+ * the repeat penalty and before the gumbel draw, so a masked token can never
+ * win the argmax. */
+__global__ void k_token_mask(float *__restrict__ logits,
+                             const int *__restrict__ mask, int vocab) {
+    const int i = threadIdx.x + blockIdx.x * blockDim.x;
+    if (i < vocab && !mask[i]) logits[i] = -INFINITY;
+}
 __global__ void k_gumbel_transform(float *__restrict__ logits, int vocab,
                                    float temp, const int *__restrict__ d_pos,
                                    const int *__restrict__ d_sampling_on) {
@@ -3892,6 +3900,8 @@ struct Qwen2Engine {
     int   *d_recent;              /* ring of recently fed tokens, 64 entries */
     int   *d_n_recent;            /* valid count in ring */
     int   *d_sampling_on;         /* 0/1 flag read by kernels inside graph */
+    int   *d_tok_mask;            /* [vocab] 0/1 JSON constraint, NULL until used */
+    int    tok_mask_on;           /* host mirror; graphs are dropped when set */
     int pending_tok;              /* sampled token not yet fed through layers */
     int   *cached_toks;           /* Automatic prefix caching: evaluated prompt tokens */
     int    cached_toks_len;
@@ -7212,9 +7222,12 @@ static void apply_sampling_eager(Qwen2Engine *e) {
     if (e->repeat_penalty > 1.0f)
         k_repeat_penalty<<<(e->cfg.vocab + 255) / 256, 256, 0, e->stream>>>(
             e->d_logits, e->d_recent, e->d_n_recent, e->cfg.vocab, e->repeat_penalty);
+    if (e->tok_mask_on && e->d_tok_mask)
+        k_token_mask<<<(e->cfg.vocab + 255) / 256, 256, 0, e->stream>>>(
+            e->d_logits, e->d_tok_mask, e->cfg.vocab);
     if (e->sampling_temp > 0.0f)
-    k_gumbel_transform<<<(e->cfg.vocab + 255) / 256, 256, 0, e->stream>>>(
-        e->d_logits, e->cfg.vocab, e->sampling_temp, e->d_pos, e->d_sampling_on);
+        k_gumbel_transform<<<(e->cfg.vocab + 255) / 256, 256, 0, e->stream>>>(
+            e->d_logits, e->cfg.vocab, e->sampling_temp, e->d_pos, e->d_sampling_on);
 }
 
 static int sample_eager(Qwen2Engine *e) {
@@ -7378,6 +7391,12 @@ static int qwen2_engine_graph_capture(Qwen2Engine *e, uint64_t key) {
     if (e->repeat_penalty > 1.0f)
     k_repeat_penalty<<<(c->vocab + 255) / 256, 256, 0, e->stream>>>(
         e->d_logits, e->d_recent, e->d_n_recent, c->vocab, e->repeat_penalty);
+    /* Same order as apply_sampling_eager: penalty, mask, gumbel. The mask
+     * buffer is read at replay time, so a graph stays valid while the mask
+     * stays enabled; enabling or disabling it drops captured slots. */
+    if (e->tok_mask_on && e->d_tok_mask)
+    k_token_mask<<<(c->vocab + 255) / 256, 256, 0, e->stream>>>(
+        e->d_logits, e->d_tok_mask, c->vocab);
     if (e->sampling_temp > 0.0f)
     k_gumbel_transform<<<(c->vocab + 255) / 256, 256, 0, e->stream>>>(
         e->d_logits, c->vocab, e->sampling_temp, e->d_pos, e->d_sampling_on);
@@ -7679,6 +7698,29 @@ void qwen2_engine_set_sampling(Qwen2Engine *e, float temp, int topk,
     if (on)
         fprintf(stderr, "[qwen2-engine] sampling ON: temp=%.2f penalty=%.2f\n",
                 temp, penalty);
+}
+
+void qwen2_engine_set_token_mask(Qwen2Engine *e, const int *mask) {
+    if (!e) return;
+    const int want = mask != NULL;
+    if (want && !e->d_tok_mask) {
+        if (cudaMalloc(&e->d_tok_mask, (size_t)e->cfg.vocab * sizeof(int)) != cudaSuccess) {
+            e->d_tok_mask = NULL;
+            return;
+        }
+    }
+    /* The mask kernel is only in a graph if it was enabled at capture time,
+     * so a change in presence invalidates captured slots. They are rebuilt
+     * on the next step with the new state. */
+    if (want != e->tok_mask_on && e->graph_slot_used > 0)
+        graph_slots_drop_all(e);
+    if (want) {
+        cudaMemcpy(e->d_tok_mask, mask, (size_t)e->cfg.vocab * sizeof(int),
+                   cudaMemcpyHostToDevice);
+        e->tok_mask_on = 1;
+    } else {
+        e->tok_mask_on = 0;
+    }
 }
 
 /* debug accessors (used by parity harness; not part of the public API contract) */
