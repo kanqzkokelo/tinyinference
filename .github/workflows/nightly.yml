@@ -58,17 +58,12 @@ jobs:
           sudo apt-get update && sudo apt-get install -y gcc python3-numpy
       - name: Build cpu_backend binary (long-tests consume it)
         run: |
+          mkdir -p build
           gcc -O3 -mavx2 -mfma -fopenmp -std=c11 -Iinclude \
             -DCPU_BACKEND_MAIN -o build/cpu_backend src/cpu_backend.c -lm
 
       # The expensive ones. Each is allowed to fail individually so the
       # other regressions still surface in the same run.
-      - name: engine golden (3 models x 3 prompts, minutes)
-        id: engine-golden
-        continue-on-error: true
-        run: |
-          python3 tests/test_engine_golden.py verify 2>&1 \
-            | tee build_nightly_engine_golden.log
       - name: samplers conformance (5000 cases, ~10s)
         id: samplers-conformance
         continue-on-error: true
@@ -82,13 +77,14 @@ jobs:
           python3 tests/test_cpu_backend.py 2>&1 \
             | tee build_nightly_cpu_backend.log
 
-      # Aggregate: if ANY of the three regressed, fail the job. This is the
+      # Aggregate: if ANY of the two regressed, fail the job. This is the
       # notification path (red badge in GH PR checks + email if subscribed).
+      # engine_golden is GPU-only (needs CUDA + model files), so it runs
+      # from scripts/verify.sh m61 on a GPU box, not on hosted runners.
       - name: Gate on regression
-        if: always() && (steps.engine-golden.outcome == 'failure' || steps.samplers-conformance.outcome == 'failure' || steps.cpu-backend-sweep.outcome == 'failure')
+        if: always() && (steps.samplers-conformance.outcome == 'failure' || steps.cpu-backend-sweep.outcome == 'failure')
         run: |
           echo "::error::Nightly regression detected:"
-          [ "${{ steps.engine-golden.outcome }}" = "failure" ]       && echo " - engine_golden"
           [ "${{ steps.samplers-conformance.outcome }}" = "failure" ] && echo " - samplers_conformance"
           [ "${{ steps.cpu-backend-sweep.outcome }}" = "failure" ]    && echo " - cpu_backend_sweep"
           exit 1
