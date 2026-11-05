@@ -10,6 +10,12 @@ from .model import Model
 
 
 def main(argv: list[str] | None = None) -> int:
+    # Model output is UTF-8; the Windows console defaults to a legacy code page
+    # and raises UnicodeEncodeError on emoji and non-Latin text.
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, "reconfigure"):
+            stream.reconfigure(encoding="utf-8", errors="replace")
+
     parser = argparse.ArgumentParser(prog="tinyinference")
     parser.add_argument("--version", action="version", version=__version__)
     sub = parser.add_subparsers(dest="command", required=True)

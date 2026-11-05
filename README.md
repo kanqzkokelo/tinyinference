@@ -51,13 +51,15 @@ field to several GGUF files in one process.
 
 ## Python
 
-The wheel bundles the engine `.dll`/`.so`, so `pip install` needs no compiler:
+The wheel bundles the engine `.dll`/`.so` and the CUDA runtime, so `pip install`
+needs no compiler:
 
 ```
-make -f Makefile.win pydll        # or `make pylib` on Linux
-bash python/build_wheel.sh        # -> python/dist/tinyinference-0.9.0-*.whl
-pip install python/dist/tinyinference-0.9.0-py3-none-win_amd64.whl
+pip install https://github.com/kanqzkokelo/tinyinference/releases/download/v0.9.1/tinyinference-0.9.1-py3-none-win_amd64.whl
 ```
+
+Use a normal CPython (python.org or a venv), not the MSYS2 build. CUDA 12
+driver or newer is required; nothing else.
 
 ```
 tinyinference chat model.gguf "Explain KV caching in one sentence"
@@ -73,9 +75,27 @@ with Model("model.gguf", n_ctx=4096) as m:
         print(piece, end="", flush=True)
 ```
 
-`tinyinference serve` speaks the OpenAI chat and completions API, so the
-`openai` client works with `base_url="http://127.0.0.1:8000/v1"`. Requests are
-serialized: one model, one KV cache.
+`tinyinference serve` speaks the OpenAI chat and completions API. The official
+`openai` client works unmodified, streaming included:
+
+```python
+from openai import OpenAI
+
+c = OpenAI(base_url="http://127.0.0.1:8000/v1", api_key="none")
+print(c.chat.completions.create(
+    model="local",
+    messages=[{"role": "user", "content": "hi"}],
+).choices[0].message.content)
+```
+
+Requests are serialized: one model, one KV cache.
+
+To build the wheel from source instead:
+
+```
+make -f Makefile.win pydll        # or `make pylib` on Linux
+bash python/build_wheel.sh        # -> python/dist/tinyinference-0.9.1-*.whl
+```
 
 ## Build
 
