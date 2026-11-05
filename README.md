@@ -86,3 +86,7 @@ and quant tiers are in `docs/SUPPORTED_FAMILIES.md`.
 cpu_backend, moe_router, specdec, ngram_lookup, dequant_ref),
 `kernels/` CUDA, `tools/` microbenches, `bench/bench_llm.py`
 scoreboard, golden logits in `data/golden/`, servers in `examples/`.
+
+## License
+
+MIT. See [LICENSE](LICENSE).
