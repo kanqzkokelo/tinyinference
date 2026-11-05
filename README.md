@@ -183,8 +183,11 @@ against itself.
 - NVIDIA only. There is no Vulkan, Metal, or ROCm backend, and generation
   requires a CUDA GPU; the CPU backend covers prefill/GEMV paths used by the
   library and tests, not standalone generation.
-- No grammar/JSON-constrained decoding, tool calling, or continuous
-  batching. The server handles one request at a time per process.
+- JSON mode constrains decoding to a valid JSON prefix, but it is not a
+  general grammar engine: no GBNF, regex, or schema-guided sampling, and no
+  tool calling.
+- No continuous batching. The server handles one request at a time per
+  process.
 - No quantization or GGUF conversion. Bring a file produced by llama.cpp.
 - Prefix caching (`TT_PREFIX_CACHE`) is opt-in and covers prefill tokens;
   generated tokens are re-fed on the next turn.

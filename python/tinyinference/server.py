@@ -205,12 +205,9 @@ class _Handler(BaseHTTPRequestHandler):
         finally:
             self.lock.release()
 
-        if json_mode and text:
-            try:
-                json.loads(text)
-            except ValueError:
-                return self._error("model produced invalid JSON", status=500)
-
+        # A json_object response can still end early (max_tokens), so a
+        # parse failure here is not a server error. The grammar only
+        # guarantees the prefix is valid; callers check finish_reason.
         finish = self._finish_reason(limit, usage)
         if chat:
             payload = {

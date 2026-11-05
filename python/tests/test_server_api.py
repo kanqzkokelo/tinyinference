@@ -161,6 +161,22 @@ def test_json_object_response(base_url):
     assert isinstance(json.loads(text), dict)
 
 
+def test_json_object_truncated_is_not_an_error(base_url):
+    # max_tokens can cut a document short; that is a length stop, not a 500.
+    status, body = _post(
+        base_url + "/v1/chat/completions",
+        {
+            "model": "m",
+            "messages": [{"role": "user", "content": "Return a JSON object."}],
+            "max_tokens": 3,
+            "temperature": 0,
+            "response_format": {"type": "json_object"},
+        },
+    )
+    assert status == 200
+    assert json.loads(body)["choices"][0]["finish_reason"] == "length"
+
+
 def test_rejects_n_greater_than_one(base_url):
     status, body = _post(
         base_url + "/v1/completions",
