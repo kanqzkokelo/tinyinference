@@ -19,6 +19,22 @@ make run_llm_gpu         # needs nvcc + RTX-class GPU
 ./scripts/ci_local.sh    # 30s CPU sanity, no GPU needed
 ```
 
+### Windows (native, no WSL)
+
+The portable C surface builds with MSYS2 mingw-w64; the CUDA engine builds
+with MSVC + nvcc. Run from the repo root:
+
+```
+make -f Makefile.win all      # lib + tools + CPU test binaries -> build/
+make -f Makefile.win cuda     # CUDA engine, GPU tools, oracle helper
+make -f Makefile.win test     # run the CPU test suite
+./scripts/ci_windows.sh       # CPU suite + GPU gates when a device is present
+```
+
+`nvcc` and `cl` must be on `PATH` (or set `NVCC` / `CL`); see `Makefile.win`.
+Gates resolve `build/*.exe` and `%TEMP%` automatically and load
+`libtinytorch.dll` instead of the `.so`.
+
 ## Quickstart
 
 ```
@@ -37,6 +53,7 @@ python3 real_chat.py # ctypes live chat app (uses build/libtinytorch.so)
 
 ```
 ./scripts/ci_local.sh        # samplers, specdec-sim, chat-template, kvcache, cpu_backend
+./scripts/ci_windows.sh      # Windows equivalent of ci_local + CUDA gates
 ./scripts/verify.sh m61      # greedy-logit parity vs llama.cpp + multiturn chat
 ./scripts/verify.sh m84      # gemma4 parity
 ./scripts/verify.sh ple      # PLE-fused golden

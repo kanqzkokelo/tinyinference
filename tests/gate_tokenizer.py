@@ -28,9 +28,12 @@ import subprocess
 import sys
 import tempfile
 
+from tt_platform import find_cc
+
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 MODEL_DIR = os.path.join(REPO, "data", "testmodels")
-ORACLE = os.path.join(REPO, "oracle", "llama.cpp", "build", "bin", "llama-tokenize")
+ORACLE = os.path.join(REPO, "oracle", "llama.cpp", "build", "bin",
+                      "llama-tokenize" + (".exe" if os.name == "nt" else ""))
 MAX_MODEL_BYTES = int(1.5e9)
 
 DRIVER_C = r"""
@@ -122,6 +125,8 @@ PROBE_STRINGS = [
 
 def discover_models():
     models = []
+    if not os.path.isdir(MODEL_DIR):
+        return models
     for name in sorted(os.listdir(MODEL_DIR)):
         if not name.endswith(".gguf"):
             continue
@@ -135,10 +140,10 @@ def discover_models():
 
 def build_driver(tmpdir):
     src = os.path.join(tmpdir, "gate_tok_driver.c")
-    exe = os.path.join(tmpdir, "gate_tok_driver")
+    exe = os.path.join(tmpdir, "gate_tok_driver" + (".exe" if os.name == "nt" else ""))
     with open(src, "w") as f:
         f.write(DRIVER_C)
-    cmd = ["gcc", "-O2", "-DTT_IN_LIB", "-I", os.path.join(REPO, "include"),
+    cmd = [find_cc(), "-O2", "-DTT_IN_LIB", "-I", os.path.join(REPO, "include"),
            "-o", exe, src,
            os.path.join(REPO, "src", "tokenizer_bpe.c"),
            os.path.join(REPO, "src", "loader_gguf.c"),

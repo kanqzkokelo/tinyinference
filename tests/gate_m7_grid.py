@@ -10,15 +10,15 @@ Usage: gate_m7_grid.py [--strict-median]   # strict: median<=0.15 for all
 """
 import json, os, subprocess, sys
 
+from tt_platform import env_with_lib
+
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 os.chdir(ROOT)
 GATE = os.path.join(ROOT, "tests/gate_m7_arch.py")
 BASELINE = os.path.join(ROOT, "tests/fixtures/grid_baseline.json")
-env = dict(os.environ)
-env["LD_LIBRARY_PATH"] = ":".join(filter(None, [
-    os.path.expanduser("~/mmcuda/lib"),
-    os.path.expanduser("~/.local/lib/python3.12/site-packages/nvidia/cuda_runtime/lib"),
-    env.get("LD_LIBRARY_PATH", "")]))
+env = env_with_lib([os.path.expanduser("~/mmcuda/lib"),
+                    os.path.expanduser(
+                        "~/.local/lib/python3.12/site-packages/nvidia/cuda_runtime/lib")])
 
 MODELS = []
 mf = "tests/fixtures/models.json"

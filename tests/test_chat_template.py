@@ -20,6 +20,8 @@ import subprocess
 import sys
 import tempfile
 
+from tt_platform import find_cc
+
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SRC = os.path.join(REPO, "src", "chat_template.c")
 HDR_DIR = os.path.join(REPO, "include")
@@ -44,9 +46,10 @@ class TTOpts(ctypes.Structure):
 
 def build_lib():
     tmp = tempfile.mkdtemp(prefix="tt_chat_tpl_")
-    so = os.path.join(tmp, "libchat_template.so")
+    suf = ".dll" if os.name == "nt" else ".so"
+    so = os.path.join(tmp, "libchat_template" + suf)
     subprocess.run(
-        ["cc", "-std=c11", "-Wall", "-Wextra", "-O2", "-I", HDR_DIR,
+        [find_cc(), "-std=c11", "-Wall", "-Wextra", "-O2", "-I", HDR_DIR,
          "-shared", "-fPIC", "-o", so, SRC],
         check=True,
     )

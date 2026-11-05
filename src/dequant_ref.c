@@ -434,7 +434,8 @@ int main(int argc, char **argv) {
             printf("%s\t%s\t%zu\t%llu\n", m->tensors[i].name,
                    tt_type_name((int)m->tensors[i].type),
                    m->tensors[i].size_bytes,
-                   (unsigned long long)m->tensors[i].offset);
+                   (unsigned long long)((const uint8_t *)m->tensors[i].data -
+                                        (const uint8_t *)m->mmap_addr));
         gguf_free(m);
         return 0;
     }

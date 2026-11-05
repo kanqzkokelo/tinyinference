@@ -20,25 +20,27 @@ import re
 import subprocess
 import sys
 
+from tt_platform import env_with_lib, exe
+
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 os.chdir(ROOT)
+CHAT = exe("chat_llm_gpu")
 
 MODEL = "data/models/qwen2.5-0.5b-instruct-q4_0.gguf"
 MAX_CTX = 1024
 
 
 def run_session(env_extra):
-    env = dict(os.environ)
-    env["LD_LIBRARY_PATH"] = ":".join(filter(None, [
-        os.path.expanduser("~/mmcuda/lib"),
-        os.path.expanduser("~/.local/lib/python3.12/site-packages/nvidia/cuda_runtime/lib"),
-        env.get("LD_LIBRARY_PATH", "")]))
+    env = env_with_lib([os.path.expanduser("~/mmcuda/lib"),
+                        os.path.expanduser(
+                            "~/.local/lib/python3.12/site-packages/nvidia/cuda_runtime/lib")])
     env.update(env_extra)
     turns = ["What is 2+2?", "Name a color.", "Say OK."]
     inp = "".join(t + "\n" for t in turns) + "/exit\n"
-    r = subprocess.run(["./build/chat_llm_gpu"], input=inp,
+    r = subprocess.run([CHAT], input=inp,
                        capture_output=True, text=True, env=env, timeout=1800)
-    parsed = re.findall(r"User > (.*?)\n\n\[(\d+) tokens.*?ctx (\d+)/", r.stdout, re.S)
+    parsed = re.findall(r"User > (.*?)\n\n\[(\d+) tokens.*?ctx (\d+)/",
+                        r.stdout.replace("\r\n", "\n"), re.S)
     if len(parsed) != len(turns):
         print(f"[FAIL] expected {len(turns)} turns, parsed {len(parsed)}")
         print(r.stdout[-2000:])
@@ -100,8 +102,8 @@ def check_path(name, env_extra):
 
 
 def main():
-    if not os.path.exists("./build/chat_llm_gpu"):
-        print("[FAIL] build/chat_llm_gpu missing (run make)")
+    if not os.path.exists(CHAT):
+        print(f"[FAIL] {CHAT} missing (run make)")
         return 1
     if not os.path.exists(MODEL):
         print(f"[FAIL] model missing: {MODEL}")

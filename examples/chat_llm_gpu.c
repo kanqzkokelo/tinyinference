@@ -11,6 +11,7 @@
 #include <string.h>
 #include <time.h>
 #include <cuda_runtime.h>
+#include "tt_platform.h"
 #include "loader_gguf.h"
 #include "qwen2_engine.h"
 #include "tokenizer_bpe.h"

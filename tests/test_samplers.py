@@ -11,22 +11,22 @@ Run:
     python3 tests/test_samplers.py
 """
 import math
-import shutil
 import subprocess
 import sys
 import tempfile
 import os
 import unittest
 
+from tt_platform import find_cc
+
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SRC = os.path.join(REPO, "src", "samplers.c")
 
 
 def compile_cli():
-    cc = shutil.which("cc") or shutil.which("gcc") or shutil.which("clang")
-    if not cc:
-        raise RuntimeError("no C compiler found (cc/gcc/clang)")
-    exe = os.path.join(tempfile.mkdtemp(prefix="tt_samplers_"), "tt_sampler_cli")
+    cc = find_cc()
+    exe = os.path.join(tempfile.mkdtemp(prefix="tt_samplers_"),
+                       "tt_sampler_cli" + (".exe" if os.name == "nt" else ""))
     cmd = [cc, "-std=c99", "-O2", "-Wall", "-Wextra",
            "-DSAMPLERS_MAIN", "-o", exe, SRC, "-lm"]
     r = subprocess.run(cmd, capture_output=True, text=True)

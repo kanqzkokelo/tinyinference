@@ -1,6 +1,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <time.h>
+#include "tt_platform.h"
 #include "loader_gguf.h"
 #include "ops_llm.h"
 

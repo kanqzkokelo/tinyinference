@@ -15,6 +15,7 @@
  */
 #define _POSIX_C_SOURCE 200809L   /* clock_gettime under -std=c11 */
 #include "cpu_backend.h"
+#include "tt_platform.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -896,11 +897,7 @@ long tt_cpu_gemv(const void *W, int dtype, const float *x, float *y,
 /* ------------------------- standalone driver ----------------------------- */
 #ifdef CPU_BACKEND_MAIN
 
-static double now_ms(void) {
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return ts.tv_sec * 1e3 + ts.tv_nsec / 1e6;
-}
+static double now_ms(void) { return tt_now_ms(); }
 
 int main(int argc, char **argv) {
     if (argc < 7) {

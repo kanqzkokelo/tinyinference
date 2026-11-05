@@ -5,14 +5,13 @@ AND median|dlogit| <= 0.15 over >= 85% of prompts."""
 import json, subprocess, os, sys
 import numpy as np
 
+from tt_platform import env_with_lib, exe, tmp
+
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 os.chdir(ROOT)
 FIX = os.path.join(ROOT, "tests/fixtures")
-env = dict(os.environ)
-env["LD_LIBRARY_PATH"] = ":".join(filter(None, [
-    os.path.expanduser("~/mmcuda/lib"),
-    os.path.expanduser("~/.local/lib/python3.12/site-packages/nvidia/cuda_runtime/lib"),
-    env.get("LD_LIBRARY_PATH", "")]))
+env = env_with_lib(os.path.expanduser("~/mmcuda/lib"))
+BIN = exe("dump_logits")
 
 def fail(i, d, why):
     print(f"[FAIL] {d['prompt'][:40]!r:44s} {why}")
@@ -23,7 +22,7 @@ npass = 0
 for i, d in enumerate(data):
     ids = ",".join(map(str, d["tokens"]))
     try:
-        r = subprocess.run(["build/dump_logits", ids, f"/tmp/ours_lg_{i}.bin"],
+        r = subprocess.run([BIN, ids, tmp(f"ours_lg_{i}.bin")],
                            capture_output=True, text=True, timeout=300, env=env)
     except (subprocess.TimeoutExpired, OSError) as exc:
         fail(i, d, f"engine did not run: {exc}")
@@ -31,7 +30,7 @@ for i, d in enumerate(data):
     if r.returncode != 0:
         tail = "\n".join(r.stderr.splitlines()[-5:]) or "(no stderr)"
         hint = ("build/dump_logits missing? build first"
-                if not os.path.exists("build/dump_logits")
+                if not os.path.exists(BIN)
                 else "GPU or driver issue?")
         fail(i, d, f"exit={r.returncode}\n  stderr tail:\n{tail}\n  hint: {hint}")
         continue
@@ -39,17 +38,18 @@ for i, d in enumerate(data):
     if not am_lines:
         tail = "\n".join(r.stderr.splitlines()[-5:]) or "(no stderr)"
         hint = ("build/dump_logits missing? build first"
-                if not os.path.exists("build/dump_logits")
+                if not os.path.exists(BIN)
                 else "GPU or driver issue?")
         fail(i, d, f"no ARGMAX line\n  stderr tail:\n{tail}\n  hint: {hint}")
         continue
     parts = am_lines[0].split()
     ours_am, ours_v = int(parts[1]), float(parts[2])
     ref = np.fromfile(f"{FIX}/oracle_lg_{i}.bin", dtype="<f4")
-    if not os.path.exists(f"/tmp/ours_lg_{i}.bin"):
+    out_bin = tmp(f"ours_lg_{i}.bin")
+    if not os.path.exists(out_bin):
         fail(i, d, "no logits dump written by engine")
         continue
-    ours_full = np.fromfile(f"/tmp/ours_lg_{i}.bin", dtype="<f4")
+    ours_full = np.fromfile(out_bin, dtype="<f4")
     if len(ours_full) < len(ref):
         fail(i, d, f"vocab-size mismatch: ours={len(ours_full)} ref={len(ref)} "
                    f"(oracle vocab {len(ref)} vs engine vocab {len(ours_full)})")

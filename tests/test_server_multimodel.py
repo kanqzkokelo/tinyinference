@@ -28,6 +28,7 @@ import os
 import socket
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 from typing import Any
@@ -35,8 +36,10 @@ from typing import Any
 import pytest
 import requests
 
+from tt_platform import exe
+
 REPO = Path(__file__).resolve().parent.parent
-BUILD_BIN = REPO / "build" / "server_multimodel"
+BUILD_BIN = Path(exe("server_multimodel"))
 DEFAULT_MODEL = REPO / "data" / "models" / "qwen2.5-0.5b-instruct-q4_0.gguf"
 
 TEST_LISTEN_HOST = "127.0.0.1"
@@ -101,13 +104,16 @@ def server():
     env["TT_GREEDY"] = "1"
     env["TT_MAX_CTX"] = "1024"
 
+    log = Path(tempfile.gettempdir()) / "tt_server_multimodel.log"
+    logf = open(log, "wb")
     proc = subprocess.Popen(
         [str(BUILD_BIN)],
         env=env,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
+        stdout=logf,
+        stderr=subprocess.STDOUT,
         cwd=str(REPO),
     )
+    logf.close()
     try:
         # Both engines load before the socket binds; under contention this
         # can take 30-60s. Beyond that we skip rather than hang.
@@ -118,9 +124,8 @@ def server():
             proc.wait(timeout=5)
         except subprocess.TimeoutExpired:
             proc.kill()
-        out, err = proc.communicate(timeout=5)
-        sys.stderr.write("--- server stdout ---\n" + (out or b"").decode(errors="replace"))
-        sys.stderr.write("--- server stderr ---\n" + (err or b"").decode(errors="replace"))
+        sys.stderr.write(f"--- server log ({log}), tail ---\n")
+        sys.stderr.write(log.read_bytes()[-4000:].decode(errors="replace"))
         pytest.skip(f"server failed to start on {base} (likely GPU contention)")
         return  # unreachable
 

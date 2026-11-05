@@ -52,12 +52,26 @@
 #include <time.h>
 #include <errno.h>
 #include <signal.h>
+#ifdef _WIN32
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#include "tt_pthread.h"
+typedef SSIZE_T ssize_t;
+#define close closesocket
+#ifndef MSG_NOSIGNAL
+#define MSG_NOSIGNAL 0
+#endif
+#ifndef SHUT_RDWR
+#define SHUT_RDWR SD_BOTH
+#endif
+#else
 #include <unistd.h>
 #include <pthread.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <netinet/tcp.h>
+#endif
 #include <cuda_runtime.h>
 
 #include "loader_gguf.h"
@@ -65,6 +79,7 @@
 #include "tokenizer_bpe.h"
 #include "chat_template.h"
 #include "samplers.h"
+#include "tt_platform.h"
 
 /* --------------------------- configuration ---------------------------- */
 
@@ -932,7 +947,12 @@ int main(int argc, char **argv) {
     (void)argc; (void)argv;
     signal(SIGINT,  on_signal);
     signal(SIGTERM, on_signal);
+#ifndef _WIN32
     signal(SIGPIPE, SIG_IGN);
+#else
+    WSADATA wsa;
+    if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0) die("WSAStartup failed");
+#endif
 
     const char *models_spec = env_or(ENV_MODELS, NULL);
     const char *listen_str  = env_or(ENV_LISTEN, DEFAULT_LISTEN);

@@ -7,13 +7,15 @@ import os
 import sys
 import time
 import subprocess
+import tempfile
 import numpy as np
 
-ROOT = "/home/mitesh/Storage/repos/nnfromscratch"
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 MODEL_PATH = os.path.join(ROOT, "data", "models", "qwen2.5-0.5b-instruct-q4_0.gguf")
+LIB_EXT = ".dll" if os.name == "nt" else ".so"
 
 # Load C shared library
-clib = ctypes.CDLL(os.path.join(ROOT, "build", "libtinytorch_cuda.so"))
+clib = ctypes.CDLL(os.path.join(ROOT, "build", "libtinytorch_cuda" + LIB_EXT))
 clib.tt_cuda_alloc.argtypes = [ctypes.POINTER(ctypes.c_void_p), ctypes.c_size_t]
 clib.tt_cuda_free.argtypes = [ctypes.c_void_p]
 
@@ -207,20 +209,23 @@ int launch_transformer_step(cudaGraphExec_t graphExec) {
 }
 """
 
-cu_file = "/home/mitesh/Storage/tmp/gen_cuda_engine.cu"
-so_file = "/home/mitesh/Storage/tmp/libgen_cuda_engine.so"
+cu_file = os.path.join(tempfile.gettempdir(), "gen_cuda_engine.cu")
+so_file = os.path.join(tempfile.gettempdir(), "libgen_cuda_engine" + LIB_EXT)
 
 with open(cu_file, "w") as f:
     f.write(code)
 
-nvcc = os.path.expanduser("~/mmcuda/bin/nvcc")
-cuda_inc = os.path.expanduser("~/.local/lib/python3.12/site-packages/nvidia/cuda_runtime/include")
-
-subprocess.run([
-    nvcc, "-O3", "-gencode", "arch=compute_86,code=sm_86",
-    "-I" + cuda_inc, "-shared", "-Xcompiler", "-fPIC",
-    "-o", so_file, cu_file
-], check=True, cwd=ROOT)
+nvcc = os.environ.get("NVCC") or "nvcc"
+cmd = [nvcc, "-O3", "-gencode", "arch=compute_86,code=sm_86",
+       "-shared", "-o", so_file, cu_file]
+if os.name != "nt":
+    cuda_inc = os.path.expanduser(
+        "~/.local/lib/python3.12/site-packages/nvidia/cuda_runtime/include")
+    if os.path.isdir(cuda_inc):
+        cmd.insert(3, "-I" + cuda_inc)
+    cmd.insert(-3, "-Xcompiler")
+    cmd.insert(-3, "-fPIC")
+subprocess.run(cmd, check=True, cwd=ROOT)
 
 lib = ctypes.CDLL(so_file)
 lib.init_transformer_graph.argtypes = [ctypes.POINTER(ctypes.c_void_p)]*4 + [ctypes.c_void_p]*5 + [ctypes.c_int]*2 + [ctypes.POINTER(ctypes.c_void_p)]

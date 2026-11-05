@@ -435,23 +435,23 @@ void tt_kv_memory(const tt_kvcache_cfg *cfg, tt_kv_mem *out) {
     memset(out, 0, sizeof(*out));
     if (!cfg_sane(cfg)) return;
 
-    long maxw = 0, owned_exact = 0;
+    int64_t maxw = 0, owned_exact = 0;
     int n_own = 0;
     for (int l = 0; l < cfg->n_layers; l++) {
-        const long w = cfg->kv_width ? cfg->kv_width[l] : cfg->head_dim;
+        const int64_t w = cfg->kv_width ? cfg->kv_width[l] : cfg->head_dim;
         if (w > maxw) maxw = w;
         const int src = cfg->src_layer ? cfg->src_layer[l] : -1;
         if (src < 0) { n_own++; owned_exact += w; }
     }
     const double dt = (double)cfg->dtype_size;
-    const double tok = (double)cfg->max_ctx;
+    const int64_t tok = (int64_t)cfg->max_ctx;
 
-    const long b_no_share = (long)((double)cfg->n_layers * 2.0 *
-                                   (double)maxw * tok * dt);
-    const long b_shared   = (long)((double)n_own * 2.0 *
-                                   (double)maxw * tok * dt);
-    const long b_ideal    = 2L * owned_exact * (long)tok *
-                            (long)cfg->dtype_size;
+    const int64_t b_no_share = (int64_t)((double)cfg->n_layers * 2.0 *
+                                         (double)maxw * (double)tok * dt);
+    const int64_t b_shared   = (int64_t)((double)n_own * 2.0 *
+                                         (double)maxw * (double)tok * dt);
+    const int64_t b_ideal    = 2 * owned_exact * tok *
+                               (int64_t)cfg->dtype_size;
     out->b_no_share = b_no_share;
     out->b_shared   = b_shared;
     out->b_ideal    = b_ideal;

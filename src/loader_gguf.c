@@ -1,11 +1,8 @@
 #include "loader_gguf.h"
+#include "tt_platform.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <fcntl.h>
-#include <unistd.h>
-#include <sys/mman.h>
-#include <sys/stat.h>
 
 #define GGUF_MAGIC 0x46554747 // "GGUF"
 
@@ -106,31 +103,15 @@ static int skip_kv_value(GCursor *c, uint32_t type) {
 }
 
 GGUFModel *gguf_load(const char *filepath) {
-    int fd = open(filepath, O_RDONLY);
-    if (fd < 0) {
-        fprintf(stderr, "[GGUF] Failed to open file: %s\n", filepath);
+    size_t file_size = 0;
+    void *mmap_addr = tt_map_file(filepath, &file_size);
+    if (!mmap_addr) {
+        fprintf(stderr, "[GGUF] Failed to open/mmap file: %s\n", filepath);
         return NULL;
     }
-
-    struct stat st;
-    if (fstat(fd, &st) < 0) {
-        close(fd);
-        fprintf(stderr, "[GGUF] fstat failed: %s\n", filepath);
-        return NULL;
-    }
-
-    size_t file_size = (size_t)st.st_size;
     if (file_size < 8) {
-        close(fd);
+        tt_unmap_file(mmap_addr, file_size);
         fprintf(stderr, "[GGUF] File too small to be GGUF (%zu bytes): %s\n", file_size, filepath);
-        return NULL;
-    }
-
-    void *mmap_addr = mmap(NULL, file_size, PROT_READ, MAP_SHARED, fd, 0);
-    close(fd);
-
-    if (mmap_addr == MAP_FAILED) {
-        fprintf(stderr, "[GGUF] mmap failed for %s\n", filepath);
         return NULL;
     }
 
@@ -142,7 +123,7 @@ GGUFModel *gguf_load(const char *filepath) {
     uint32_t magic = read_u32(&c);
     if (magic != GGUF_MAGIC) {
         fprintf(stderr, "[GGUF] Invalid magic header: 0x%08x\n", magic);
-        munmap(mmap_addr, file_size);
+        tt_unmap_file(mmap_addr, file_size);
         return NULL;
     }
     uint32_t version = read_u32(&c);
@@ -150,7 +131,7 @@ GGUFModel *gguf_load(const char *filepath) {
     uint64_t kv_count = read_u64(&c);
     if (c.err) {
         fprintf(stderr, "[GGUF] Truncated header: %s\n", filepath);
-        munmap(mmap_addr, file_size);
+        tt_unmap_file(mmap_addr, file_size);
         return NULL;
     }
 
@@ -159,7 +140,7 @@ GGUFModel *gguf_load(const char *filepath) {
     if (tensor_count == 0 || tensor_count > MAX_TENSORS) {
         fprintf(stderr, "[GGUF] Unrealistic tensor count %llu (cap %llu): %s\n",
                 (unsigned long long)tensor_count, (unsigned long long)MAX_TENSORS, filepath);
-        munmap(mmap_addr, file_size);
+        tt_unmap_file(mmap_addr, file_size);
         return NULL;
     }
     /* A tensor header needs >=33 bytes on disk (u64 name-len + >=1 name byte
@@ -168,20 +149,20 @@ GGUFModel *gguf_load(const char *filepath) {
     if (tensor_count > (uint64_t)(file_size / 16)) {
         fprintf(stderr, "[GGUF] Unrealistic tensor count %llu for %zu-byte file: %s\n",
                 (unsigned long long)tensor_count, file_size, filepath);
-        munmap(mmap_addr, file_size);
+        tt_unmap_file(mmap_addr, file_size);
         return NULL;
     }
     if (kv_count > file_size / 8) {
         fprintf(stderr, "[GGUF] Unrealistic metadata kv count %llu for %zu-byte file: %s\n",
                 (unsigned long long)kv_count, file_size, filepath);
-        munmap(mmap_addr, file_size);
+        tt_unmap_file(mmap_addr, file_size);
         return NULL;
     }
 
     model = (GGUFModel *)calloc(1, sizeof(GGUFModel));
     if (!model) {
         fprintf(stderr, "[GGUF] Out of memory (model struct)\n");
-        munmap(mmap_addr, file_size);
+        tt_unmap_file(mmap_addr, file_size);
         return NULL;
     }
     model->mmap_addr = mmap_addr;
@@ -450,7 +431,7 @@ fail:
         free(model->tensors);
         free(model);
     }
-    munmap(mmap_addr, file_size);
+    tt_unmap_file(mmap_addr, file_size);
     return NULL;
 }
 
@@ -464,7 +445,7 @@ GGUFTensor *gguf_get_tensor(GGUFModel *model, const char *name) {
 
 void gguf_free(GGUFModel *model) {
     if (!model) return;
-    if (model->mmap_addr) munmap(model->mmap_addr, model->mmap_size);
+    if (model->mmap_addr) tt_unmap_file(model->mmap_addr, model->mmap_size);
     if (model->tensors) free(model->tensors);
     free(model);
 }

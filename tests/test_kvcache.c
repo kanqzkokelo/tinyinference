@@ -287,9 +287,9 @@ static void test_e2b_memory(void) {
 
     tt_kv_mem mem;
     tt_kv_memory(&cfg, &mem);
-    CHECK(labs(mem.b_ideal - b_ideal) * 100 < b_ideal, "ideal exact");
-    CHECK(labs(mem.b_shared - b_shared) * 100 < b_shared, "shared exact");
-    CHECK(labs(mem.b_no_share - b_noshar) * 100 < b_noshar, "noshare ex.");
+    CHECK(llabs(mem.b_ideal - b_ideal) * 100 < b_ideal, "ideal exact");
+    CHECK(llabs(mem.b_shared - b_shared) * 100 < b_shared, "shared exact");
+    CHECK(llabs(mem.b_no_share - b_noshar) * 100 < b_noshar, "noshare ex.");
 
     printf("E2B fp32 KV memory:\n");
     printf("  ctx      no-share(GiB)  shared-slab(GiB)  ideal-mixed(GiB)\n");

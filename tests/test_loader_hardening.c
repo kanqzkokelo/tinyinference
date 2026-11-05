@@ -8,8 +8,14 @@
 #include <string.h>
 #include <stdint.h>
 #include "loader_gguf.h"
+#include "tt_platform.h"
 
+#ifdef _WIN32
+#include <direct.h>
+#define SCRATCH "ti_loader_hard"
+#else
 #define SCRATCH "/tmp/ti_loader_hard"
+#endif
 
 static void w8(FILE *f, uint64_t v) { fwrite(&v, 8, 1, f); }
 static void w4(FILE *f, uint32_t v) { fwrite(&v, 4, 1, f); }
@@ -47,9 +53,13 @@ static void check(const char *name, int cond) {
 }
 
 int main(void) {
+#ifdef _WIN32
+    _mkdir(SCRATCH);
+#else
     char cmd[256];
     snprintf(cmd, sizeof cmd, "mkdir -p %s", SCRATCH);
     if (system(cmd) != 0) return 2;
+#endif
     char p1[256], p2[256], p3[256], p4[256], p5[256];
     snprintf(p1, sizeof p1, "%s/kq.gguf", SCRATCH);
     snprintf(p2, sizeof p2, "%s/dup.gguf", SCRATCH);
@@ -74,25 +84,25 @@ int main(void) {
     /* T3a: truncated payload, strict default -> NULL */
     Tent t3[] = {{"big", 1, {4096}, 0, 0}};
     write_gguf(p3, 1, t3, 64);
-    unsetenv("TT_GGUF_ALLOW_PARTIAL");
+    tt_unsetenv("TT_GGUF_ALLOW_PARTIAL");
     m = gguf_load(p3);
     check("T3a truncated-strict-null", m == NULL);
     if (m) gguf_free(m);
 
     /* T3b: same file with opt-out -> loads, data NULL */
-    setenv("TT_GGUF_ALLOW_PARTIAL", "1", 1);
+    tt_setenv("TT_GGUF_ALLOW_PARTIAL", "1", 1);
     m = gguf_load(p3);
     check("T3b partial-allowed-nonnull", m != NULL);
     check("T3b partial-data-null",
           m && m->tensor_count == 1 && m->tensors[0].data == NULL);
     if (m) gguf_free(m);
-    unsetenv("TT_GGUF_ALLOW_PARTIAL");
+    tt_unsetenv("TT_GGUF_ALLOW_PARTIAL");
     /* "0" and empty stay strict */
-    setenv("TT_GGUF_ALLOW_PARTIAL", "0", 1);
+    tt_setenv("TT_GGUF_ALLOW_PARTIAL", "0", 1);
     m = gguf_load(p3);
     check("T3b zero-stays-strict", m == NULL);
     if (m) gguf_free(m);
-    unsetenv("TT_GGUF_ALLOW_PARTIAL");
+    tt_unsetenv("TT_GGUF_ALLOW_PARTIAL");
 
     /* T4: absurd count for tiny file -> NULL before big alloc */
     {

@@ -10,6 +10,7 @@
 #include <string.h>
 #include <math.h>
 #include <cuda_runtime.h>
+#include "tt_platform.h"
 #include "loader_gguf.h"
 #include "qwen2_engine.h"
 

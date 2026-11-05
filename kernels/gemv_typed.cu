@@ -1494,6 +1494,9 @@ __global__ void k_gemm_batched_q4_0(const uint8_t *__restrict__ W,
 
 extern "C" {
 
+#ifdef _WIN32
+__declspec(dllexport)
+#endif
 int tt_gemm_batched(const void *W, int dtype, const float *X, float *Y,
                     int M, int K, int T, cudaStream_t stream) {
     if (!W || !X || !Y || M <= 0 || M > (1 << 22) ||

@@ -1,0 +1,256 @@
+# Makefile.win - native Windows build with mingw-w64 (MSYS2).
+#
+# Usage (from an MSYS2 MINGW64 shell, or with /mingw64/bin on PATH):
+#   make -f Makefile.win            # library + tools + CPU tests
+#   make -f Makefile.win test       # build and run CPU tests
+#   make -f Makefile.win clean
+#
+# The CUDA engine needs nvcc with the MSVC host compiler; see
+# scripts/build_windows.sh.  `make -f Makefile.win cuda` builds it from a
+# Visual Studio x64 developer shell (cl.exe on PATH).
+
+BUILD ?= build
+# GNU make predefines CC=cc, so `?=` would never pick gcc in a plain MSYS2
+# shell where cc is absent. Command-line CC=... still overrides.
+CC     = gcc
+CFLAGS ?= -O3 -std=c11 -Wall -Wextra -DTT_IN_LIB -Iinclude -Isrc -fopenmp
+# Same opt-in AVX2 TU as the Linux Makefile (runtime dispatch still guards it).
+AVX2_FLAGS ?= $(CFLAGS) -mavx2 -mfma
+LDFLAGS ?= -static -fopenmp
+LDLIBS  ?= -lm
+
+OBJ   = $(BUILD)/obj
+SHLIB = $(BUILD)/libtinytorch.dll
+
+SRCS = \
+	src/arch_registry.c \
+	src/async_printer.c \
+	src/chat_template.c \
+	src/dequant_ref.c \
+	src/kvcache.c \
+	src/loader_gguf.c \
+	src/moe_router.c \
+	src/ngram_lookup.c \
+	src/ops_llm.c \
+	src/quant_ref.c \
+	src/samplers.c \
+	src/specdec.c \
+	src/tinytorch_ipc.c \
+	src/tokenizer_bpe.c
+OBJS = $(SRCS:src/%.c=$(OBJ)/%.o) $(OBJ)/cpu_backend.o
+
+TESTS = \
+	test_arch_registry \
+	test_kvcache \
+	test_loader_hardening \
+	test_moe_router \
+	test_ngram_lookup \
+	test_quant_ref \
+	test_samplers \
+	test_specdec_regress \
+	test_tokenizer_trunc
+
+.PHONY: all lib tools tests test clean
+
+all: lib tools tests
+
+lib: $(SHLIB)
+
+$(SHLIB): $(OBJS)
+	$(CC) $(CFLAGS) $(LDFLAGS) -shared -Wl,--export-all-symbols -o $@ $(OBJS) $(LDLIBS)
+
+$(OBJ)/cpu_backend.o: src/cpu_backend.c
+	@mkdir -p $(OBJ)
+	$(CC) $(AVX2_FLAGS) -c -o $@ $<
+
+$(OBJ)/%.o: src/%.c
+	@mkdir -p $(OBJ)
+	$(CC) $(CFLAGS) -c -o $@ $<
+
+tools: $(BUILD)/dequant_ref.exe $(BUILD)/cpu_backend.exe $(BUILD)/run_llm.exe $(BUILD)/bench_ipc.exe
+
+$(BUILD)/dequant_ref.exe: src/dequant_ref.c $(OBJ)/loader_gguf.o
+	$(CC) $(CFLAGS) -DTTQ_MAIN -o $@ src/dequant_ref.c $(OBJ)/loader_gguf.o $(LDFLAGS) $(LDLIBS)
+
+$(BUILD)/cpu_backend.exe: src/cpu_backend.c
+	$(CC) $(CFLAGS) -DCPU_BACKEND_MAIN -o $@ $< $(LDFLAGS) $(LDLIBS)
+
+$(BUILD)/run_llm.exe: examples/run_llm.c $(OBJ)/loader_gguf.o $(OBJ)/tokenizer_bpe.o \
+                     $(OBJ)/samplers.o $(OBJ)/chat_template.o $(OBJ)/ops_llm.o $(OBJ)/cpu_backend.o
+	$(CC) $(CFLAGS) -o $@ $< $(OBJ)/loader_gguf.o $(OBJ)/tokenizer_bpe.o \
+		$(OBJ)/samplers.o $(OBJ)/chat_template.o $(OBJ)/ops_llm.o $(OBJ)/cpu_backend.o \
+		$(LDFLAGS) $(LDLIBS)
+
+$(BUILD)/bench_ipc.exe: tools/bench_ipc_throughput.c $(OBJ)/tinytorch_ipc.o
+	$(CC) $(CFLAGS) -o $@ tools/bench_ipc_throughput.c $(OBJ)/tinytorch_ipc.o $(LDFLAGS) $(LDLIBS)
+
+tests: $(TESTS:%=$(BUILD)/%.exe)
+
+$(BUILD)/test_arch_registry.exe: tests/test_arch_registry.c $(OBJ)/arch_registry.o $(OBJ)/loader_gguf.o
+	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS) $(LDLIBS)
+
+$(BUILD)/test_kvcache.exe: tests/test_kvcache.c $(OBJ)/kvcache.o
+	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS) $(LDLIBS)
+
+$(BUILD)/test_loader_hardening.exe: tests/test_loader_hardening.c $(OBJ)/loader_gguf.o
+	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS) $(LDLIBS)
+
+$(BUILD)/test_moe_router.exe: tests/test_moe_router.c $(OBJ)/moe_router.o
+	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS) $(LDLIBS)
+
+$(BUILD)/test_ngram_lookup.exe: tests/test_ngram_lookup.c $(OBJ)/ngram_lookup.o
+	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS) $(LDLIBS)
+
+$(BUILD)/test_quant_ref.exe: tests/test_quant_ref.c $(OBJ)/quant_ref.o $(OBJ)/dequant_ref.o $(OBJ)/loader_gguf.o
+	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS) $(LDLIBS)
+
+$(BUILD)/test_samplers.exe: src/samplers.c
+	$(CC) $(CFLAGS) -DSAMPLERS_MAIN -o $@ src/samplers.c $(LDFLAGS) $(LDLIBS)
+
+$(BUILD)/test_specdec_regress.exe: tests/test_specdec_regress.c $(OBJ)/specdec.o
+	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS) $(LDLIBS)
+
+$(BUILD)/test_tokenizer_trunc.exe: tests/test_tokenizer_trunc.c $(OBJ)/tokenizer_bpe.o $(OBJ)/loader_gguf.o
+	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS) $(LDLIBS)
+
+test: tests
+	@fail=0; for t in $(TESTS:%=$(BUILD)/%.exe); do \
+		echo "=== $$t"; "$$t" || fail=$$((fail+1)); \
+	done; \
+	echo "FAILED_SUITES=$$fail"; test $$fail -eq 0
+
+clean:
+	rm -rf $(BUILD)
+
+# ---------------------------------------------------------------------------
+# CUDA engine (MSVC host)
+# ---------------------------------------------------------------------------
+NVCC      ?= nvcc
+CL        ?= cl
+CUDA_ARCH ?= sm_86
+NVCCFLAGS ?= -O3 -std=c++17 -arch=$(CUDA_ARCH) -Iinclude -Isrc \
+             -Xcompiler "-O2 -MT"
+# Dash-style flags: MSYS2 rewrites leading "/" arguments of native programs
+# (cl.exe) into Windows paths, which would turn /O2 into a file name.
+CLFLAGS   ?= -nologo -O2 -MT -std:c11 -experimental:c11atomics \
+             -D_CRT_SECURE_NO_WARNINGS -Iinclude -Isrc \
+             $(if $(CUDA_INC),-I$(CUDA_INC),)
+CUDA_OBJ  = $(BUILD)/cuda-obj
+CUDA_LIB  = -lcudart
+# CUDA_PATH is set by the standard NVIDIA installer; a manual toolkit unpack
+# can override CUDA_BIN. Without either, the runtime DLLs are expected on PATH.
+CUDA_BIN  ?= $(if $(CUDA_PATH),$(CUDA_PATH)/bin/,)
+CUDA_DLLS  = $(if $(CUDA_BIN),$(BUILD)/cudart64_12.dll $(BUILD)/cublas64_12.dll,)
+
+vpath %.c src examples tools tests
+
+CUDA_KERNELS = gemv_q4_cuda gemv_typed qwen2_cuda
+CUDA_OBJS    = $(CUDA_KERNELS:%=$(CUDA_OBJ)/%.obj)
+
+ENGINE_LIB_C = loader_gguf arch_registry dequant_ref cpu_backend \
+               tokenizer_bpe async_printer chat_template
+ENGINE_LIB_OBJS = $(ENGINE_LIB_C:%=$(CUDA_OBJ)/%.obj)
+ENGINE_C     = run_llm_gpu $(ENGINE_LIB_C)
+ENGINE_OBJS  = $(ENGINE_C:%=$(CUDA_OBJ)/%.obj)
+CHAT_C       = chat_llm_gpu $(ENGINE_LIB_C) samplers
+CHAT_OBJS    = $(CHAT_C:%=$(CUDA_OBJ)/%.obj)
+SPEC_C       = spec_llm_gpu $(ENGINE_LIB_C) ngram_lookup
+SPEC_OBJS    = $(SPEC_C:%=$(CUDA_OBJ)/%.obj)
+SERVER_C     = loader_gguf arch_registry dequant_ref cpu_backend \
+               tokenizer_bpe chat_template samplers
+SERVER_OBJS  = $(SERVER_C:%=$(CUDA_OBJ)/%.obj)
+
+CUDA_PROGS = $(BUILD)/run_llm_gpu.exe $(BUILD)/chat_llm_gpu.exe \
+             $(BUILD)/spec_llm_gpu.exe $(BUILD)/server_minimal.exe \
+             $(BUILD)/server_multimodel.exe
+
+CUDA_TOOLS = dump_logits bench_prefill profile_step spec_expA_ab \
+             spec_expA_e2e test_gemv_typed print_ids
+
+CUDA_TESTS = test_spec_verify test_batch4_gemv test_logits_q8_v4 \
+             test_q8_kvcache test_q4_kvcache test_q4_split_exact \
+             test_qcache_backfill test_prefill_gemm test_wmma_prefill_gemm \
+             test_prefill_layer_parity
+
+cuda: $(CUDA_PROGS) $(CUDA_TOOLS:%=$(BUILD)/%.exe) \
+      $(CUDA_TESTS:%=$(BUILD)/%.exe) \
+      $(BUILD)/libtinytorch_cuda.dll $(BUILD)/tt_cublas.dll $(CUDA_DLLS)
+
+$(BUILD)/cudart64_12.dll: $(CUDA_BIN)cudart64_12.dll
+	cp $< $@
+
+$(BUILD)/cublas64_12.dll: $(CUDA_BIN)cublas64_12.dll
+	cp $< $@
+
+$(CUDA_OBJ)/%.obj: kernels/%.cu
+	@mkdir -p $(CUDA_OBJ)
+	$(NVCC) $(NVCCFLAGS) -c -o $@ $<
+
+$(CUDA_OBJ)/%.obj: tools/%.cu
+	@mkdir -p $(CUDA_OBJ)
+	$(NVCC) $(NVCCFLAGS) -c -o $@ $<
+
+$(CUDA_OBJ)/%.obj: %.c
+	@mkdir -p $(CUDA_OBJ)
+	$(CL) $(CLFLAGS) -c -Fo$@ $<
+
+$(BUILD)/run_llm_gpu.exe: $(ENGINE_OBJS) $(CUDA_OBJS)
+	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LIB)
+
+$(BUILD)/chat_llm_gpu.exe: $(CHAT_OBJS) $(CUDA_OBJS)
+	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LIB)
+
+$(BUILD)/spec_llm_gpu.exe: $(SPEC_OBJS) $(CUDA_OBJS)
+	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LIB)
+
+$(BUILD)/server_minimal.exe: $(CUDA_OBJ)/server_minimal.obj $(SERVER_OBJS) $(CUDA_OBJS)
+	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LIB) -lws2_32
+
+$(BUILD)/server_multimodel.exe: $(CUDA_OBJ)/server_multimodel.obj $(SERVER_OBJS) $(CUDA_OBJS)
+	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LIB) -lws2_32
+
+$(BUILD)/dump_logits.exe: $(CUDA_OBJ)/dump_logits.obj $(ENGINE_LIB_OBJS) $(CUDA_OBJS)
+	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LIB)
+
+$(BUILD)/bench_prefill.exe: $(CUDA_OBJ)/bench_prefill.obj $(ENGINE_LIB_OBJS) $(CUDA_OBJS)
+	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LIB)
+
+$(BUILD)/profile_step.exe: $(CUDA_OBJ)/profile_step.obj $(ENGINE_LIB_OBJS) $(CUDA_OBJS)
+	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LIB)
+
+$(BUILD)/spec_expA_ab.exe: $(CUDA_OBJ)/spec_expA_ab.obj $(ENGINE_LIB_OBJS) $(CUDA_OBJS)
+	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LIB)
+
+$(BUILD)/spec_expA_e2e.exe: $(CUDA_OBJ)/spec_expA_e2e.obj $(CUDA_OBJ)/ngram_lookup.obj \
+                             $(ENGINE_LIB_OBJS) $(CUDA_OBJS)
+	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LIB)
+
+$(BUILD)/test_gemv_typed.exe: $(CUDA_OBJ)/test_gemv_typed.obj $(ENGINE_LIB_OBJS) $(CUDA_OBJS)
+	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LIB)
+
+$(BUILD)/%.exe: $(CUDA_OBJ)/%.obj $(ENGINE_LIB_OBJS) $(CUDA_OBJS)
+	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LIB)
+
+$(BUILD)/libtinytorch_cuda.dll: kernels/gemm_cuda.cu kernels/gemv_q4_cuda.cu kernels/gemv_typed.cu
+	$(NVCC) $(NVCCFLAGS) -shared -o $@ $^ $(CUDA_LIB)
+
+$(BUILD)/tt_cublas.dll: kernels/cublas_ref.cu
+	$(NVCC) $(NVCCFLAGS) -shared -o $@ $< $(CUDA_LIB) -lcublas
+
+# Oracle logits tool against a llama.cpp build (parity fixtures). Point
+# ORACLE_DIR at any llama.cpp checkout whose build/bin holds llama.dll.
+ORACLE_DIR ?= oracle/llama.cpp
+$(BUILD)/oracle_logits.exe: tools/oracle_logits.c | $(BUILD)
+	$(CC) -O2 -Wno-deprecated-declarations \
+	  -I$(ORACLE_DIR)/include -I$(ORACLE_DIR)/ggml/include \
+	  -o $@ $< -L$(ORACLE_DIR)/build/bin -lllama
+
+# libllama.dll needs ggml*.dll next to the exe; copy them so the oracle
+# tools run without ORACLE_DIR on PATH.
+oracle_logits: $(BUILD)/oracle_logits.exe
+	@if [ -d "$(ORACLE_DIR)/build/bin" ]; then \
+	  cp -f $(ORACLE_DIR)/build/bin/libllama.dll \
+	        $(ORACLE_DIR)/build/bin/ggml*.dll $(BUILD)/; \
+	fi
+
+.PHONY: cuda oracle_logits

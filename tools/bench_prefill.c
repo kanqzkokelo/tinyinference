@@ -8,6 +8,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include "tt_platform.h"
 #include "loader_gguf.h"
 #include "qwen2_engine.h"
 

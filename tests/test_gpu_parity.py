@@ -6,12 +6,14 @@ import sys
 
 import numpy as np
 
+from tt_platform import lib as lib_path, make_cuda_cmd
+
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 subprocess_ok = True
 import subprocess
-subprocess.run(["make", "-s", "cuda"], cwd=ROOT, check=True)
+subprocess.run(make_cuda_cmd(), cwd=ROOT, check=True)
 
-lib = ctypes.CDLL(os.path.join(ROOT, "build", "libtinytorch_cuda.so"))
+lib = ctypes.CDLL(lib_path("libtinytorch_cuda"))
 for name in ("tt_cuda_alloc", "tt_cuda_sgemm_naive", "tt_cuda_sgemm_tiled",
              "tt_cuda_sgemm_wmma"):
     f = getattr(lib, name)

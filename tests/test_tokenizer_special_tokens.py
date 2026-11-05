@@ -25,6 +25,8 @@ import subprocess
 import sys
 import tempfile
 
+from tt_platform import find_cc
+
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 MODEL_PATH = os.path.join(REPO, "data", "models", "gemma-4-E2B-it-Q4_0.gguf")
 HDR_DIR = os.path.join(REPO, "include")
@@ -125,10 +127,10 @@ int main(int argc, char **argv) {
 def build_driver():
     tmp = tempfile.mkdtemp(prefix="tt_special_tok_")
     src = os.path.join(tmp, "driver.c")
-    exe = os.path.join(tmp, "driver")
+    exe = os.path.join(tmp, "driver" + (".exe" if os.name == "nt" else ""))
     with open(src, "w") as f:
         f.write(DRIVER_C)
-    cmd = ["gcc", "-O2", "-DTT_IN_LIB",
+    cmd = [find_cc(), "-O2", "-DTT_IN_LIB",
            "-I", HDR_DIR, "-I", SRC_DIR,
            "-o", exe, src,
            os.path.join(SRC_DIR, "tokenizer_bpe.c"),

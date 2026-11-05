@@ -28,7 +28,6 @@ import ctypes
 import json
 import math
 import os
-import shutil
 import subprocess
 import sys
 import tempfile
@@ -36,6 +35,8 @@ import unittest
 from collections import Counter
 from ctypes import POINTER, c_float, c_int, c_int32, c_uint64, c_void_p
 from typing import Dict, List, Sequence, Tuple
+
+from tt_platform import find_cc
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SRC = os.path.join(REPO, "src", "samplers.c")
@@ -92,10 +93,9 @@ def _compile_shared() -> str:
     line-buffer limitation of the SAMPLERS_MAIN CLI driver for large vocabs.
     Does not modify src/ or the Makefile.
     """
-    cc = shutil.which("cc") or shutil.which("gcc") or shutil.which("clang")
-    if not cc:
-        raise RuntimeError("no C compiler found")
-    so = os.path.join(tempfile.mkdtemp(prefix="tt_samp_so_"), "libtt_samplers.so")
+    cc = find_cc()
+    so = os.path.join(tempfile.mkdtemp(prefix="tt_samp_so_"),
+                      "libtt_samplers" + (".dll" if os.name == "nt" else ".so"))
     cmd = [cc, "-std=c99", "-O2", "-fPIC", "-shared", "-o", so, SRC, "-lm"]
     r = subprocess.run(cmd, capture_output=True, text=True)
     if r.returncode != 0:

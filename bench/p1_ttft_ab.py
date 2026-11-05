@@ -24,7 +24,9 @@ import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
-BIN = ROOT / "build" / "run_llm_gpu"
+BIN = ROOT / "build" / (
+    "run_llm_gpu.exe" if os.name == "nt" else "run_llm_gpu"
+)
 DEFAULT_MODEL = ROOT / "data" / "models" / "qwen2.5-0.5b-instruct-q4_0.gguf"
 
 # NOTE (2026-09-20): the previous NEW_ENV was {BATCHN_N=8, MINN=12}, which made the

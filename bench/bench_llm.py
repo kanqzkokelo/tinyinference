@@ -32,14 +32,22 @@ import re
 import statistics
 import subprocess
 import sys
+import tempfile
 import time
 from typing import Any, Dict, List, Optional, Tuple
 
 ROOT = Path(__file__).resolve().parent.parent
-SCRATCH = Path("/home/mitesh/ti-scratch")
+ENGINE_BIN = ROOT / "build" / (
+    "run_llm_gpu.exe" if os.name == "nt" else "run_llm_gpu"
+)
+SCRATCH = Path(tempfile.gettempdir()) / "ti-scratch"
 SCRATCH.mkdir(parents=True, exist_ok=True)
 
-DEFAULT_ORACLE_BIN = "/home/mitesh/Storage/llama.cpp/build_cuda/bin/llama-cli"
+DEFAULT_ORACLE_BIN = str(
+    Path(__file__).resolve().parent.parent
+    / "oracle" / "llama.cpp" / "build" / "bin"
+    / ("llama-cli.exe" if os.name == "nt" else "llama-cli")
+)
 DEFAULT_LLAMACPP_COMMIT = "3f545be"
 
 PRIMARY_MODELS = [
@@ -271,18 +279,24 @@ def run_engine_once(
     timeout: int = 180,
 ) -> Dict[str, Any]:
     env = dict(os.environ)
-    env["LD_LIBRARY_PATH"] = ":".join(
-        filter(
-            None,
-            [
-                os.path.expanduser("~/mmcuda/lib"),
-                os.path.expanduser(
-                    "~/.local/lib/python3.12/site-packages/nvidia/cuda_runtime/lib"
-                ),
-                env.get("LD_LIBRARY_PATH", ""),
-            ],
+    if os.name == "nt":
+        env["PATH"] = os.pathsep.join(
+            filter(None, [str(Path(__file__).resolve().parent.parent / "build"),
+                          env.get("PATH", "")])
         )
-    )
+    else:
+        env["LD_LIBRARY_PATH"] = ":".join(
+            filter(
+                None,
+                [
+                    os.path.expanduser("~/mmcuda/lib"),
+                    os.path.expanduser(
+                        "~/.local/lib/python3.12/site-packages/nvidia/cuda_runtime/lib"
+                    ),
+                    env.get("LD_LIBRARY_PATH", ""),
+                ],
+            )
+        )
     env["TT_GREEDY"] = "1"
     if raw_prompt:
         env["TT_RAW_PROMPT"] = "1"
@@ -295,11 +309,11 @@ def run_engine_once(
         env.pop("TT_NO_GRAPH", None)
 
     if len(prompt) > 8192:
-        pfile = "/tmp/prompt_bench.txt"
+        pfile = os.path.join(tempfile.gettempdir(), "prompt_bench.txt")
         with open(pfile, "w") as f:
             f.write(prompt)
         cmd = [
-            str(ROOT / "build" / "run_llm_gpu"),
+            str(ENGINE_BIN),
             "-m",
             str(model_path),
             "-f",
@@ -308,7 +322,7 @@ def run_engine_once(
         ]
     else:
         cmd = [
-            str(ROOT / "build" / "run_llm_gpu"),
+            str(ENGINE_BIN),
             "-m",
             str(model_path),
             prompt,
@@ -393,7 +407,7 @@ def run_oracle_once(
         raise ValueError("Refusing to invoke oracle llama-cli with empty prompt (known hang)")
 
     if len(prompt) > 8192:
-        pfile = "/tmp/prompt_bench_oracle.txt"
+        pfile = os.path.join(tempfile.gettempdir(), "prompt_bench_oracle.txt")
         with open(pfile, "w") as f:
             f.write(prompt)
         prompt_args = ["-f", pfile]
@@ -424,18 +438,19 @@ def run_oracle_once(
     ]
 
     env = dict(os.environ)
-    env["LD_LIBRARY_PATH"] = ":".join(
-        filter(
-            None,
-            [
-                os.path.expanduser("~/mmcuda/lib"),
-                os.path.expanduser(
-                    "~/.local/lib/python3.12/site-packages/nvidia/cuda_runtime/lib"
-                ),
-                env.get("LD_LIBRARY_PATH", ""),
-            ],
+    if os.name != "nt":
+        env["LD_LIBRARY_PATH"] = ":".join(
+            filter(
+                None,
+                [
+                    os.path.expanduser("~/mmcuda/lib"),
+                    os.path.expanduser(
+                        "~/.local/lib/python3.12/site-packages/nvidia/cuda_runtime/lib"
+                    ),
+                    env.get("LD_LIBRARY_PATH", ""),
+                ],
+            )
         )
-    )
 
     r = subprocess.run(
         cmd,

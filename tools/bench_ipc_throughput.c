@@ -14,24 +14,29 @@
  */
 
 #include "tinytorch_ipc.h"
+#include "tt_platform.h"
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <stdbool.h>
+
+#ifdef _WIN32
+#include <windows.h>
+#include <process.h>
+typedef HANDLE tt_thread_t;
+#else
 #include <time.h>
 #include <pthread.h>
 #include <unistd.h>
 #include <sched.h>
+typedef pthread_t tt_thread_t;
+#endif
 
 #define NUM_REQUESTS 100000
 #define WARMUP 1000
 
-static double now_us(void) {
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (double)ts.tv_sec * 1e6 + (double)ts.tv_nsec / 1e3;
-}
+static double now_us(void) { return tt_now_us(); }
 
 static int cmp_d(const void *a, const void *b) {
     double da = *(const double*)a;
@@ -39,7 +44,13 @@ static int cmp_d(const void *a, const void *b) {
     return (da > db) - (da < db);
 }
 
-static void pin_thread(pthread_t th, int core) {
+static void pin_thread(tt_thread_t th, int core) {
+#ifdef _WIN32
+    DWORD_PTR mask = (DWORD_PTR)1 << (core & 63);
+    if (!SetThreadAffinityMask(th, mask)) {
+        SetThreadAffinityMask(th, (DWORD_PTR)1 << (core % 2));
+    }
+#else
     cpu_set_t cpus;
     CPU_ZERO(&cpus);
     CPU_SET(core, &cpus);
@@ -50,6 +61,7 @@ static void pin_thread(pthread_t th, int core) {
         CPU_SET(core % 2, &cpus);
         pthread_setaffinity_np(th, sizeof(cpus), &cpus);
     }
+#endif
 }
 
 typedef struct {
@@ -57,12 +69,19 @@ typedef struct {
     int target;
 } ServerArg;
 
+#ifdef _WIN32
+static DWORD WINAPI server_thread_func(LPVOID arg) {
+#else
 static void *server_thread_func(void *arg) {
+#endif
     ServerArg *sa = (ServerArg*)arg;
     TTIpcServer *server = sa->server;
     // pin server to core 0
-    cpu_set_t cpus; CPU_ZERO(&cpus); CPU_SET(0, &cpus);
-    pthread_setaffinity_np(pthread_self(), sizeof(cpus), &cpus);
+#ifdef _WIN32
+    pin_thread(GetCurrentThread(), 0);
+#else
+    pin_thread(pthread_self(), 0);
+#endif
 
     TTIpcRequest req;
     TTIpcResponse resp;
@@ -73,12 +92,17 @@ static void *server_thread_func(void *arg) {
             resp.req_id = req.req_id;
             resp.token_id = 42;
             resp.is_final = true;
-            snprintf(resp.token_text, sizeof(resp.token_text), "tok_%lu", req.req_id);
+            snprintf(resp.token_text, sizeof(resp.token_text), "tok_%llu",
+                     (unsigned long long)req.req_id);
             while (!tt_ipc_server_send_response(server, &resp)) { /* spin */ }
             handled++;
         }
     }
+#ifdef _WIN32
+    return 0;
+#else
     return NULL;
+#endif
 }
 
 static void run_phase(const char *label, TTIpcClient *client, int n_reqs, bool fill_prompt, double *out_samples) {
@@ -86,7 +110,11 @@ static void run_phase(const char *label, TTIpcClient *client, int n_reqs, bool f
     TTIpcResponse resp;
     for (int i = 0; i < n_reqs; i++) {
         req.req_id = (uint64_t)i;
+#ifdef _WIN32
+        req.client_pid = (int)_getpid();
+#else
         req.client_pid = (int)getpid();
+#endif
         req.n_tokens = 1;
         req.temperature = 0.0f;
         req.repeat_penalty = 1.0f;
@@ -108,7 +136,13 @@ int main(void) {
     printf("Mode: in-process SPSC threads on shared ShmBuffer (cache-coherent, no syscall)\n");
     printf("NOTE: honest cross-core latency, not same-core L1. Compare to pipe(2) ~5-15 us.\n");
 
+#ifdef _WIN32
+    SYSTEM_INFO si;
+    GetSystemInfo(&si);
+    int ncpu = (int)si.dwNumberOfProcessors;
+#else
     int ncpu = (int)sysconf(_SC_NPROCESSORS_ONLN);
+#endif
     printf("CPUs online: %d\n", ncpu);
     int client_core = ncpu >= 4 ? 2 : (ncpu >= 2 ? 1 : 0);
     printf("Pinning: server -> core 0, client -> core %d\n", client_core);
@@ -118,7 +152,14 @@ int main(void) {
     if (!server) { fprintf(stderr, "Failed to create IPC server\n"); return 1; }
 
     ServerArg sarg = { .server = server, .target = WARMUP + NUM_REQUESTS };
-    pthread_t server_thread;
+    tt_thread_t server_thread;
+#ifdef _WIN32
+    server_thread = CreateThread(NULL, 0, server_thread_func, &sarg, 0, NULL);
+    if (!server_thread) {
+        fprintf(stderr, "CreateThread failed\n"); tt_ipc_server_destroy(server); return 1;
+    }
+    pin_thread(GetCurrentThread(), client_core);
+#else
     if (pthread_create(&server_thread, NULL, server_thread_func, &sarg) != 0) {
         perror("pthread_create"); tt_ipc_server_destroy(server); return 1;
     }
@@ -127,6 +168,7 @@ int main(void) {
         cpu_set_t cpus; CPU_ZERO(&cpus); CPU_SET(client_core, &cpus);
         pthread_setaffinity_np(pthread_self(), sizeof(cpus), &cpus);
     }
+#endif
 
     TTIpcClient *client = tt_ipc_client_connect(ipc_name);
     if (!client) { fprintf(stderr, "Failed to connect IPC client\n"); tt_ipc_server_destroy(server); return 1; }
@@ -148,18 +190,28 @@ int main(void) {
     // Simpler: just reuse same connection for tiny payload as continuation
     // But server already finished after WARMUP+NUM_REQUESTS. So handle tiny as separate run.
     // Workaround: destroy and recreate for tiny phase.
+#ifdef _WIN32
+    WaitForSingleObject(server_thread, INFINITE);
+    CloseHandle(server_thread);
+#else
     pthread_join(server_thread, NULL);
+#endif
     tt_ipc_client_disconnect(client);
     tt_ipc_server_destroy(server);
 
     // Tiny payload phase (fresh shm)
     server = tt_ipc_server_create(ipc_name);
     sarg.server = server; sarg.target = WARMUP + NUM_REQUESTS;
+#ifdef _WIN32
+    server_thread = CreateThread(NULL, 0, server_thread_func, &sarg, 0, NULL);
+    pin_thread(GetCurrentThread(), client_core);
+#else
     pthread_create(&server_thread, NULL, server_thread_func, &sarg);
     {
         cpu_set_t cpus; CPU_ZERO(&cpus); CPU_SET(client_core, &cpus);
         pthread_setaffinity_np(pthread_self(), sizeof(cpus), &cpus);
     }
+#endif
     client = tt_ipc_client_connect(ipc_name);
     // warmup tiny
     warm = (double*)malloc(WARMUP * sizeof(double));
@@ -168,7 +220,12 @@ int main(void) {
     double t2 = now_us();
     run_phase("tiny-0B", client, NUM_REQUESTS, false, samples_tiny);
     double t3 = now_us();
+#ifdef _WIN32
+    WaitForSingleObject(server_thread, INFINITE);
+    CloseHandle(server_thread);
+#else
     pthread_join(server_thread, NULL);
+#endif
 
     double total_full = t1 - t0;
     double total_tiny = t3 - t2;

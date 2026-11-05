@@ -24,28 +24,29 @@ import glob
 import os
 import subprocess
 import sys
+import tempfile
 import time
 
 import numpy as np
+
+from tt_platform import env_with_lib
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 os.chdir(ROOT)
 sys.path.insert(0, os.path.join(ROOT, "tests"))
 import ref_gemma4_numpy as REF  # noqa: E402  (deq_q4_K / deq_q5_K)
 
-DUMP = "build/dump_logits"
+DUMP = os.path.join(ROOT, "build", "dump_logits" + (".exe" if os.name == "nt" else ""))
 DEFAULT_MODEL = "data/models/gemma-4-E2B-it-Q4_0.gguf"
 TOKENS = [2, 2202, 60000]
 L, PL_DIM, DIM = 35, 256, 1536
 PLE_N = L * PL_DIM                      # 8960
-DUMP_PREFIX = "/tmp/ple_gate_eng.bin"
+DUMP_PREFIX = os.path.join(tempfile.gettempdir(), "ple_gate_eng.bin")
 
-env = dict(os.environ)
-env["LD_LIBRARY_PATH"] = ":".join(filter(None, [
-    os.path.expanduser("~/mmcuda/lib"),
-    os.path.expanduser("~/.local/lib/python3.12/site-packages/nvidia/cuda_runtime/lib"),
-    os.path.join(os.getcwd(), "oracle/llama.cpp/build/bin"),
-    env.get("LD_LIBRARY_PATH", "")]))
+env = env_with_lib([os.path.expanduser("~/mmcuda/lib"),
+                    os.path.expanduser(
+                        "~/.local/lib/python3.12/site-packages/nvidia/cuda_runtime/lib"),
+                    os.path.join(os.getcwd(), "oracle/llama.cpp/build/bin")])
 
 
 def load_tensors(model_path):

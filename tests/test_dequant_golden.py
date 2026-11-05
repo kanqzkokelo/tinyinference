@@ -19,14 +19,20 @@ import types
 
 import numpy as np
 
+from tt_platform import exe, tmp, utf8_stdout  # noqa: E402
+
+utf8_stdout()
+
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-BIN = os.path.join(ROOT, "build/dequant_ref")
+BIN = exe("dequant_ref")
 MANIFEST = os.path.join(ROOT, "tests/fixtures/dequant_gold_manifest.json")
 
 
 def _load_gguf_py():
     """Import vendored gguf-py (plain import fails here: no sentencepiece)."""
     pkg_dir = os.path.join(ROOT, "oracle/llama.cpp/gguf-py/gguf")
+    if not os.path.isfile(os.path.join(pkg_dir, "__init__.py")):
+        return None
     spec = importlib.util.spec_from_file_location(
         "gguf", os.path.join(pkg_dir, "__init__.py"),
         submodule_search_locations=[pkg_dir])
@@ -57,7 +63,7 @@ def part_a_types():
     print(f"{'type':7s} {'tensor':26s} {'max|err|':>10s}  result")
     for label, info in manifest.items():
         path = os.path.join(ROOT, "data/testmodels", info["file"])
-        out_bin = f"/tmp/dq_ref_{label}.bin"
+        out_bin = tmp(f"dq_ref_{label}.bin")
         r = run_cli([path, info["tensor"], out_bin])
         if r.returncode != 0:
             print(f"{label:7s} {info['tensor']:26s} {'-':>10s}  FAIL (cli exit "
@@ -131,6 +137,9 @@ def part_b_sizes():
 
 
 if __name__ == "__main__":
+    if GGUF is None:
+        print("SKIP: oracle/llama.cpp/gguf-py not vendored")
+        sys.exit(0)
     fails = part_a_types()
     print()
     bad = part_b_sizes()

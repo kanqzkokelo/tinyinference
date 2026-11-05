@@ -18,20 +18,23 @@ import argparse
 import os
 import subprocess
 import sys
+import tempfile
 
 import numpy as np
 
+from tt_platform import env_with_lib, exe
+
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 os.chdir(ROOT)
-ORACLE_TOK = "oracle/llama.cpp/build/bin/llama-tokenize"
-ORACLE_LOGITS = "build/oracle_logits"
-DUMP = "build/dump_logits"
+EXE = ".exe" if os.name == "nt" else ""
+ORACLE_TOK = os.path.join("oracle", "llama.cpp", "build", "bin",
+                          "llama-tokenize" + EXE)
+ORACLE_LOGITS = exe("oracle_logits")
+DUMP = exe("dump_logits")
 
-env = dict(os.environ)
-env["LD_LIBRARY_PATH"] = ":".join(filter(None, [
-    os.path.expanduser("~/mmcuda/lib"),
-    os.path.expanduser("~/.local/lib/python3.12/site-packages/nvidia/cuda_runtime/lib"),
-    env.get("LD_LIBRARY_PATH", "")]))
+env = env_with_lib([os.path.expanduser("~/mmcuda/lib"),
+                    os.path.expanduser(
+                        "~/.local/lib/python3.12/site-packages/nvidia/cuda_runtime/lib")])
 
 DEFAULT_PROMPTS = [
     "The capital of France is",
@@ -53,7 +56,7 @@ def oracle_tokenize(model, prompt):
 
 
 def engine_logits(model, ids, tag):
-    out = f"/tmp/m7_ours_{tag}.bin"
+    out = os.path.join(tempfile.gettempdir(), f"m7_ours_{tag}.bin")
     r = subprocess.run([DUMP, "--model", model,
                         ",".join(map(str, ids)), out],
                        capture_output=True, text=True, timeout=300, env=env)
@@ -68,7 +71,7 @@ def engine_logits(model, ids, tag):
 
 
 def oracle_ref(model, ids, tag):
-    out = f"/tmp/m7_oracle_{tag}.bin"
+    out = os.path.join(tempfile.gettempdir(), f"m7_oracle_{tag}.bin")
     id_csv = ",".join(map(str, ids))
     r = subprocess.run([ORACLE_LOGITS, model, "--ids", id_csv, "--dump", out],
                        capture_output=True, text=True, timeout=300, env=env)

@@ -26,16 +26,22 @@ Compile line (see include/cpu_backend.h):
 import os
 import subprocess
 import sys
+import tempfile
 
 import numpy as np
+
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8")
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from ref_qwen2_numpy import load_gguf  # noqa: E402
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-BIN = os.path.join(ROOT, "build/cpu_backend")
-DQBINDIR = os.path.join(ROOT, "build/dequant_ref")
+EXE = ".exe" if os.name == "nt" else ""
+BIN = os.path.join(ROOT, "build", f"cpu_backend{EXE}")
+DQBINDIR = os.path.join(ROOT, "build", f"dequant_ref{EXE}")
 MODEL = os.path.join(ROOT, "data/models/qwen2.5-0.5b-instruct-q4_0.gguf")
+TMP = tempfile.gettempdir()
 
 TTQ_Q4_0, TTQ_Q8_0 = 2, 8
 TTQ_Q2_K, TTQ_Q3_K = 10, 11
@@ -57,9 +63,9 @@ failures = []
 
 
 def run_gemv(w_raw, dtype, M, K, threads, x, force_scalar=False):
-    wb = os.path.join("/tmp", f"cb_w_{os.getpid()}.bin")
-    xb = os.path.join("/tmp", f"cb_x_{os.getpid()}.bin")
-    yb = os.path.join("/tmp", f"cb_y_{os.getpid()}.bin")
+    wb = os.path.join(TMP, f"cb_w_{os.getpid()}.bin")
+    xb = os.path.join(TMP, f"cb_x_{os.getpid()}.bin")
+    yb = os.path.join(TMP, f"cb_y_{os.getpid()}.bin")
     open(wb, "wb").write(w_raw)
     x.astype("<f4").tofile(xb)
     env = dict(os.environ)
@@ -99,7 +105,7 @@ def raw_tensor(mm, base, off, dtype, numel):
 
 def dequant_golden(gguf_path, tensor_name, numel):
     """fp32 golden via build/dequant_ref CLI (validated vs gguf-py elsewhere)."""
-    out_bin = f"/tmp/cb_gold_{os.getpid()}.bin"
+    out_bin = os.path.join(TMP, f"cb_gold_{os.getpid()}.bin")
     r = subprocess.run([DQBINDIR, gguf_path, tensor_name, out_bin],
                        capture_output=True, text=True)
     if r.returncode != 0:
@@ -112,6 +118,9 @@ def dequant_golden(gguf_path, tensor_name, numel):
 
 def correctness_legacy():
     print("== correctness vs numpy reference (legacy quants, qwen tensors) ==")
+    if not os.path.exists(MODEL):
+        print(f"  {os.path.basename(MODEL)} missing, skipped")
+        return
     kv, tensors, mm, base = load_gguf(MODEL)
     rng = np.random.default_rng(42)
 

@@ -10,10 +10,13 @@ Requires: build/run_llm_gpu, oracle/llama.cpp/build/bin/llama-cli
 """
 import subprocess, sys, os, re
 
+from tt_platform import env_with_lib, exe
+
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+EXE = ".exe" if os.name == "nt" else ""
 MODEL = os.path.join(ROOT, "data/models/qwen2.5-0.5b-instruct-q4_0.gguf")
-OURS = os.path.join(ROOT, "build/run_llm_gpu")
-LLAMA = os.path.join(ROOT, "oracle/llama.cpp/build/bin/llama-cli")
+OURS = exe("run_llm_gpu")
+LLAMA = os.path.join(ROOT, "oracle/llama.cpp/build/bin", "llama-cli" + EXE)
 
 PROMPTS = [
     "The capital of France is",
@@ -26,27 +29,32 @@ PROMPTS = [
 ]
 
 def run_ours(prompt, n):
-    env = dict(os.environ, TT_RAW_PROMPT="1")
-    env["LD_LIBRARY_PATH"] = ":".join(filter(None, [
-        os.path.expanduser("~/mmcuda/lib"),
-        os.path.expanduser("~/.local/lib/python3.12/site-packages/nvidia/cuda_runtime/lib"),
-        env.get("LD_LIBRARY_PATH", "")]))
+    env = env_with_lib([os.path.expanduser("~/mmcuda/lib"),
+                        os.path.expanduser(
+                            "~/.local/lib/python3.12/site-packages/nvidia/cuda_runtime/lib")])
+    env["TT_RAW_PROMPT"] = "1"
     r = subprocess.run([OURS, prompt, str(n)], capture_output=True, text=True, timeout=180, env=env)
     # stdout layout: <banner lines>\n<streamed tokens>\"\n[gen: ...]
     out = r.stdout.split("\n")
     # drop banner lines (contain [run]/[GGUF]/[BPE] markers) and stats tail
     toks = [l for l in out if "[gen:" not in l and not l.startswith(("[run]", "[GGUF]", "[BPE]"))]
-    txt = "".join(toks).split('"')[0]
+    txt = "\n".join(toks).split('"')[0]
     return txt
 
 def run_llama(prompt, n):
-    env = dict(os.environ)
-    env["LD_LIBRARY_PATH"] = os.path.join(ROOT, "oracle/llama.cpp/build/bin")
+    env = env_with_lib(os.path.join(ROOT, "oracle/llama.cpp/build/bin"))
     r = subprocess.run([LLAMA, "-m", MODEL, "-p", prompt, "-n", str(n),
                         "--temp", "0", "-no-cnv"],
                        capture_output=True, text=True, timeout=180, env=env)
     lines = [l for l in r.stdout.splitlines() if l.strip() and not l.startswith(("llama_perf", "="))]
-    return lines[-1] if lines else ""
+    text = "\n".join(lines)
+    # llama-cli echoes the prompt before the continuation. Depending on the
+    # build/terminal it lands on the same line or its own line, so strip the
+    # prompt wherever it appears instead of assuming a single output line.
+    i = text.find(prompt)
+    if i >= 0:
+        text = text[i + len(prompt):]
+    return text
 
 def norm(s):
     return re.sub(r"\s+", " ", s).strip()

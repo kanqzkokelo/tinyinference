@@ -4,6 +4,12 @@
 #include <cuda_fp16.h>
 #include <cstdio>
 
+#ifdef _WIN32
+#define TT_CUDA_API __declspec(dllexport)
+#else
+#define TT_CUDA_API
+#endif
+
 static cublasHandle_t g_handle = nullptr;
 
 static void ensure_handle(void) {
@@ -14,7 +20,7 @@ static void ensure_handle(void) {
 /* Computes row-major C[MxN] = A[MxK] @ B[KxN] on device memory.
  * Column-major equivalence used: C_cm(N x M) = B_cm(N x K) @ A_cm(K x M).
  * Returns 0 on success, nonzero cublas status otherwise. */
-extern "C" int tt_cublas_ref(const float *A, const float *B, float *C,
+extern "C" TT_CUDA_API int tt_cublas_ref(const float *A, const float *B, float *C,
                              int M, int N, int K) {
     ensure_handle();
     if (!g_handle) return -1;
@@ -34,7 +40,7 @@ extern "C" int tt_cublas_ref(const float *A, const float *B, float *C,
  * allow_tf32=0 -> CUBLAS_COMPUTE_32F (strict, q/k/v/o);
  * allow_tf32!=0 -> CUBLAS_COMPUTE_32F_FAST_TF32 (gate/up/down only).
  * stream may be NULL (uses handle default). Returns 0 on success. */
-extern "C" int tt_cublas_prefill_nt(const float *dW, const float *dX, float *dY,
+extern "C" TT_CUDA_API int tt_cublas_prefill_nt(const float *dW, const float *dX, float *dY,
                                     int M, int K, int N,
                                     void *stream, int allow_tf32) {
     ensure_handle();
@@ -62,7 +68,7 @@ extern "C" int tt_cublas_prefill_nt(const float *dW, const float *dX, float *dY,
  * OP_T(W,lda=K) OP_N(X,ldb=K), m=M n=N k=K ldc=M.
  * compute=CUBLAS_COMPUTE_32F_FAST_16F, algo=TENSOR_OP. stream may be NULL.
  * Returns 0 on success. */
-extern "C" int tt_cublas_prefill_nt_fp16(const void *dW, const void *dX, float *dY,
+extern "C" TT_CUDA_API int tt_cublas_prefill_nt_fp16(const void *dW, const void *dX, float *dY,
                                     int M, int K, int N,
                                     void *stream) {
     ensure_handle();

@@ -16,15 +16,21 @@ import time
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-BUILD_BIN = REPO_ROOT / "build" / "run_llm_gpu"
+BUILD_BIN = REPO_ROOT / "build" / (
+    "run_llm_gpu.exe" if os.name == "nt" else "run_llm_gpu"
+)
 
 ENV_BASE = dict(os.environ)
-ENV_BASE["PATH"] = f"{os.path.expanduser('~/mmcuda/bin')}:{ENV_BASE.get('PATH', '')}"
-ENV_BASE["LD_LIBRARY_PATH"] = ":".join(filter(None, [
-    os.path.expanduser("~/mmcuda/lib"),
-    os.path.expanduser("~/.local/lib/python3.12/site-packages/nvidia/cuda_runtime/lib"),
-    ENV_BASE.get("LD_LIBRARY_PATH", "")
-]))
+if os.name == "nt":
+    ENV_BASE["PATH"] = os.pathsep.join(filter(None, [
+        str(REPO_ROOT / "build"), ENV_BASE.get("PATH", "")]))
+else:
+    ENV_BASE["PATH"] = f"{os.path.expanduser('~/mmcuda/bin')}:{ENV_BASE.get('PATH', '')}"
+    ENV_BASE["LD_LIBRARY_PATH"] = ":".join(filter(None, [
+        os.path.expanduser("~/mmcuda/lib"),
+        os.path.expanduser("~/.local/lib/python3.12/site-packages/nvidia/cuda_runtime/lib"),
+        ENV_BASE.get("LD_LIBRARY_PATH", "")
+    ]))
 
 
 def run_benchmark(model_path: str, prompt_text: str, gen_tokens: int = 16,

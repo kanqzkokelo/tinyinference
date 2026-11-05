@@ -28,6 +28,8 @@ import unittest
 
 import numpy as np
 
+from tt_platform import exe as build_exe, lib as lib_path, make_cuda_cmd
+
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 GGUF = os.path.join(REPO, "data", "models", "qwen2.5-0.5b-instruct-q4_0.gguf")
 TENSOR = "blk.0.attn_q.weight"
@@ -42,16 +44,17 @@ def sh(cmd, **kw):
 
 
 def build_lib():
-    r = sh("make cuda", cwd=REPO)
+    r = subprocess.run(make_cuda_cmd(), cwd=REPO,
+                       capture_output=True, text=True)
     if r.returncode != 0:
         raise RuntimeError("make cuda failed:\n" + r.stderr[-4000:])
 
 
 def load_lib():
     import ctypes
-    lib = ctypes.CDLL(os.path.join(REPO, "build", "libtinytorch_cuda.so"))
+    lib = ctypes.CDLL(lib_path("libtinytorch_cuda"))
     for name in ("tt_cuda_alloc", "tt_gemm_batched"):
-        assert hasattr(lib, name), f"symbol {name} missing from .so"
+        assert hasattr(lib, name), f"symbol {name} missing from {lib_path('libtinytorch_cuda')}"
     lib.tt_cuda_alloc.argtypes = [ctypes.POINTER(ctypes.c_void_p), ctypes.c_size_t]
     lib.tt_cuda_alloc.restype = ctypes.c_int
     lib.tt_cuda_free.argtypes = [ctypes.c_void_p]
@@ -87,7 +90,7 @@ def cuda_alloc(bytes_):
 def dequant_dump():
     """Dump fp32-dequantized real tensor via the C reference CLI."""
     out = os.path.join(tempfile.mkdtemp(prefix="tt_gemm_b_"), "w.f32")
-    r = sh(f"{os.path.join(REPO, 'build', 'dequant_ref')} {GGUF} {TENSOR} {out}")
+    r = sh(f'"{build_exe("dequant_ref")}" "{GGUF}" {TENSOR} "{out}"')
     if r.returncode != 0:
         raise RuntimeError("dequant_ref failed:\n" + r.stderr)
     w = np.fromfile(out, dtype=np.float32)
@@ -97,12 +100,29 @@ def dequant_dump():
     return w.reshape(side, side)          # GGUF row-major W[M,K]
 
 
+def q4_0_nbytes(M, K):
+    """Q4_0 keeps an fp16 scale per 32 weights -> 18 bytes per block."""
+    return M * (K // 32) * 18
+
+
+def tensor_file_offset(name):
+    """Absolute file offset of a tensor, from `dequant_ref --sizes`."""
+    r = subprocess.run([build_exe("dequant_ref"), "--sizes", GGUF],
+                       capture_output=True, text=True)
+    for line in r.stdout.splitlines():
+        parts = line.split("\t")
+        if len(parts) == 4 and parts[0] == name:
+            return int(parts[3])
+    raise RuntimeError(f"tensor {name!r} not listed in {GGUF}")
+
+
 def run_gemm(w_q_bytes, w_np_deq, x, M, K, T):
     """Upload q4_0 W + X, run tt_gemm_batched, return Y[M,T] host copy."""
     import ctypes
-    dw, dx, dy = cuda_alloc(M * K // 2), cuda_alloc(K * T * 4), cuda_alloc(M * T * 4)
+    wbytes = q4_0_nbytes(M, K)
+    dw, dx, dy = cuda_alloc(wbytes), cuda_alloc(K * T * 4), cuda_alloc(M * T * 4)
     try:
-        assert lib.tt_cuda_h2d(dw, w_q_bytes.ctypes.data, M * K // 2) == 0
+        assert lib.tt_cuda_h2d(dw, w_q_bytes.ctypes.data, wbytes) == 0
         assert lib.tt_cuda_h2d(dx, x.ctypes.data, K * T * 4) == 0
         rc = lib.tt_gemm_batched(dw, 2, dx, dy, M, K, T, None)  # 2 = TTQ_Q4_0
         assert rc == 0, f"tt_gemm_batched rc={rc}"
@@ -146,10 +166,9 @@ class TestGemmbBatched(unittest.TestCase):
         w_deq = dequant_dump()               # [M,K] fp32, C-reference dequant
         M, K = w_deq.shape
         # raw q4_0 bytes straight from the GGUF for the same tensor
-        import struct
         with open(GGUF, "rb") as f:
-            f.seek(229100544)                # offset from --sizes
-            w_q = np.frombuffer(f.read(M * K // 2), dtype=np.uint8)
+            f.seek(tensor_file_offset(TENSOR))
+            w_q = np.frombuffer(f.read(q4_0_nbytes(M, K)), dtype=np.uint8)
         rng = np.random.default_rng(7)
         for T in (1, 8, 16):
             x = rng.standard_normal((K, T)).astype(np.float32)

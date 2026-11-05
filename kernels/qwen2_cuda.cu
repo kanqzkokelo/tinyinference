@@ -27,7 +27,19 @@
 #include "loader_gguf.h"
 #include "qwen2_engine.h"
 #include "dequant_ref.h"
+#include "tt_platform.h"
+
+#ifdef _WIN32
+/* tt_platform.h provides LoadLibrary-based shims; keep the POSIX names used
+ * by the optional cuBLAS helper loader. */
+#define dlopen  tt_dlopen
+#define dlsym   tt_dlsym
+#define dlclose tt_dlclose
+#define dlerror tt_dlerror
+#define RTLD_NOW 0
+#else
 #include <dlfcn.h>
+#endif
 
 /* BlockQ4_0 comes from loader_gguf.h (d stored as raw fp16 bits). */
 #define Q4_D(blk) __half2float(*(const __half *)&(blk).d)
@@ -5965,6 +5977,14 @@ static inline int cublas_pre_wanted(void) {
     if (cached < 0) cached = getenv("TT_CUBLAS_PRE") ? 1 : 0;
     return cached;
 }
+static const char *const *cublas_lib_paths(void) {
+#ifdef _WIN32
+    static const char *p[] = { "build\\tt_cublas.dll", "tt_cublas.dll", NULL };
+#else
+    static const char *p[] = { "build/libtt_cublas.so", "./build/libtt_cublas.so", NULL };
+#endif
+    return p;
+}
 /* kind: 0=strict(q/k/v/o) 1=tf32-ok(gate/up/down). kind: 0=q 1=k 2=v 3=o 4=gate 5=up 6=down */
 static inline float *cublas_shadow_ptr(Qwen2Engine *e, int l, int kind) {
     if (!e->cublas_ok || l < 0 || l >= e->cfg.n_layers) return NULL;
@@ -5993,7 +6013,7 @@ static void cublas_build_shadows(Qwen2Engine *e, GGUFModel *m) {
     for (int l = 0; l < 128; l++)
         e->sh_q[l]=e->sh_k[l]=e->sh_v[l]=e->sh_o[l]=e->sh_gate[l]=e->sh_up[l]=e->sh_down[l]=NULL;
     if (!cublas_pre_wanted()) return;
-    static const char *paths[] = { "build/libtt_cublas.so", "./build/libtt_cublas.so", NULL };
+    const char *const *paths = cublas_lib_paths();
     for (int i = 0; paths[i]; i++) {
         e->cublas_dl = dlopen(paths[i], RTLD_NOW);
         if (e->cublas_dl) break;
@@ -6083,7 +6103,7 @@ static void cublas_fp16_build(Qwen2Engine *e, GGUFModel *m) {
     for (int l = 0; l < 128; l++)
         e->sh16_q[l]=e->sh16_k[l]=e->sh16_v[l]=e->sh16_o[l]=e->sh16_gate[l]=e->sh16_up[l]=e->sh16_down[l]=NULL;
     if (!cublas_fp16_wanted()) return;
-    static const char *paths[] = { "build/libtt_cublas.so", "./build/libtt_cublas.so", NULL };
+    const char *const *paths = cublas_lib_paths();
     for (int i = 0; paths[i]; i++) {
         e->cublas_fp16_dl = dlopen(paths[i], RTLD_NOW);
         if (e->cublas_fp16_dl) break;
@@ -6467,9 +6487,13 @@ int prefill_batched_gemm(Qwen2Engine *e, const int *toks, int n, float *h_x_out)
                     const long total_blocks = (long)n * blocks_per_slot;
                     k_kv_scatter_q4_0_batched<<<(total_blocks + 255)/256, 256, 0, e->stream>>>(
                         d_K, d_V, Kl_q4, Vl_q4, d_pos_batch, KV_l, HDl, c->max_ctx, n);
-                } else if (e->use_q8_kvcache && Kl_q8 && Vl_q8 && kv_use_q8_eff_at(e, e->pos + n) && getenv("TT_Q8_PREFILL_FLASH")) {
+                } else if (e->use_q8_kvcache && Kl_q8 && Vl_q8) {
                     /* Dual-write FP32 + Q8 (mirror Q4 path): hybrid decode
-                     * below thresh reads FP32, so it must be populated. */
+                     * reads FP32 below thresh and Q8 inside/above it, so
+                     * both must be populated for EVERY prefill token, no
+                     * matter which prefill-attention kernel runs. Gating
+                     * this write on TT_Q8_PREFILL_FLASH left the Q8 slabs
+                     * zeroed (decode reads garbage past the threshold). */
                     k_kv_scatter_batched<<<(n*kvdim_l+255)/256, 256, 0, e->stream>>>(
                         d_K, d_V, Kl_f, Vl_f, d_pos_batch, KV_l, HDl, c->max_ctx, n, kvdim_l);
                     const int blocks_per_slot = kvdim_l / 32;
@@ -6490,7 +6514,7 @@ int prefill_batched_gemm(Qwen2Engine *e, const int *toks, int n, float *h_x_out)
         if (HDl > 128) {
             /* Tiled prefill flash regs/smem sized for elems<=4 (HD<=128);
              * fall back to per-token serial path for this layer only. */
-            if (e->use_q8_kvcache && Kl_q8 && Vl_q8 && !(e->use_q4_kvcache && Kl_q4 && Vl_q4)) {
+            if (e->use_q8_kvcache && Kl_q8 && Vl_q8 && !(e->use_q4_kvcache && Kl_q4 && Vl_q4) && kv_use_q8_eff_at(e, e->pos + n) && getenv("TT_Q8_PREFILL_FLASH")) {
                 for (int qi = 0; qi < n; qi++)
                     k_flash_gqa_q8_0<<<H_l, 32, 0, e->stream>>>(
                         d_Q + (long)qi * attn_qout, Kl_q8, Vl_q8, d_Att + (long)qi * attn_qout,
@@ -6804,9 +6828,13 @@ int prefill_batched_gemm_dx(Qwen2Engine *e, const int *toks, int n, float *d_x_o
                     const long total_blocks = (long)n * blocks_per_slot;
                     k_kv_scatter_q4_0_batched<<<(total_blocks + 255)/256, 256, 0, e->stream>>>(
                         d_K, d_V, Kl_q4, Vl_q4, d_pos_batch, KV_l, HDl, c->max_ctx, n);
-                } else if (e->use_q8_kvcache && Kl_q8 && Vl_q8 && kv_use_q8_eff_at(e, e->pos + n) && getenv("TT_Q8_PREFILL_FLASH")) {
+                } else if (e->use_q8_kvcache && Kl_q8 && Vl_q8) {
                     /* Dual-write FP32 + Q8 (mirror Q4 path): hybrid decode
-                     * below thresh reads FP32, so it must be populated. */
+                     * reads FP32 below thresh and Q8 inside/above it, so
+                     * both must be populated for EVERY prefill token, no
+                     * matter which prefill-attention kernel runs. Gating
+                     * this write on TT_Q8_PREFILL_FLASH left the Q8 slabs
+                     * zeroed (decode reads garbage past the threshold). */
                     k_kv_scatter_batched<<<(n*kvdim_l+255)/256, 256, 0, e->stream>>>(
                         d_K, d_V, Kl_f, Vl_f, d_pos_batch, KV_l, HDl, c->max_ctx, n, kvdim_l);
                     const int blocks_per_slot = kvdim_l / 32;
@@ -6826,7 +6854,7 @@ int prefill_batched_gemm_dx(Qwen2Engine *e, const int *toks, int n, float *d_x_o
         if (HDl > 128) {
             /* Tiled prefill flash regs/smem sized for elems<=4 (HD<=128);
              * fall back to per-token serial path for this layer only. */
-            if (e->use_q8_kvcache && Kl_q8 && Vl_q8 && !(e->use_q4_kvcache && Kl_q4 && Vl_q4)) {
+            if (e->use_q8_kvcache && Kl_q8 && Vl_q8 && !(e->use_q4_kvcache && Kl_q4 && Vl_q4) && kv_use_q8_eff_at(e, e->pos + n) && getenv("TT_Q8_PREFILL_FLASH")) {
                 for (int qi = 0; qi < n; qi++)
                     k_flash_gqa_q8_0<<<H_l, 32, 0, e->stream>>>(
                         d_Q + (long)qi * attn_qout, Kl_q8, Vl_q8, d_Att + (long)qi * attn_qout,

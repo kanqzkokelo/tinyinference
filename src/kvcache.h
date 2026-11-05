@@ -195,9 +195,9 @@ typedef struct {
                              n_layers (K+V), stride max_kv*ctx*hd       */
     double gb_shared;     /* uniform slab x KV-OWNING layers only       */
     double gb_ideal;      /* exact per-layer widths, owners only        */
-    long   b_no_share;
-    long   b_shared;
-    long   b_ideal;
+    int64_t b_no_share;
+    int64_t b_shared;
+    int64_t b_ideal;
 } tt_kv_mem;
 
 /* Exact byte math, mirrors gate-script estimates:

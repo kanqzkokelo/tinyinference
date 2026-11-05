@@ -20,20 +20,21 @@ import argparse
 import os
 import subprocess
 import sys
+import tempfile
 
 import numpy as np
 
+from tt_platform import env_with_lib, exe
+
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 os.chdir(ROOT)
-ORACLE_LOGITS = "build/oracle_logits"
-DUMP = "build/dump_logits"
+ORACLE_LOGITS = exe("oracle_logits")
+DUMP = exe("dump_logits")
 
-env = dict(os.environ)
-env["LD_LIBRARY_PATH"] = ":".join(filter(None, [
-    os.path.expanduser("~/mmcuda/lib"),
-    os.path.expanduser("~/.local/lib/python3.12/site-packages/nvidia/cuda_runtime/lib"),
-    os.path.join(os.getcwd(), "oracle/llama.cpp/build/bin"),
-    env.get("LD_LIBRARY_PATH", "")]))
+env = env_with_lib([os.path.expanduser("~/mmcuda/lib"),
+                    os.path.expanduser(
+                        "~/.local/lib/python3.12/site-packages/nvidia/cuda_runtime/lib"),
+                    os.path.join(os.getcwd(), "oracle/llama.cpp/build/bin")])
 
 DEFAULT_MODEL = "data/models/gemma-4-E2B-it-Q4_0.gguf"
 
@@ -52,7 +53,7 @@ VOCAB = 262144
 
 
 def engine_logits(model, ids, tag):
-    out = f"/tmp/m84_ours_{tag}.bin"
+    out = os.path.join(tempfile.gettempdir(), f"m84_ours_{tag}.bin")
     r = subprocess.run([DUMP, "--model", model,
                         ",".join(map(str, ids)), out],
                        capture_output=True, text=True, timeout=300, env=env)
@@ -67,7 +68,7 @@ def engine_logits(model, ids, tag):
 
 
 def oracle_ref(model, ids, tag):
-    out = f"/tmp/m84_oracle_{tag}.bin"
+    out = os.path.join(tempfile.gettempdir(), f"m84_oracle_{tag}.bin")
     r = subprocess.run([ORACLE_LOGITS, model,
                         "--ids", ",".join(map(str, ids)), "--dump", out],
                        capture_output=True, text=True, timeout=300, env=env)

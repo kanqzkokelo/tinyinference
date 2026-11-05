@@ -43,16 +43,19 @@ import os
 import re
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 
 import numpy as np
 
+from tt_platform import exe
+
 ROOT = Path(__file__).resolve().parent.parent
 os.chdir(ROOT)
 
-DUMP_BIN = ROOT / "build" / "dump_logits"
-ORACLE_BIN = ROOT / "build" / "oracle_logits"
+DUMP_BIN = Path(exe("dump_logits"))
+ORACLE_BIN = Path(exe("oracle_logits"))
 GOLDEN_DIR = ROOT / "data" / "golden"
 
 TOP_N = 10                          # capture top-10
@@ -227,6 +230,9 @@ def gather_cases(filter_model, workdir):
     for m in MODELS:
         if filter_model and m["name"] != filter_model:
             continue
+        if not os.path.isfile(m["path"]):
+            print(f"  [{m['name']}] skip: model not present at {m['path']}", flush=True)
+            continue
         for label, ids in PROMPTS:
             print(f"  [{m['name']}] {label}: ids={ids} ...", flush=True)
             c = compute_case(m["path"], m["name"], label, ids, workdir)
@@ -335,7 +341,7 @@ def self_test(workdir):
     """Inject a 5.0 offset into one row of each golden then verify, expect fail."""
     GOLDEN_DIR.mkdir(parents=True, exist_ok=True)
     cases = record(None, workdir)
-    tmpdir = Path("/tmp")
+    tmpdir = Path(tempfile.gettempdir())
     backups = []
     seen_paths = set()
     for c in cases:
@@ -378,7 +384,8 @@ def main():
                     help="override median|d| tolerance (default 0.6)")
     ap.add_argument("--tol-drift", type=float, default=None,
                     help="fail if |live_median - golden_median| exceeds this")
-    ap.add_argument("--workdir", default="/tmp/eng_golden_work")
+    ap.add_argument("--workdir",
+                    default=os.path.join(tempfile.gettempdir(), "eng_golden_work"))
     args = ap.parse_args()
 
     if not DUMP_BIN.exists() or not ORACLE_BIN.exists():

@@ -7,6 +7,7 @@
 #include <time.h>
 #include <math.h>
 #include <cuda_runtime.h>
+#include "tt_platform.h"
 #include "loader_gguf.h"
 #include "qwen2_engine.h"
 #include "tokenizer_bpe.h"
@@ -231,18 +232,20 @@ int main(int argc, char **argv) {
     if (getenv("TT_PROFILE")) qwen2_debug_profile_reset();
     clock_gettime(CLOCK_MONOTONIC, &t0);   /* decode-only window starts here */
 
-    int history[MAX_CTX];
+    float *logits = (float *)malloc(sizeof(float) * vocab_size);
+    if (!logits) { fprintf(stderr, "OOM logits\n"); return 1; }
+
+    int *history = (int *)malloc(sizeof(int) * (size_t)MAX_CTX);
+    if (!history) { fprintf(stderr, "OOM history\n"); free(logits); return 1; }
     int history_len = 0;
     for (int i = 0; i < n_prompt && history_len < MAX_CTX; i++) {
         history[history_len++] = prompt_tokens[i];
     }
 
-    float *logits = (float *)malloc(sizeof(float) * vocab_size);
-    if (!logits) { fprintf(stderr, "OOM logits\n"); return 1; }
-
     if (temp > 0.0f) {
         if (qwen2_engine_next(eng) < 0) {
             fprintf(stderr, "prompt scoring failed\n");
+            free(history);
             free(logits);
             return 1;
         }
@@ -272,15 +275,19 @@ int main(int argc, char **argv) {
         if (!tok) { gen_count++; continue; }   /* no decoder yet: count only */
         int out_len = 0;
         const char *txt = bpe_decode_token(tok, id, &out_len);
+        const char *print_txt = txt;
         if (tl + (size_t)out_len < sizeof(turn_text)) {
             memcpy(turn_text + tl, txt, (size_t)out_len);
             tl += (size_t)out_len;
             turn_text[tl] = '\0';
+            /* bpe_decode_token returns a reused internal buffer; hand the
+             * printer the stable copy so the worker thread cannot race it. */
+            print_txt = turn_text + tl - (size_t)out_len;
         }
         if (id == tok->eos_id) {
             break;
         }
-        async_printer_push(ap, txt, out_len);
+        async_printer_push(ap, print_txt, out_len);
         gen_count++;
 
         if (history_len < MAX_CTX) {
@@ -308,6 +315,7 @@ int main(int argc, char **argv) {
            first_tok_sec * 1e6, tot * 1e6);
     if (getenv("TT_PROFILE")) qwen2_debug_profile_report(gen_count);
 
+    free(history);
     free(logits);
     qwen2_engine_free(eng);
     if (tok) bpe_tokenizer_free(tok);

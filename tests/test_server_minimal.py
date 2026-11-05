@@ -24,6 +24,7 @@ import os
 import socket
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 from typing import Any
@@ -31,8 +32,10 @@ from typing import Any
 import pytest
 import requests
 
+from tt_platform import exe
+
 REPO = Path(__file__).resolve().parent.parent
-BUILD_BIN = REPO / "build" / "server_minimal"
+BUILD_BIN = Path(exe("server_minimal"))
 DEFAULT_MODEL = REPO / "data" / "models" / "qwen2.5-0.5b-instruct-q4_0.gguf"
 
 # Use a high port unlikely to collide with anything; pytest doesn't share
@@ -103,28 +106,30 @@ def server():
 
     # The engine loads on first accept; the server prints "listening on ..."
     # once the socket is bound. We capture stderr for diagnostics on failure.
+    log = Path(tempfile.gettempdir()) / "tt_server_minimal.log"
+    logf = open(log, "wb")
     proc = subprocess.Popen(
         [str(BUILD_BIN)],
         env=env,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
+        stdout=logf,
+        stderr=subprocess.STDOUT,
         cwd=str(REPO),
     )
+    logf.close()
     try:
         # Bound the wait. qwen2.5-0.5b loads in a couple seconds on a free
         # GPU; under contention it can spike to ~30s. Beyond that we assume
         # the engine never came up and skip rather than hang the test.
         _wait_ready(base + "/healthz", timeout_s=60.0)
     except Exception:
-        # Tear down and surface stderr to make the failure debuggable.
+        # Tear down and surface the tail of the server log for debugging.
         proc.terminate()
         try:
             proc.wait(timeout=5)
         except subprocess.TimeoutExpired:
             proc.kill()
-        out, err = proc.communicate(timeout=5)
-        sys.stderr.write("--- server stdout ---\n" + (out or b"").decode(errors="replace"))
-        sys.stderr.write("--- server stderr ---\n" + (err or b"").decode(errors="replace"))
+        sys.stderr.write(f"--- server log ({log}), tail ---\n")
+        sys.stderr.write(log.read_bytes()[-4000:].decode(errors="replace"))
         pytest.skip(f"server failed to start on {base} (likely GPU contention)")
         return  # unreachable, but appeases type checkers
 

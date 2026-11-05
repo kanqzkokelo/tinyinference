@@ -251,27 +251,33 @@ static int run_wmma(const float *dAf, const float *dBf, float *dC,
     return err;
 }
 
+#ifdef _WIN32
+#define TT_CUDA_API __declspec(dllexport)
+#else
+#define TT_CUDA_API
+#endif
+
 extern "C" {
 
-int tt_cuda_alloc(float **p, size_t bytes) { return (int)cudaMalloc(p, bytes); }
-void tt_cuda_free(float *p) { cudaFree(p); }
-int tt_cuda_h2d(float *d, const float *h, size_t bytes) {
+TT_CUDA_API int tt_cuda_alloc(float **p, size_t bytes) { return (int)cudaMalloc(p, bytes); }
+TT_CUDA_API void tt_cuda_free(float *p) { cudaFree(p); }
+TT_CUDA_API int tt_cuda_h2d(float *d, const float *h, size_t bytes) {
     return (int)cudaMemcpy(d, h, bytes, cudaMemcpyHostToDevice);
 }
-int tt_cuda_d2h(float *h, const float *d, size_t bytes) {
+TT_CUDA_API int tt_cuda_d2h(float *h, const float *d, size_t bytes) {
     return (int)cudaMemcpy(h, d, bytes, cudaMemcpyDeviceToHost);
 }
-int tt_cuda_sync(void) { return (int)cudaDeviceSynchronize(); }
+TT_CUDA_API int tt_cuda_sync(void) { return (int)cudaDeviceSynchronize(); }
 
-int tt_cuda_sgemm_naive(const float *dA, const float *dB, float *dC,
+TT_CUDA_API int tt_cuda_sgemm_naive(const float *dA, const float *dB, float *dC,
                         int M, int N, int K) {
     return run_naive(dA, dB, dC, M, N, K);
 }
-int tt_cuda_sgemm_tiled(const float *dA, const float *dB, float *dC,
+TT_CUDA_API int tt_cuda_sgemm_tiled(const float *dA, const float *dB, float *dC,
                         int M, int N, int K) {
     return run_tiled(dA, dB, dC, M, N, K);
 }
-int tt_cuda_sgemm_wmma(const float *dA, const float *dB, float *dC,
+TT_CUDA_API int tt_cuda_sgemm_wmma(const float *dA, const float *dB, float *dC,
                        int M, int N, int K) {
     return run_wmma(dA, dB, dC, M, N, K);
 }
