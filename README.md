@@ -1,5 +1,7 @@
 # tinyinference
 
+[![ci](https://github.com/kanqzkokelo/tinyinference/actions/workflows/ci.yml/badge.svg)](https://github.com/kanqzkokelo/tinyinference/actions/workflows/ci.yml)
+
 Multi-architecture LLM inference engine in C + CUDA, built from scratch.
 Loads GGUF weights, runs quantized transformer decode on NVIDIA GPUs.
 Split out of the `nnfromscratch` monorepo; tensor/autograd/ML code lives
