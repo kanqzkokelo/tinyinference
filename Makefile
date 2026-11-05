@@ -41,6 +41,24 @@ cuda: $(BUILD)/libtinytorch_cuda.so
 
 .PHONY: cuda
 
+# Language-binding shared library (bindings/tt_api.h) used by the Python
+# wheel; same objects as run_llm_gpu, no main().
+PYLIB_SRCS := src/loader_gguf.c src/arch_registry.c src/dequant_ref.c \
+              src/cpu_backend.c src/tokenizer_bpe.c src/async_printer.c \
+              src/chat_template.c \
+              kernels/gemv_q4_cuda.cu kernels/gemv_typed.cu kernels/qwen2_cuda.cu
+
+$(BUILD)/libtinytorch_engine.so: bindings/tt_api.cu $(PYLIB_SRCS) | $(BUILD)
+	$(NVCC) -O3 $(NVCC_GENCODE) \
+	  -I$(CUDA_INC) -Iinclude -Isrc -Xcompiler "-fPIC -fopenmp" \
+	  -Xlinker -rpath=$(CURDIR)/build:$(HOME)/mmcuda/lib \
+	  -shared -o $@ bindings/tt_api.cu $(PYLIB_SRCS) \
+	  -L$(HOME)/mmcuda/lib -lcudart -lpthread -lgomp
+
+pylib: $(BUILD)/libtinytorch_engine.so
+
+.PHONY: pylib
+
 CUBLAS_INC := $(HOME)/.local/lib/python3.12/site-packages/nvidia/cublas/include
 CUBLAS_LIB := $(HOME)/.local/lib/python3.12/site-packages/nvidia/cublas/lib
 

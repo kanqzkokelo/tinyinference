@@ -237,6 +237,17 @@ $(BUILD)/libtinytorch_cuda.dll: kernels/gemm_cuda.cu kernels/gemv_q4_cuda.cu ker
 $(BUILD)/tt_cublas.dll: kernels/cublas_ref.cu
 	$(NVCC) $(NVCCFLAGS) -shared -o $@ $< $(CUDA_LIB) -lcublas
 
+# Language-binding shared library (bindings/tt_api.h). Used by the Python wheel.
+PYLIB = $(BUILD)/tinytorch_engine.dll
+pydll: $(PYLIB)
+
+$(CUDA_OBJ)/tt_api.obj: bindings/tt_api.cu
+	@mkdir -p $(CUDA_OBJ)
+	$(NVCC) $(NVCCFLAGS) -c -o $@ $<
+
+$(PYLIB): $(CUDA_OBJ)/tt_api.obj $(ENGINE_LIB_OBJS) $(CUDA_OBJS)
+	$(NVCC) $(NVCCFLAGS) -shared -o $@ $^ $(CUDA_LIB)
+
 # Oracle logits tool against a llama.cpp build (parity fixtures). Point
 # ORACLE_DIR at any llama.cpp checkout whose build/bin holds llama.dll.
 ORACLE_DIR ?= oracle/llama.cpp

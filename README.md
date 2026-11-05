@@ -49,6 +49,34 @@ Routes: `POST /v1/chat/completions` (streaming and non-streaming),
 `GET /v1/models`, `GET /healthz`. `server_multimodel` routes by the `model`
 field to several GGUF files in one process.
 
+## Python
+
+The wheel bundles the engine `.dll`/`.so`, so `pip install` needs no compiler:
+
+```
+make -f Makefile.win pydll        # or `make pylib` on Linux
+bash python/build_wheel.sh        # -> python/dist/tinyinference-0.9.0-*.whl
+pip install python/dist/tinyinference-0.9.0-py3-none-win_amd64.whl
+```
+
+```
+tinyinference chat model.gguf "Explain KV caching in one sentence"
+tinyinference serve model.gguf --port 8000
+```
+
+```python
+from tinyinference import Model
+
+with Model("model.gguf", n_ctx=4096) as m:
+    print(m.chat([{"role": "user", "content": "hi"}]))
+    for piece in m.stream_text(m.encode("Once upon a time"), 64):
+        print(piece, end="", flush=True)
+```
+
+`tinyinference serve` speaks the OpenAI chat and completions API, so the
+`openai` client works with `base_url="http://127.0.0.1:8000/v1"`. Requests are
+serialized: one model, one KV cache.
+
 ## Build
 
 Linux, CPU library plus the CUDA engine:

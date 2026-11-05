@@ -17,3 +17,7 @@ oracle/
 *.swp
 *.swo
 .DS_Store
+
+python/dist/
+python/*.egg-info/
+python/build/
