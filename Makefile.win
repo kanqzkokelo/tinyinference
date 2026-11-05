@@ -41,7 +41,6 @@ OBJS = $(SRCS:src/%.c=$(OBJ)/%.o) $(OBJ)/cpu_backend.o
 
 TESTS = \
 	test_arch_registry \
-	test_json_grammar \
 	test_kvcache \
 	test_loader_hardening \
 	test_moe_router \
@@ -89,9 +88,6 @@ tests: $(TESTS:%=$(BUILD)/%.exe)
 
 $(BUILD)/test_arch_registry.exe: tests/test_arch_registry.c $(OBJ)/arch_registry.o $(OBJ)/loader_gguf.o
 	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS) $(LDLIBS)
-
-$(BUILD)/test_json_grammar.exe: tests/test_json_grammar.c src/json_grammar.c
-	$(CC) $(CFLAGS) -Isrc -o $@ $^ $(LDFLAGS) $(LDLIBS)
 
 $(BUILD)/test_kvcache.exe: tests/test_kvcache.c $(OBJ)/kvcache.o
 	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS) $(LDLIBS)
@@ -152,7 +148,7 @@ CUDA_KERNELS = gemv_q4_cuda gemv_typed qwen2_cuda
 CUDA_OBJS    = $(CUDA_KERNELS:%=$(CUDA_OBJ)/%.obj)
 
 ENGINE_LIB_C = loader_gguf arch_registry dequant_ref cpu_backend \
-               tokenizer_bpe async_printer chat_template json_grammar
+               tokenizer_bpe async_printer chat_template
 ENGINE_LIB_OBJS = $(ENGINE_LIB_C:%=$(CUDA_OBJ)/%.obj)
 ENGINE_C     = run_llm_gpu $(ENGINE_LIB_C)
 ENGINE_OBJS  = $(ENGINE_C:%=$(CUDA_OBJ)/%.obj)
