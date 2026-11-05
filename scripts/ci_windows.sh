@@ -83,6 +83,13 @@ if [ -x build/run_llm_gpu.exe ] && command -v nvidia-smi >/dev/null 2>&1 \
     else
       echo "=== engine-golden ==="; echo "SKIP: goldens/models not present"
     fi
+    GEMMA4=data/models/gemma-4-E2B-it-Q4_0.gguf
+    if [ -f "$GEMMA4" ]; then
+      run gate-ple-golden "$PY_BIN" tests/gate_ple_golden.py --model "$GEMMA4"
+      run gate-m84-gemma4 "$PY_BIN" tests/gate_m84_gemma4.py --model "$GEMMA4"
+    else
+      echo "=== gate-ple-golden ==="; echo "SKIP: $GEMMA4 not present"
+    fi
   else
     echo "=== gate-tokenizer ==="; echo "SKIP: llama.cpp oracle not built"
   fi

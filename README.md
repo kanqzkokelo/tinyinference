@@ -56,7 +56,7 @@ python3 real_chat.py # ctypes live chat app (uses build/libtinytorch.so)
 ./scripts/ci_windows.sh      # Windows equivalent of ci_local + CUDA gates
 ./scripts/verify.sh m61      # greedy-logit parity vs llama.cpp + multiturn chat
 ./scripts/verify.sh m84      # gemma4 parity
-./scripts/verify.sh ple      # PLE-fused golden
+./scripts/verify.sh ple      # PLE-fused golden (needs `pip install gguf`)
 ./scripts/verify.sh tok      # tokenizer oracle parity (needs oracle build)
 ./scripts/verify.sh backfill # Q8 KV-cache backfill (needs nvcc)
 ```

@@ -130,7 +130,7 @@ def engine_ples(model, timeout=300, oom_retries=5):
         os.remove(stale)
     for attempt in range(oom_retries + 1):
         r = subprocess.run([DUMP, "--model", model,
-                            ",".join(map(str, TOKENS)), "/dev/null"],
+                            ",".join(map(str, TOKENS)), os.devnull],
                            capture_output=True, text=True, timeout=timeout,
                            env={**env, "TT_DUMP_PLE": DUMP_PREFIX})
         files = sorted(glob.glob(DUMP_PREFIX + ".tok*"),
@@ -168,7 +168,7 @@ def main():
     tensors = load_tensors(args.model)
     import mmap
     f = open(args.model, "rb")
-    mm = mmap.mmap(f.fileno(), 0, prot=mmap.PROT_READ)
+    mm = mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ)
 
     refs = [ref_ple(tensors, mm, t) for t in TOKENS]
     ours_all = engine_ples(args.model)
