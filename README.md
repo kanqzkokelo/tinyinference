@@ -2,92 +2,136 @@
 
 [![ci](https://github.com/kanqzkokelo/tinyinference/actions/workflows/ci.yml/badge.svg)](https://github.com/kanqzkokelo/tinyinference/actions/workflows/ci.yml)
 
-Multi-architecture LLM inference engine in C + CUDA, built from scratch.
-Loads GGUF weights, runs quantized transformer decode on NVIDIA GPUs.
-Split out of the `nnfromscratch` monorepo; tensor/autograd/ML code lives
-in `tinytorch`.
+A from-scratch LLM inference engine in C + CUDA. It loads GGUF weights and
+runs quantized transformer decode on NVIDIA GPUs with no Python in the hot
+path. Built for fast single-stream generation on small-VRAM machines: the
+reference numbers below are from a 4 GB laptop RTX 3050.
 
-What works: GGUF loader, arch registry (qwen2/llama/qwen3/gemma/gemma4/
-tinyllama/granite/smollm2/mistral/internlm2/xverse/exaone/ernie4_5),
-BPE tokenizer, chat templates, top-k/top-p/min-p samplers, paged KV-cache
-with Q8 backfill, MoE router, N-gram speculative decode, threaded CPU
-GEMV backend (Q4_0/Q8_0/Q4_K/Q5_K/Q6_K), CUDA GEMV/GEMM/flash kernels.
-
-## Build
-
-```
-make lib                 # CPU objects -> build/libtinytorch.so
-make run_llm_gpu         # needs nvcc + RTX-class GPU
-./scripts/ci_local.sh    # 30s CPU sanity, no GPU needed
-```
-
-### Windows (native, no WSL)
-
-The portable C surface builds with MSYS2 mingw-w64; the CUDA engine builds
-with MSVC + nvcc. Run from the repo root:
-
-```
-make -f Makefile.win all      # lib + tools + CPU test binaries -> build/
-make -f Makefile.win cuda     # CUDA engine, GPU tools, oracle helper
-make -f Makefile.win test     # run the CPU test suite
-./scripts/ci_windows.sh       # CPU suite + GPU gates when a device is present
-```
-
-`nvcc` and `cl` must be on `PATH` (or set `NVCC` / `CL`); see `Makefile.win`.
-Gates resolve `build/*.exe` and `%TEMP%` automatically and load
-`libtinytorch.dll` instead of the `.so`.
+- **Fast decode where it is hardest.** Qwen2.5-0.5B Q4_0 at 289 tok/s @ 32
+  context, 261 tok/s @ 2048, 103 tok/s @ 30k.
+- **Typed kernels, no dequant-to-FP32 round trip.** Q4_0/Q4_K/Q5_K/Q6_K/Q8_0
+  GEMV, flash attention, FP32/Q8/Q4 KV caches.
+- **One binary.** `run_llm_gpu`, `chat_llm_gpu`, and an OpenAI-compatible
+  server, no runtime dependencies beyond the CUDA driver.
 
 ## Quickstart
 
-```
-./build/run_llm_gpu data/models/qwen2.5-0.5b-instruct-q4_0.gguf "Hello"
-```
-
-## Chat frontends
+Grab a GGUF (Qwen2.5-0.5B-Instruct Q4_0 is 397 MB) and run:
 
 ```
-./chat          # bash launcher -> build/chat_llm_gpu (C binary, fastest)
-python3 chat.py      # terminal client (template + sampling knobs)
-python3 real_chat.py # ctypes live chat app (uses build/libtinytorch.so)
+# Linux
+./build/run_llm_gpu -m qwen2.5-0.5b-instruct-q4_0.gguf "Explain KV caching." 64
+
+# Windows
+run_llm_gpu.exe -m qwen2.5-0.5b-instruct-q4_0.gguf "Explain KV caching." 64
 ```
 
-## Gates
+`-m` picks the model, the quoted string is the prompt, the last argument is
+the token budget. `TT_MODEL` works too. Interactive chat:
 
 ```
-./scripts/ci_local.sh        # samplers, specdec-sim, chat-template, kvcache, cpu_backend
-./scripts/ci_windows.sh      # Windows equivalent of ci_local + CUDA gates
-./scripts/verify.sh m61      # greedy-logit parity vs llama.cpp + multiturn chat
-./scripts/verify.sh m84      # gemma4 parity
-./scripts/verify.sh ple      # PLE-fused golden (needs `pip install gguf`)
-./scripts/verify.sh tok      # tokenizer oracle parity (needs oracle build)
-./scripts/verify.sh backfill # Q8 KV-cache backfill (needs nvcc)
+./build/chat_llm_gpu          # TT_MODEL=... if the model is not in data/models
 ```
+
+## Server
+
+```
+TT_MODEL=qwen2.5-0.5b-instruct-q4_0.gguf TT_LISTEN=127.0.0.1:8080 ./build/server_minimal
+```
+
+```
+curl -s localhost:8080/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"local","messages":[{"role":"user","content":"hi"}],"stream":true}'
+```
+
+Routes: `POST /v1/chat/completions` (streaming and non-streaming),
+`GET /v1/models`, `GET /healthz`. `server_multimodel` routes by the `model`
+field to several GGUF files in one process.
+
+## Build
+
+Linux, CPU library plus the CUDA engine:
+
+```
+make lib
+make run_llm_gpu
+```
+
+Windows, native, no WSL:
+
+```
+make -f Makefile.win all      # lib, tools, CPU test binaries -> build/
+make -f Makefile.win cuda     # CUDA engine and GPU tools
+make -f Makefile.win test     # CPU suite
+./scripts/ci_windows.sh       # CPU suite + GPU gates when a device is present
+```
+
+The portable C side builds with MSYS2 mingw-w64; the CUDA side needs MSVC
+`cl` and `nvcc` on `PATH` (or `NVCC` / `CL` set). See `Makefile.win`.
+
+## What it runs
+
+Architectures: qwen2, qwen3, llama, mistral, gemma, gemma4, tinyllama,
+granite, smollm2, internlm2, xverse, exaone, ernie4_5.
+
+Weights: F32, F16, Q4_0, Q4_1, Q4_K, Q5_0, Q5_1, Q5_K, Q6_K, Q8_0.
+
+Engine features: BPE tokenizer, chat templates, top-k/top-p/min-p/temperature
+sampling with repetition penalty, paged KV cache with Q8 backfill, MoE
+routing, N-gram speculative decoding, CUDA graph replay, batched prefill,
+threaded CPU GEMV fallback.
 
 ## Numbers
 
-Decode throughput beats llama.cpp CUDA across short (32), medium (512),
-and long (2048, 4096, 8192, 16384, 30000) contexts on RTX 3050 Laptop 4GB
-(with fair `-ctk q4_0 -ctv q4_0` context quant enabled on llama.cpp).
-Fleet: qwen2.5-0.5b, qwen3-0.6b, llama-3.2-1b, smollm2-135m, gemma-4-E2B.
+Decode throughput vs llama.cpp CUDA on RTX 3050 Laptop 4 GB, llama.cpp given
+the same KV quantization (`-ctk q4_0 -ctv q4_0`). Ratios above 1.0 favor
+tinyinference.
 
-- **Qwen2.5-0.5B**: 289.6 tok/s @ 32 (1.11x), 321.3 tok/s @ 512 (1.13x), 261.6 tok/s @ 2048 (1.21x), 226.2 tok/s @ 4096 (1.08x), 103.3 tok/s @ 30k (1.12x).
-- **SmolLM2-135M**: 559.3 tok/s @ 512 (1.33x), 462.7 tok/s @ 2048 (1.14x), 356.9 tok/s @ 4096 (0.96x).
-- **Llama-3.2-1B**: 154.4 tok/s @ 512 (1.13x), 133.2 tok/s @ 2048 (1.08x).
-- **Small-n TTFT/Prefill**: 1.54x–2.38x faster prefill via `tt_gemv_q4_0_batchn`.
-- **Automatic Prefix Caching**: Instant multi-turn history reuse for agentic loops.
+| model | 32 | 512 | 2048 | 4096 | 30k |
+|---|---|---|---|---|---|
+| Qwen2.5-0.5B | 1.11x | 1.13x | 1.21x | 1.08x | 1.12x |
+| SmolLM2-135M | — | 1.33x | 1.14x | 0.96x | — |
+| Llama-3.2-1B | — | 1.13x | 1.08x | — | — |
 
-Full tables and methodology in `docs/BENCHMARKS.md`. Supported families
-and quant tiers are in `docs/SUPPORTED_FAMILIES.md`.
+Absolute Qwen2.5-0.5B: 289.6 / 321.3 / 261.6 / 226.2 / 103.3 tok/s. Prefill
+on small batches is 1.54x-2.38x faster. We lose one cell (SmolLM2 @ 4096);
+the full tables, hardware, and methodology are in `docs/BENCHMARKS.md`.
 
-![Decode throughput vs llama.cpp CUDA](docs/assets/decode_geomean.png)
-![Per-cell decode parity in graph mode](docs/assets/decode_parity_cells.png)
+## Gates
+
+Correctness is checked against llama.cpp logits and tokenizer output, not
+against itself.
+
+```
+./scripts/ci_local.sh        # samplers, specdec, chat templates, KV cache, CPU backend
+./scripts/ci_windows.sh      # the same plus CUDA gates when a GPU is present
+./scripts/verify.sh m61      # greedy logit parity + multiturn chat
+./scripts/verify.sh m84      # gemma4 parity
+./scripts/verify.sh ple      # PLE-fused golden (pip install gguf)
+./scripts/verify.sh tok      # tokenizer oracle parity
+./scripts/verify.sh backfill # Q8 KV-cache backfill
+```
+
+## Known limits
+
+- NVIDIA only. There is no Vulkan, Metal, or ROCm backend, and generation
+  requires a CUDA GPU; the CPU backend covers prefill/GEMV paths used by the
+  library and tests, not standalone generation.
+- No grammar/JSON-constrained decoding, tool calling, or continuous
+  batching. The server handles one request at a time per process.
+- No quantization or GGUF conversion. Bring a file produced by llama.cpp.
+- Prefix caching (`TT_PREFIX_CACHE`) is opt-in and covers prefill tokens;
+  generated tokens are re-fed on the next turn.
+- Gemma 4 needs `data/models/gemma-4-E2B-it-Q4_0.gguf` for its gates; the
+  file is not redistributed here.
 
 ## Layout
 
-`src/` engine (loader, arch_registry, tokenizer, samplers, kvcache,
-cpu_backend, moe_router, specdec, ngram_lookup, dequant_ref),
-`kernels/` CUDA, `tools/` microbenches, `bench/bench_llm.py`
-scoreboard, golden logits in `data/golden/`, servers in `examples/`.
+`src/` engine (GGUF loader, arch registry, tokenizer, samplers, KV cache,
+CPU backend, MoE router, spec decode, n-gram lookup), `kernels/` CUDA,
+`examples/` CLIs and servers, `tools/` microbenches, `bench/bench_llm.py`,
+`data/golden/` reference logits, `tests/` and `scripts/` gates.
 
 ## License
 

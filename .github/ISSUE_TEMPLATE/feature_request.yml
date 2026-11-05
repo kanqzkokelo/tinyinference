@@ -1,0 +1,29 @@
+name: Feature request
+description: A model, backend, or serving feature
+labels: [enhancement]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: What can't you do today
+      description: Describe the use case, not the implementation.
+    validations:
+      required: true
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      options:
+        - Model architecture or quantization
+        - CUDA kernels / performance
+        - CPU backend
+        - Server / OpenAI API
+        - Tokenizer or chat template
+        - Build or platform support
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: What you tried instead
+      description: Another engine, a workaround, or nothing.
