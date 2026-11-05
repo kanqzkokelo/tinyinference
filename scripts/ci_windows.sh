@@ -69,6 +69,17 @@ if [ -x build/run_llm_gpu.exe ] && command -v nvidia-smi >/dev/null 2>&1 \
   run test-tokenizer-special "$PY_BIN" tests/test_tokenizer_special_tokens.py
   run test-server-minimal "$PY_BIN" tests/test_server_minimal.py
   run test-server-multimodel "$PY_BIN" tests/test_server_multimodel.py
+  # Python binding + HTTP API (same engine, via ctypes).
+  if [ -f data/models/qwen2.5-0.5b-instruct-q4_0.gguf ]; then
+    export TT_TEST_MODEL="$PWD/data/models/qwen2.5-0.5b-instruct-q4_0.gguf"
+    export TINYINFERENCE_LIB="$PWD/build/tinytorch_engine.dll"
+    export PYTHONPATH="$PWD/python:$PWD/tests"
+    run python-tests "$PY_BIN" -m pytest python/tests -q
+    unset TT_TEST_MODEL TINYINFERENCE_LIB
+    export PYTHONPATH="$PWD/tests"
+  else
+    echo "=== python-tests ==="; echo "SKIP: qwen2.5 model not present"
+  fi
   for t in test_arch_registry test_gemv_typed test_batch4_gemv test_spec_verify \
            test_q8_kvcache test_q4_kvcache test_q4_split_exact test_qcache_backfill \
            test_prefill_gemm test_wmma_prefill_gemm test_logits_q8_v4; do

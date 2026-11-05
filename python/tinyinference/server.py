@@ -117,21 +117,15 @@ class _Handler(BaseHTTPRequestHandler):
         messages = req.get("messages")
         if not isinstance(messages, list) or not messages:
             return self._error("messages must be a non-empty array")
+        if not self._single_choice(req):
+            return
 
         try:
             prompt = self.model.chat_format(messages)
         except ValueError as exc:
             return self._error(str(exc))
 
-        self._generate(
-            prompt=prompt,
-            max_tokens=int(req.get("max_tokens") or 256),
-            temperature=float(req.get("temperature", 0.7)),
-            top_k=int(req.get("top_k") or 40),
-            repeat_penalty=float(req.get("repeat_penalty", 1.1)),
-            stream=bool(req.get("stream", False)),
-            chat=True,
-        )
+        self._generate(prompt=prompt, req=req, chat=True)
 
     def _completion(self) -> None:
         req = self._read_json()
@@ -142,55 +136,65 @@ class _Handler(BaseHTTPRequestHandler):
             prompt = prompt[0] if prompt else ""
         if not isinstance(prompt, str):
             return self._error("prompt must be a string")
+        if not self._single_choice(req):
+            return
 
-        self._generate(
-            prompt=prompt,
-            max_tokens=int(req.get("max_tokens") or 256),
-            temperature=float(req.get("temperature", 0.7)),
-            top_k=int(req.get("top_k") or 40),
-            repeat_penalty=float(req.get("repeat_penalty", 1.1)),
-            stream=bool(req.get("stream", False)),
-            chat=False,
-        )
+        self._generate(prompt=prompt, req=req, chat=False)
 
-    def _generate(
-        self,
-        prompt: str,
-        max_tokens: int,
-        temperature: float,
-        top_k: int,
-        repeat_penalty: float,
-        stream: bool,
-        chat: bool,
-    ) -> None:
+    def _single_choice(self, req: dict) -> bool:
+        n = int(req.get("n") or 1)
+        if n != 1:
+            self._error("n > 1 is not supported")
+            return False
+        return True
+
+    def _generate(self, prompt: str, req: dict, chat: bool) -> None:
         model = self.model
-        tokens = model.encode(prompt)
+        max_tokens = int(req.get("max_tokens") or req.get("max_completion_tokens") or 256)
+        temperature = float(req.get("temperature", 0.7))
+        top_k = int(req.get("top_k") or 40)
+        repeat_penalty = float(req.get("repeat_penalty", 1.1))
+        stop = req.get("stop")
+        stream = bool(req.get("stream", False))
+        include_usage = bool((req.get("stream_options") or {}).get("include_usage"))
+
         cid = _completion_id()
         created = _now()
 
-        if stream:
-            self._start_stream()
-            self._sse(
-                self._chunk(cid, created, chat, delta={"role": "assistant", "content": ""})
-            )
-            self.lock.acquire()
-            try:
-                model.set_sampling(temperature, top_k, repeat_penalty)
-                for piece in model.stream_text(tokens, max_tokens):
-                    self._sse(self._chunk(cid, created, chat, delta={"content": piece}))
-            finally:
-                self.lock.release()
-            self._sse(self._chunk(cid, created, chat, finish="stop"))
-            self._sse("[DONE]")
-            return
-
         self.lock.acquire()
         try:
+            # The engine keeps one KV cache; every request starts from zero.
+            model.reset()
+            tokens = model.encode(prompt)
+            prompt_tokens = len(tokens)
+            limit = max(0, min(max_tokens, model.n_ctx - prompt_tokens - 1))
+
             model.set_sampling(temperature, top_k, repeat_penalty)
-            text = "".join(model.stream_text(tokens, max_tokens))
+
+            if stream:
+                self._start_stream()
+                self._sse(
+                    self._chunk(cid, created, chat, delta={"role": "assistant", "content": ""})
+                )
+                for piece in model.stream_text(tokens, max_tokens, stop=stop):
+                    self._sse(self._chunk(cid, created, chat, delta={"content": piece}))
+                usage = self._usage(prompt_tokens)
+                self._sse(
+                    self._chunk(
+                        cid, created, chat, finish=self._finish_reason(limit, usage)
+                    )
+                )
+                if include_usage:
+                    self._sse(self._usage_chunk(cid, created, usage))
+                self._sse("[DONE]")
+                return
+
+            text = "".join(model.stream_text(tokens, max_tokens, stop=stop))
+            usage = self._usage(prompt_tokens)
         finally:
             self.lock.release()
 
+        finish = self._finish_reason(limit, usage)
         if chat:
             payload = {
                 "id": cid,
@@ -201,14 +205,10 @@ class _Handler(BaseHTTPRequestHandler):
                     {
                         "index": 0,
                         "message": {"role": "assistant", "content": text},
-                        "finish_reason": "stop",
+                        "finish_reason": finish,
                     }
                 ],
-                "usage": {
-                    "prompt_tokens": len(tokens),
-                    "completion_tokens": len(model.encode(text)),
-                    "total_tokens": len(tokens) + len(model.encode(text)),
-                },
+                "usage": usage,
             }
         else:
             payload = {
@@ -216,14 +216,32 @@ class _Handler(BaseHTTPRequestHandler):
                 "object": "text_completion",
                 "created": created,
                 "model": self.model_name,
-                "choices": [{"index": 0, "text": text, "finish_reason": "stop"}],
-                "usage": {
-                    "prompt_tokens": len(tokens),
-                    "completion_tokens": len(model.encode(text)),
-                    "total_tokens": len(tokens) + len(model.encode(text)),
-                },
+                "choices": [{"index": 0, "text": text, "finish_reason": finish}],
+                "usage": usage,
             }
         self._send_json(payload)
+
+    def _usage(self, prompt_tokens: int) -> dict:
+        completion = max(0, self.model.pos - prompt_tokens)
+        return {
+            "prompt_tokens": prompt_tokens,
+            "completion_tokens": completion,
+            "total_tokens": prompt_tokens + completion,
+        }
+
+    @staticmethod
+    def _finish_reason(limit: int, usage: dict) -> str:
+        return "length" if limit and usage["completion_tokens"] >= limit else "stop"
+
+    def _usage_chunk(self, cid: str, created: int, usage: dict) -> dict:
+        return {
+            "id": cid,
+            "object": "chat.completion.chunk",
+            "created": created,
+            "model": self.model_name,
+            "choices": [],
+            "usage": usage,
+        }
 
     def _chunk(
         self,
